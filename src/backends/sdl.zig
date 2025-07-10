@@ -1,6 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const dvui = @import("dvui");
+const fifo = @import("../concurrency/fifo.zig");
+const AcRelAtomic = fifo.AcqRelAtomic;
 
 const sdl_options = @import("sdl_options");
 pub const sdl3 = sdl_options.version.major == 3;
@@ -943,7 +945,6 @@ pub fn addEvent(self: *SDLBackend, win: *dvui.Window, event: c.SDL_Event) !bool 
             if (self.log_events) {
                 log.debug("event KEYDOWN {} {s} {} {}\n", .{ sdl_key, @tagName(code), mod, event.key.repeat });
             }
-
             return try win.addEventKey(.{
                 .code = code,
                 .action = if (if (sdl3) event.key.repeat else event.key.repeat != 0) .repeat else .down,
@@ -1345,6 +1346,7 @@ pub fn main() !u8 {
 
     return 0;
 }
+const Mpsc = fifo.SpinLockMPSC(c.SDL_Event);
 
 /// used when doing sdl callbacks
 const CallbackState = struct {
@@ -1352,8 +1354,9 @@ const CallbackState = struct {
     back: SDLBackend,
     gpa: std.heap.GeneralPurposeAllocator(.{}) = .init,
     interrupted: bool = false,
-    have_resize: bool = false,
+    have_resize: AcRelAtomic(bool) = .init(false),
     no_wait: bool = false,
+    mpsc: Mpsc = undefined,
 };
 
 /// used when doing sdl callbacks
@@ -1373,6 +1376,10 @@ fn appInit(appstate: ?*?*anyopaque, argc: c_int, argv: ?[*:null]?[*:0]u8) callco
     const init_opts = app.config.get();
 
     const gpa = appState.gpa.allocator();
+
+    // App is running at atleast 30 fps, max. 256 ev / ms, 30 fps ~ 32 ms => 32 * 256 = 8192 upper bound
+
+    appState.mpsc = Mpsc.init(gpa, 8192) catch return c.SDL_APP_FAILURE;
 
     // init SDL backend (creates and owns OS window)
     appState.back = initWindow(.{
@@ -1439,15 +1446,14 @@ fn appQuit(_: ?*anyopaque, result: c.SDL_AppResult) callconv(.c) void {
 // This function runs when a new event (mouse input, keypresses, etc) occurs.
 fn appEvent(_: ?*anyopaque, event: ?*c.SDL_Event) callconv(.c) c.SDL_AppResult {
     const e = event.?.*;
-    _ = appState.back.addEvent(&appState.win, e) catch |err| {
-        log.err("dvui.Window.addEvent failed: {!}", .{err});
-        return c.SDL_APP_FAILURE;
-    };
+
+    // if fifo is full we start dropping events
+    appState.mpsc.push(e) catch {};
 
     if (event.?.type == c.SDL_EVENT_WINDOW_RESIZED) {
         //std.debug.print("resize {d}x{d}\n", .{e.window.data1, e.window.data2});
         // getting a resize event means we are likely in a callback, so don't call any wait functions
-        appState.have_resize = true;
+        appState.have_resize.store(true); // concurrent access, using atomic
     }
 
     if (event.?.type == c.SDL_EVENT_QUIT) {
@@ -1462,6 +1468,11 @@ fn appEvent(_: ?*anyopaque, event: ?*c.SDL_Event) callconv(.c) c.SDL_AppResult {
 fn appIterate(_: ?*anyopaque) callconv(.c) c.SDL_AppResult {
     // beginWait coordinates with waitTime below to run frames only when needed
     const nstime = appState.win.beginWait(appState.interrupted or appState.no_wait);
+
+    // poll fresh event from fifo
+    while (appState.mpsc.pop()) |evt| {
+        _ = appState.back.addEvent(appState.win, evt) catch return c.SDL_APP_FAILURE;
+    }
 
     // marks the beginning of a frame for dvui, can call dvui functions after this
     appState.win.begin(nstime) catch |err| {
