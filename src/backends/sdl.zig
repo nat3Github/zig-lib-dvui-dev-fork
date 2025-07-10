@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const dvui = @import("dvui");
-const fifo = @import("../concurrency/fifo.zig");
+const fifo = @import("fifo.zig");
 const AcRelAtomic = fifo.AcqRelAtomic;
 
 const sdl_options = @import("sdl_options");
@@ -1437,6 +1437,7 @@ fn appQuit(_: ?*anyopaque, result: c.SDL_AppResult) callconv(.c) void {
     if (app.deinitFn) |deinitFn| deinitFn();
     appState.win.deinit();
     appState.back.deinit();
+    appState.mpsc.deinit(appState.gpa.allocator());
     if (appState.gpa.deinit() != .ok) @panic("Memory leak on exit!");
 
     // SDL will clean up the window/renderer for us.
@@ -1471,7 +1472,7 @@ fn appIterate(_: ?*anyopaque) callconv(.c) c.SDL_AppResult {
 
     // poll fresh event from fifo
     while (appState.mpsc.pop()) |evt| {
-        _ = appState.back.addEvent(appState.win, evt) catch return c.SDL_APP_FAILURE;
+        _ = appState.back.addEvent(&appState.win, evt) catch return c.SDL_APP_FAILURE;
     }
 
     // marks the beginning of a frame for dvui, can call dvui functions after this
@@ -1514,8 +1515,8 @@ fn appIterate(_: ?*anyopaque) callconv(.c) c.SDL_AppResult {
     // During a callback we don't want to call SDL_WaitEvent or
     // SDL_WaitEventTimeout.  Otherwise all event handling gets screwed up and
     // either never recovers or recovers after many seconds.
-    if (appState.no_wait or appState.have_resize) {
-        appState.have_resize = false;
+    if (appState.no_wait or appState.have_resize.load()) {
+        appState.have_resize.store(false);
         return c.SDL_APP_CONTINUE;
     }
 

@@ -78,7 +78,7 @@ pub fn SpscFifo(comptime T: type) type {
 pub fn SpinLockMPSC(comptime T: type) type {
     return struct {
         fifo: SpscFifo(T),
-        reader_lock: Spinlock = .{},
+        writer_lock: Spinlock = .{},
         pub fn init(alloc: Allocator, capacity: usize) !@This() {
             return @This(){
                 .fifo = try SpscFifo(T).init(alloc, capacity),
@@ -93,7 +93,7 @@ pub fn SpinLockMPSC(comptime T: type) type {
             try self.fifo.push(item);
         }
         pub fn pop(self: *@This()) ?T {
-            self.fifo.pop();
+            return self.fifo.pop();
         }
     };
 }
