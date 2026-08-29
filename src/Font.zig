@@ -906,7 +906,7 @@ pub const Cache = struct {
         }
         result.have_positions = true;
 
-        const cluster_tables = try Entry.ShapedLine.buildClusterTables(gpa, &result, decoded.byte_offsets);
+        const cluster_tables = try result.buildClusterTables(gpa, decoded.byte_offsets);
 
         return .{
             .allocator = gpa,
@@ -1485,26 +1485,6 @@ pub const Cache = struct {
                 return fallback;
             }
 
-            fn buildClusterTables(gpa: std.mem.Allocator, buffer: *const ot.shaping.Buffer, byte_offsets: []const u32) std.mem.Allocator.Error!struct { starts: []u32, ends: []u32 } {
-                var starts: std.ArrayList(u32) = .empty;
-                errdefer starts.deinit(gpa);
-                for (buffer.info.items) |info| {
-                    if (std.mem.indexOfScalar(u32, starts.items, info.cluster) == null) {
-                        try starts.append(gpa, info.cluster);
-                    }
-                }
-                std.mem.sort(u32, starts.items, {}, std.sort.asc(u32));
-
-                const ends = try gpa.alloc(u32, starts.items.len);
-                errdefer gpa.free(ends);
-                for (starts.items, 0..) |_, i| {
-                    const next_start = if (i + 1 < starts.items.len) starts.items[i + 1] else @as(u32, @intCast(byte_offsets.len - 1));
-                    ends[i] = byte_offsets[next_start];
-                }
-
-                return .{ .starts = try starts.toOwnedSlice(gpa), .ends = ends };
-            }
-
             /// Logical byte range `[start, end)` of the cluster that glyph
             /// `buffer.info.items[glyph_idx]` belongs to. Unlike
             /// `byteOffsetForGlyph`/`glyphLimitForByteOffset`, this never
@@ -1513,9 +1493,7 @@ pub const Cache = struct {
             /// next glyph in visual (buffer) order has a *smaller* cluster
             /// than the current one.
             pub fn clusterByteRange(self: ShapedLine, glyph_idx: usize) struct { start: usize, end: usize } {
-                const cluster = self.buffer.info.items[glyph_idx].cluster;
-                const i = std.mem.indexOfScalar(u32, self.cluster_starts, cluster).?;
-                return .{ .start = self.byte_offsets[cluster], .end = self.cluster_ends[i] };
+                return self.buffer.clusterByteRange(self.cluster_starts, self.cluster_ends, self.byte_offsets, glyph_idx);
             }
 
             /// Byte offset in the original text immediately after the first
@@ -1531,10 +1509,7 @@ pub const Cache = struct {
             /// mouse/touch hit-testing inside an RTL run, where the byte this
             /// maps a click to can still be off by a cluster.
             pub fn byteOffsetForGlyph(self: ShapedLine, glyph_count: usize) usize {
-                if (glyph_count == 0) return 0;
-                if (glyph_count >= self.buffer.info.items.len) return self.byte_offsets[self.codepoints.len];
-                const cluster = self.buffer.info.items[glyph_count].cluster;
-                return self.byte_offsets[cluster];
+                return self.buffer.byteOffsetForGlyph(self.byte_offsets, glyph_count);
             }
 
             /// Inverse of `byteOffsetForGlyph`: smallest glyph count whose
@@ -1544,10 +1519,7 @@ pub const Cache = struct {
             /// offset) without reshaping. Same visual-vs-logical-order
             /// caveat as `byteOffsetForGlyph`.
             pub fn glyphLimitForByteOffset(self: ShapedLine, byte_offset: usize) usize {
-                for (self.buffer.info.items, 0..) |info, idx| {
-                    if (self.byte_offsets[info.cluster] >= byte_offset) return idx;
-                }
-                return self.buffer.info.items.len;
+                return self.buffer.glyphLimitForByteOffset(self.byte_offsets, byte_offset);
             }
 
             /// True if bidi reordering moved glyphs out of logical order --
