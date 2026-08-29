@@ -1,8 +1,10 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const dvui = @import("../dvui.zig");
+const ot = @import("opentype");
 
 const Event = dvui.Event;
+const Font = dvui.Font;
 const Options = dvui.Options;
 const Point = dvui.Point;
 const Rect = dvui.Rect;
@@ -31,11 +33,29 @@ pub var defaults: Options = .{
     .style = .content,
 };
 
+pub const OverflowWrap = enum { normal, anywhere };
+
 pub const InitOptions = struct {
     selection: ?*Selection = null,
 
     /// If true, break text on space to fit (or any character if width is < 10 Ms)
     break_lines: bool = true,
+
+    /// CSS `line-break`: how strictly to allow breaks around punctuation,
+    /// small kana, etc. `.strict` is the untailored UAX #14 default;
+    /// `.normal`/`.loose` add more opportunities. See `ot.unicode`.
+    line_break: ot.unicode.LineBreakStrictness = .strict,
+
+    /// CSS `word-break`: `.normal` is customary UAX #14, `.break_all` allows
+    /// breaks between any two letters (CJK-style), `.keep_all` forbids breaks
+    /// between letters (keeping runs whole, dictionary breaks still apply).
+    word_break: ot.unicode.WordBreakMode = .normal,
+
+    /// CSS `overflow-wrap`. `.anywhere` (default, dvui's existing behavior)
+    /// breaks an over-long word at a character boundary so it never exceeds
+    /// the line; `.normal` lets such a word overflow instead of breaking it
+    /// mid-word.
+    overflow_wrap: OverflowWrap = .anywhere,
 
     /// If true, assume text (and text height) is the same as we saw last frame
     /// and only process what is needed for visibility (and copy).
@@ -143,6 +163,9 @@ line_ascents_new: std.ArrayList(LineAscent) = .empty, // creating this frame
 prevClip: Rect.Physical = .{},
 kerning: ?bool,
 break_lines: bool,
+line_break: ot.unicode.LineBreakStrictness,
+word_break: ot.unicode.WordBreakMode,
+overflow_wrap: OverflowWrap,
 current_line_width: f32 = 0.0, // width of lines if break_lines was false
 touch_edit_just_focused: bool,
 process_events_in_deinit: bool,
@@ -269,6 +292,9 @@ pub fn init(self: *TextLayoutWidget, src: std.builtin.SourceLocation, init_opts:
     self.* = .{
         .wd = WidgetData.init(src, .{ .scroll_when_focused = false }, options),
         .break_lines = init_opts.break_lines,
+        .line_break = init_opts.line_break,
+        .word_break = init_opts.word_break,
+        .overflow_wrap = init_opts.overflow_wrap,
         .cache_layout = init_opts.cache_layout,
         .kerning = init_opts.kerning,
         .touch_edit_just_focused = init_opts.touch_edit_just_focused,
@@ -583,7 +609,7 @@ pub fn addTextTooltip(self: *TextLayoutWidget, src: std.builtin.SourceLocation, 
 
 // Helper to addTextEx
 // - returns byte position if p is before or within r
-fn findPoint(self: *TextLayoutWidget, p: Point, r: Rect, bytes_seen: usize, txt: []const u8, options: Options) ?struct { byte: usize, affinity: Selection.Affinity = .after } {
+fn findPoint(self: *TextLayoutWidget, p: Point, r: Rect, bytes_seen: usize, txt: []const u8, options: Options, shaped: ?*Font.ShapedText, glyph_limit: ?usize) ?struct { byte: usize, affinity: Selection.Affinity = .after } {
     if (p.y < r.y or (p.y < (r.y + r.h) and p.x < r.x)) {
         // found it - p is before this rect
         return .{ .byte = bytes_seen };
@@ -592,19 +618,31 @@ fn findPoint(self: *TextLayoutWidget, p: Point, r: Rect, bytes_seen: usize, txt:
     if (p.y < (r.y + r.h) and p.x < (r.x + r.w)) {
         // found it - p is in this rect
         const how_far = p.x - r.x;
+        // Width-driven hit-test against an already-shaped line (only
+        // mouse/touch text selection reaches here) instead of reshaping
+        // `txt` from scratch just to find which byte a pixel offset lands
+        // on.
         var pt_end: usize = undefined;
-        _ = options.fontGet().textSizeEx(txt, .{ .kerning = self.kerning, .max_width = how_far, .end_idx = &pt_end, .end_metric = .nearest });
+        var found = false;
+        if (shaped) |st| {
+            if (glyph_limit) |gl| {
+                if (st.byteForWidth(dvui.currentWindow().gpa, gl, how_far, .nearest)) |b| {
+                    pt_end = b;
+                    found = true;
+                } else |_| {}
+            }
+        }
+        if (!found) {
+            _ = options.fontGet().textSizeEx(txt, .{ .kerning = self.kerning, .max_width = how_far, .end_idx = &pt_end, .end_metric = .nearest });
+        }
         return .{ .byte = bytes_seen + pt_end, .affinity = if (pt_end == txt.len) .before else .after };
     }
 
-    var newline = false;
-    if (txt.len > 0 and (txt[txt.len - 1] == '\n')) {
-        newline = true;
-    }
+    const break_len = Font.trailingHardBreakLen(txt);
 
-    if (newline and p.y < (r.y + r.h)) {
+    if (break_len > 0 and p.y < (r.y + r.h)) {
         // found it - p is after this rect on same horizontal line
-        return .{ .byte = bytes_seen + txt.len - 1 };
+        return .{ .byte = bytes_seen + txt.len - break_len };
     }
 
     return null;
@@ -613,13 +651,13 @@ fn findPoint(self: *TextLayoutWidget, p: Point, r: Rect, bytes_seen: usize, txt:
 // Called for each piece of text before searching for the cursor.
 // Place for selection movement to track points and move the cursor if needed,
 // also to track any state they need before the cursor (like word select).
-fn selMovePre(self: *TextLayoutWidget, txt: []const u8, end: usize, text_rect: Rect, options: Options) void {
+fn selMovePre(self: *TextLayoutWidget, txt: []const u8, end: usize, text_rect: Rect, options: Options, shaped: ?*Font.ShapedText, glyph_limit: ?usize) void {
     const text_line = txt[0..end];
     switch (self.sel_move) {
         .none => {},
         .mouse => |*m| {
             if (m.down_pt) |p| {
-                if (self.findPoint(p, text_rect, self.bytes_seen, text_line, options)) |ba| {
+                if (self.findPoint(p, text_rect, self.bytes_seen, text_line, options, shaped, glyph_limit)) |ba| {
                     m.byte = ba.byte;
                     self.selection.moveCursor(ba.byte, false);
                     self.selection.affinity = ba.affinity;
@@ -629,7 +667,7 @@ fn selMovePre(self: *TextLayoutWidget, txt: []const u8, end: usize, text_rect: R
                     self.selection.moveCursor(self.bytes_seen + end, false);
                 }
             } else if (m.drag_pt) |p| {
-                if (self.findPoint(p, text_rect, self.bytes_seen, text_line, options)) |ba| {
+                if (self.findPoint(p, text_rect, self.bytes_seen, text_line, options, shaped, glyph_limit)) |ba| {
                     self.selection.cursor = ba.byte;
                     self.selection.start = @min(m.byte.?, ba.byte);
                     self.selection.end = @max(m.byte.?, ba.byte);
@@ -646,7 +684,7 @@ fn selMovePre(self: *TextLayoutWidget, txt: []const u8, end: usize, text_rect: R
         },
         .expand_pt => |*ep| {
             if (ep.pt) |p| {
-                if (self.findPoint(p, text_rect, self.bytes_seen, text_line, options)) |ba| {
+                if (self.findPoint(p, text_rect, self.bytes_seen, text_line, options, shaped, glyph_limit)) |ba| {
                     self.selection.moveCursor(ba.byte, false);
                     self.selection.affinity = ba.affinity;
                     ep.pt = null;
@@ -664,7 +702,7 @@ fn selMovePre(self: *TextLayoutWidget, txt: []const u8, end: usize, text_rect: R
         .char_left_right => {},
         .cursor_updown => |*cud| {
             if (cud.pt) |p| {
-                if (self.findPoint(p, text_rect, self.bytes_seen, text_line, options)) |ba| {
+                if (self.findPoint(p, text_rect, self.bytes_seen, text_line, options, shaped, glyph_limit)) |ba| {
                     self.selection.moveCursor(ba.byte, cud.select);
                     self.selection.affinity = ba.affinity;
                     cud.pt = null;
@@ -1238,6 +1276,88 @@ const AddTextExAction = enum {
     hover,
 };
 
+/// Last UAX #14 line-break opportunity in `txt[0..limit_byte]` (clamped to
+/// `txt.len`), replacing a plain ASCII-space search so text without spaces
+/// (CJK, Thai/Lao, long URLs after punctuation, ...) can still wrap.
+// UAX #14 break opportunities over `txt`, tailored by the CSS `line-break`
+// (`strictness`) and `word-break` (`word_break`) properties. The iterator
+// also folds in dictionary segmentation for Thai/Lao/Khmer/Myanmar, so those
+// scripts get interior break points for free. `each` is called with every
+// non-prohibited boundary's byte offset in ascending order; return true from
+// it to stop early. Returns false on OOM (no boundaries reported).
+fn eachLineBreakOpportunity(
+    gpa: std.mem.Allocator,
+    txt: []const u8,
+    limit_byte: usize,
+    strictness: ot.unicode.LineBreakStrictness,
+    word_break: ot.unicode.WordBreakMode,
+    context: anytype,
+    comptime each: fn (@TypeOf(context), usize) bool,
+) bool {
+    var codepoints: std.ArrayList(u21) = .empty;
+    defer codepoints.deinit(gpa);
+    var byte_offsets: std.ArrayList(usize) = .empty;
+    defer byte_offsets.deinit(gpa);
+
+    const limit = @min(limit_byte, txt.len);
+    var i: usize = 0;
+    while (i < limit) {
+        const cplen = std.unicode.utf8ByteSequenceLength(txt[i]) catch break;
+        if (i + cplen > txt.len) break;
+        const cp = std.unicode.utf8Decode(txt[i..][0..cplen]) catch break;
+        codepoints.append(gpa, cp) catch return false;
+        byte_offsets.append(gpa, i) catch return false;
+        i += cplen;
+    }
+    byte_offsets.append(gpa, i) catch return false;
+
+    var it = ot.unicode.LineBreakIterator.init(codepoints.items);
+    it.strictness = strictness;
+    it.word_break = word_break;
+    while (it.next()) |b| {
+        // Skip index 0 and the synthetic eot the iterator always emits at
+        // the window edge -- when `limit_byte < txt.len` that "end of text"
+        // is just where we stopped decoding, not a real break opportunity.
+        // (Real mandatory breaks never reach here: Font measurement cuts the
+        // fragment before them.) Without this, the search always returned
+        // the window edge and never snapped back to a word boundary.
+        if (b.opportunity == .prohibited or b.index == 0 or b.index >= codepoints.items.len) continue;
+        if (each(context, byte_offsets.items[b.index])) return true;
+    }
+    return true;
+}
+
+// Last break opportunity at or before `limit_byte` (for soft-wrapping a line
+// that overflowed the available width back to a word boundary).
+fn lastLineBreakOpportunity(gpa: std.mem.Allocator, txt: []const u8, limit_byte: usize, strictness: ot.unicode.LineBreakStrictness, word_break: ot.unicode.WordBreakMode) ?usize {
+    var best: ?usize = null;
+    _ = eachLineBreakOpportunity(gpa, txt, limit_byte, strictness, word_break, &best, struct {
+        fn f(b: *?usize, off: usize) bool {
+            b.* = off;
+            return false;
+        }
+    }.f);
+    return best;
+}
+
+// First break opportunity strictly after `after_byte`, or null. Used by
+// `overflow-wrap: normal` to let an over-long word run to its next natural
+// break instead of char-breaking it.
+fn nextLineBreakOpportunity(gpa: std.mem.Allocator, txt: []const u8, after_byte: usize, strictness: ot.unicode.LineBreakStrictness, word_break: ot.unicode.WordBreakMode) ?usize {
+    const Ctx = struct { after: usize, found: ?usize = null };
+    var ctx: Ctx = .{ .after = after_byte };
+    _ = eachLineBreakOpportunity(gpa, txt, txt.len, strictness, word_break, &ctx, struct {
+        fn f(c: *Ctx, off: usize) bool {
+            if (off > c.after) {
+                c.found = off;
+                return true;
+            }
+            return false;
+        }
+    }.f);
+    return ctx.found;
+}
+
 fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExAction, opts: Options) ?HoverMatch {
     var ret: ?HoverMatch = null;
     const cw = dvui.currentWindow();
@@ -1337,21 +1457,59 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
 
         // get slice of text that fits within width or ends with newline
         var ascent: f32 = undefined;
-        var s = font.textSizeEx(txt, .{
+
+        // Shape this fragment once and reuse the shape (full UAX #9 bidi +
+        // GSUB/GPOS) for line-break re-measurement, cursor/selection
+        // tracking, and the actual glyph render below -- each of those
+        // used to trigger its own independent reshape of the same bytes,
+        // 3-4x per fragment per frame. `shaped` is scratch-allocated on
+        // `cw.arena()` (bulk-freed at frame end), so it's deliberately
+        // never `.deinit()`'d here -- only arena-copied out via
+        // `shaped_ptr` right before the render call that needs it to
+        // outlive this function (see there).
+        var shaped: ?Font.ShapedText = null;
+        var s: Size = undefined;
+        // Set when this fragment's shape was bidi-reordered: a visual-prefix
+        // slice of it (what the `shaped` fast path reuses for trim/measure/
+        // render/hit-test) is not a logical prefix, so we drop to the
+        // reshape-per-line path -- which shapes each final line byte-range on
+        // its own and is therefore visually correct -- and retreat over-wide
+        // lines to a fitting break below.
+        var line_is_bidi = false;
+        if (font.textSizeExShaped(cw.gpa, txt, .{
             .kerning = self.kerning,
             .max_width = if (self.break_lines) width else null,
             .end_idx = &end,
             .kern_out = &kern_buf,
             .ascent_out = &ascent,
-        });
+        }) catch null) |res| {
+            s = res.size;
+            shaped = res.shaped;
+            if (shaped) |*st| {
+                if (st.line.isBidi()) {
+                    // Leave the unused shape for the frame arena to bulk-free
+                    // (matches the "never deinit here" convention above).
+                    shaped = null;
+                    line_is_bidi = true;
+                }
+            }
+        } else {
+            s = font.textSizeEx(txt, .{
+                .kerning = self.kerning,
+                .max_width = if (self.break_lines) width else null,
+                .end_idx = &end,
+                .kern_out = &kern_buf,
+                .ascent_out = &ascent,
+            });
+        }
 
         // ensure we always get at least 1 codepoint so we make progress
         if (end == 0) {
             end = std.unicode.utf8ByteSequenceLength(txt[0]) catch 1;
-            s = font.textSizeEx(txt[0..end], .{ .kerning = self.kerning });
+            s = if (shaped) |*st| st.measureUpToByte(cw.gpa, end) catch font.textSizeEx(txt[0..end], .{ .kerning = self.kerning }) else font.textSizeEx(txt[0..end], .{ .kerning = self.kerning });
         }
 
-        self.newline = (txt[end - 1] == '\n');
+        self.newline = Font.trailingHardBreakLen(txt[0..end]) > 0;
 
         //std.debug.print("{d} 1 txt to {d} \"{s}\"\n", .{ container_width, end, txt[0..end] });
 
@@ -1363,14 +1521,62 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
             if (end < txt.len and !self.newline and linewidth > (10 * msize.w)) {
                 // now we are under the length limit but might be in the middle of a word
                 // look one char further because we might be right at the end of a word
-                const spaceIdx = std.mem.findLastLinear(u8, txt[0 .. end + 1], " ");
-                if (spaceIdx) |si| {
-                    end = si + 1;
-                    s = font.textSizeEx(txt[0..end], .{ .kerning = self.kerning, .kern_in = &kern_buf });
+                if (lastLineBreakOpportunity(dvui.currentWindow().lifo(), txt, end + 1, self.line_break, self.word_break)) |brk| {
+                    end = brk;
+                    if (shaped) |*st| {
+                        const shaped_len = st.line.byte_offsets[st.line.codepoints.len];
+                        if (end <= shaped_len) {
+                            // Common case: the break point falls inside
+                            // what we already shaped above -- re-measure
+                            // by summing already-computed advances instead
+                            // of reshaping.
+                            s = st.measureUpToByte(cw.gpa, end) catch font.textSizeEx(txt[0..end], .{ .kerning = self.kerning });
+                        } else {
+                            // Rare: the break search's one-char lookahead
+                            // crossed past what was shaped. Fall back to a
+                            // single reshape for this fragment (matches
+                            // old behavior; `shaped` no longer matches
+                            // `end` so downstream reuse is skipped too).
+                            shaped = null;
+                            s = font.textSizeEx(txt[0..end], .{ .kerning = self.kerning });
+                        }
+                    } else {
+                        s = font.textSizeEx(txt[0..end], .{ .kerning = self.kerning });
+                    }
                     break :blk; // this part will fit
                 }
 
-                // couldn't break of space, fall through
+                // No break opportunity: this is an over-long word. Under
+                // `overflow-wrap: normal` extend `end` to the word's next
+                // natural break (or end of text) so it renders whole and
+                // overflows rather than being char-broken; the drop-to-next-
+                // line check below still moves it down first if it isn't
+                // already at the line start. Under `.anywhere` (default) keep
+                // the width-limited `end`, i.e. a character break.
+                if (self.overflow_wrap == .normal) {
+                    end = nextLineBreakOpportunity(dvui.currentWindow().lifo(), txt, end, self.line_break, self.word_break) orelse txt.len;
+                    shaped = null;
+                    s = font.textSizeEx(txt[0..end], .{ .kerning = self.kerning });
+                }
+                // else fall through -> character break
+            }
+
+            // Bidi: the seed `end`/`s` came from a visual-prefix width walk,
+            // which for reordered text can pick a byte range that reshapes
+            // wider than `width`. Re-measure the real line, and if we're
+            // already at the line start (so dropping down wouldn't help),
+            // retreat to the previous break opportunity until it fits (or no
+            // earlier break exists -- an unbreakable run, left to overflow).
+            if (line_is_bidi) {
+                s = font.textSizeEx(txt[0..end], .{ .kerning = self.kerning });
+                const at_line_start = !(linewidth < container_width or self.insert_pt.x > linestart);
+                while (at_line_start and s.w > width and end > 0) {
+                    const prev = lastLineBreakOpportunity(dvui.currentWindow().lifo(), txt, end, self.line_break, self.word_break) orelse break;
+                    if (prev == 0 or prev >= end) break;
+                    end = prev;
+                    s = font.textSizeEx(txt[0..end], .{ .kerning = self.kerning });
+                }
+                self.newline = Font.trailingHardBreakLen(txt[0..end]) > 0;
             }
 
             // drop to next line without doing anything if:
@@ -1393,6 +1599,11 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
                 continue :text_loop;
             }
         }
+
+        // `end` is now final for this fragment: how many leading glyphs of
+        // `shaped` (if any) correspond to `txt[0..end]`, for reuse by
+        // cursor/selection tracking and the render call below.
+        const shaped_glyph_limit: ?usize = if (shaped) |*st| st.line.glyphLimitForByteOffset(end) else null;
 
         // now we know the line of text we are about to render
 
@@ -1458,7 +1669,7 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
 
         // handle selection movement
         const text_rect = Rect{ .x = self.insert_pt.x, .y = self.insert_pt.y, .w = s.w, .h = s.h };
-        self.selMovePre(txt, end, text_rect, options);
+        self.selMovePre(txt, end, text_rect, options, if (shaped) |*st| st else null, shaped_glyph_limit);
 
         if (self.sel_pts[0] != null or self.sel_pts[1] != null) {
             var sel_bytes = [2]?usize{ null, null };
@@ -1470,10 +1681,23 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
                         sel_bytes[i] = self.bytes_seen;
                         self.sel_pts[i] = null;
                     } else if (p.y < (rs.y + rs.h) and p.x < (rs.x + rs.w)) {
-                        // point is in this text
+                        // point is in this text (touch drag-selection hit
+                        // test -- reuse the already-shaped line instead of
+                        // reshaping `txt` from scratch, same as findPoint)
                         const how_far = p.x - rs.x;
                         var pt_end: usize = undefined;
-                        _ = font.textSizeEx(txt, .{ .kerning = self.kerning, .max_width = how_far, .end_idx = &pt_end, .end_metric = .nearest });
+                        var found = false;
+                        if (shaped) |*st| {
+                            if (shaped_glyph_limit) |gl| {
+                                if (st.byteForWidth(cw.gpa, gl, how_far, .nearest)) |b| {
+                                    pt_end = b;
+                                    found = true;
+                                } else |_| {}
+                            }
+                        }
+                        if (!found) {
+                            _ = font.textSizeEx(txt, .{ .kerning = self.kerning, .max_width = how_far, .end_idx = &pt_end, .end_metric = .nearest });
+                        }
                         sel_bytes[i] = self.bytes_seen + pt_end;
                         self.sel_pts[i] = null;
                     } else {
@@ -1507,12 +1731,14 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
         // record screen position of selection for touch editing (use s for
         // height in case we are calling textSize with an empty slice)
         if (self.selection.start >= self.bytes_seen and self.selection.start <= self.bytes_seen + end) {
-            const start_off = font.textSize(txt[0..self.selection.start -| self.bytes_seen]);
+            const off = self.selection.start -| self.bytes_seen;
+            const start_off = if (shaped) |*st| st.measureUpToByte(cw.gpa, off) catch font.textSize(txt[0..off]) else font.textSize(txt[0..off]);
             self.sel_start_r_new = .{ .x = self.insert_pt.x + start_off.w, .y = self.insert_pt.y, .w = 1, .h = s.h };
         }
 
         if (self.selection.end >= self.bytes_seen and self.selection.end <= self.bytes_seen + end) {
-            const end_off = font.textSize(txt[0..self.selection.end -| self.bytes_seen]);
+            const off = self.selection.end -| self.bytes_seen;
+            const end_off = if (shaped) |*st| st.measureUpToByte(cw.gpa, off) catch font.textSize(txt[0..off]) else font.textSize(txt[0..off]);
             self.sel_end_r_new = .{ .x = self.insert_pt.x + end_off.w, .y = self.insert_pt.y, .w = 1, .h = s.h };
         }
 
@@ -1520,7 +1746,7 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
             std.debug.assert(self.selection.cursor >= self.bytes_seen);
             const cursor_offset = self.selection.cursor - self.bytes_seen;
             const text_to_cursor = txt[0..cursor_offset];
-            const size = font.textSize(text_to_cursor);
+            const size = if (shaped) |*st| st.measureUpToByte(cw.gpa, cursor_offset) catch font.textSize(text_to_cursor) else font.textSize(text_to_cursor);
             self.cursor_rect = Rect{ .x = self.insert_pt.x + size.w, .y = self.insert_pt.y, .w = 1, .h = s.h };
 
             self.selMoveText(text_to_cursor, self.bytes_seen);
@@ -1575,6 +1801,19 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
                 break :info null;
             };
 
+            // Hand the shape from above to renderText instead of letting
+            // it reshape `rtxt` from scratch -- but it needs to outlive
+            // this function (a floating window's render can be deferred to
+            // later this frame), so copy the small `ShapedText` header
+            // (not the shape's own arrays, already arena-owned) onto
+            // `cw.arena()` rather than pointing at this stack frame.
+            const pre_shaped: ?*const Font.ShapedText = blk: {
+                const st = shaped orelse break :blk null;
+                const p = cw.arena().create(Font.ShapedText) catch break :blk null;
+                p.* = st;
+                break :blk p;
+            };
+
             // Sampled against this run's own `rs.r`, so a gradient resets at
             // each line/style-run boundary; set `gradient.anchor` to a
             // shared rect (e.g. the whole TextLayoutWidget) for a continuous
@@ -1594,6 +1833,8 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
                 .kerning = self.kerning,
                 .kern_in = &kern_buf,
                 .ak_opts = textrun_info,
+                .pre_shaped = pre_shaped,
+                .pre_shaped_glyph_limit = shaped_glyph_limit,
             }) catch |err| {
                 dvui.logError(@src(), err, "Failed to render text: {s}", .{rtxt});
             };
@@ -2398,4 +2639,34 @@ fn textRunSrc() std.builtin.SourceLocation {
 
 test {
     @import("std").testing.refAllDecls(@This());
+}
+
+test "line break search: word wrap, CSS line-break/word-break, overflow-wrap, dictionary" {
+    const t = std.testing;
+    const gpa = t.allocator;
+
+    // Word wrap snaps back to the last break opportunity, not the window edge.
+    try t.expectEqual(@as(?usize, 6), lastLineBreakOpportunity(gpa, "hello world foo", 8, .strict, .normal));
+
+    // word-break: an over-long token with no opportunity returns null under
+    // .normal, but .break_all inserts a break between two letters.
+    try t.expectEqual(@as(?usize, null), lastLineBreakOpportunity(gpa, "ab", 2, .strict, .normal));
+    try t.expectEqual(@as(?usize, 1), lastLineBreakOpportunity(gpa, "ab", 2, .strict, .break_all));
+
+    // word-break: keep-all removes the break normally allowed between CJK
+    // ideographs ("一二三").
+    const cjk = "\u{4e00}\u{4e8c}\u{4e09}";
+    try t.expect(lastLineBreakOpportunity(gpa, cjk, cjk.len, .strict, .normal) != null);
+    try t.expectEqual(@as(?usize, null), lastLineBreakOpportunity(gpa, cjk, cjk.len, .strict, .keep_all));
+
+    // Dictionary segmentation (Thai has no spaces): "สวัสดีชาวโลก" breaks
+    // internally at word boundaries.
+    const thai = "\u{0e2a}\u{0e27}\u{0e31}\u{0e2a}\u{0e14}\u{0e35}\u{0e0a}\u{0e32}\u{0e27}\u{0e42}\u{0e25}\u{0e01}";
+    const thai_brk = lastLineBreakOpportunity(gpa, thai, thai.len, .strict, .normal);
+    try t.expect(thai_brk != null and thai_brk.? > 0 and thai_brk.? < thai.len);
+
+    // overflow-wrap helper: next opportunity strictly after a byte, or null
+    // for a single unbreakable token.
+    try t.expectEqual(@as(?usize, 6), nextLineBreakOpportunity(gpa, "hello world", 2, .strict, .normal));
+    try t.expectEqual(@as(?usize, null), nextLineBreakOpportunity(gpa, "abcdefgh", 3, .strict, .normal));
 }

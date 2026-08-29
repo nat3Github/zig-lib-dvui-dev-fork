@@ -154,11 +154,7 @@ fn gui_frame() bool {
     }
     tl2.addText("\n", .{});
     tl2.addText("Cursor is always being set by dvui.\n\n", .{});
-    if (dvui.useFreeType) {
-        tl2.addText("Fonts are being rendered by FreeType 2.", .{});
-    } else {
-        tl2.addText("Fonts are being rendered by stb_truetype.", .{});
-    }
+            tl2.addText("Fonts are being rendered by opentype (lib-opentype-renderer).", .{});
     tl2.deinit();
 
     const label = if (dvui.Examples.show_demo_window) "Hide Demo Window" else "Show Demo Window";

@@ -1,9 +1,17 @@
 var line_height_factor: f32 = 1.2;
 var underline_thick: f32 = 0.0;
 var strike_thick: f32 = 0.0;
+var wght_axis: f32 = 400;
+var variable_font_registered = false;
 
 /// ![image](Examples-text_layout.png)
 pub fn layoutText() void {
+    // Register a variable font once so the wght slider below has an fvar axis
+    // to move. Bytes are embedded (static), so pass null allocator.
+    if (!variable_font_registered) {
+        dvui.addFont("Aleo VF", @embedFile("../fonts/Aleo/Aleo-VariableFont_wght.ttf"), null) catch {};
+        variable_font_registered = true;
+    }
     {
         var box = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
         defer box.deinit();
@@ -17,6 +25,7 @@ pub fn layoutText() void {
             _ = dvui.sliderEntry(@src(), "line height: {d:0.2}", .{ .value = &line_height_factor, .min = 0.1, .max = 2, .interval = 0.1 }, .{});
             _ = dvui.sliderEntry(@src(), "underline thick: {d:0.2}", .{ .value = &underline_thick, .min = 0.00, .max = 1.0, .interval = 0.01 }, .{});
             _ = dvui.sliderEntry(@src(), "strike thick: {d:0.2}", .{ .value = &strike_thick, .min = 0.00, .max = 1.0, .interval = 0.01 }, .{});
+            _ = dvui.sliderEntry(@src(), "weight axis: {d:0.0}", .{ .value = &wght_axis, .min = 100, .max = 900, .interval = 1 }, .{});
         }
 
         if (dvui.button(@src(), "Large Doc", .{}, .{ .gravity_x = 1.0 })) {
@@ -195,6 +204,9 @@ pub fn layoutText() void {
         tl.addText("is some ", .{ .font = dvui.Font.theme(.body).larger(6), .color_text = .{ .color = .{ .b = 100, .g = 100 } }, .color_fill = .green });
         tl.addText("ugly text ", .{ .font = dvui.Font.theme(.body).larger(8), .color_text = .{ .color = .{ .r = 100, .g = 100 } }, .color_fill = .teal });
         tl.addText("that shows styling.", .{ .font = dvui.Font.theme(.body).larger(-2), .color_text = .{ .color = .{ .r = 100, .g = 50, .b = 50 } } });
+
+        const variable_font = dvui.Font.init(&.{"Aleo VF"}).larger(4).withVariation("wght", wght_axis);
+        tl.format("\n\nVariable font (wght={d:0.0}): the quick brown fox\n", .{wght_axis}, .{ .font = variable_font });
     }
 
     if (dvui.useTreeSitter) {

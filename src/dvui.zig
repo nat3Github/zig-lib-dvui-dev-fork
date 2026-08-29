@@ -323,7 +323,6 @@ pub const dialogNativeFileSave = native_dialogs.Native.save;
 pub const dialogNativeFolderSelect = native_dialogs.Native.folderSelect;
 
 pub const useLibc = @import("default_options").libc;
-pub const useFreeType = @import("default_options").freetype;
 pub const useTinyFileDialogs = @import("default_options").tiny_file_dialogs;
 pub const useTreeSitter = @import("default_options").tree_sitter;
 
@@ -350,8 +349,6 @@ pub var reduce_motion: bool = false;
 pub const max_float_safe: f32 = 2_000_000; // 2000000 and 2e6 for searchability
 
 pub const c = @import("dvui-c");
-
-pub var ft2lib: if (useFreeType) c.FT_Library else void = undefined;
 
 pub const Error = std.mem.Allocator.Error || StbImageError || TvgError || FontError;
 pub const TvgError = error{tvgError};

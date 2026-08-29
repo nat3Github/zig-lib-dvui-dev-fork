@@ -152,6 +152,10 @@ _arena: std.heap.ArenaAllocator,
 _lifo_arena: std.heap.ArenaAllocator,
 /// Used to allocate widgets with a fixed location
 _widget_stack: WidgetStack,
+/// Counts calls to `end`, used to only shrink the per-frame arenas
+/// periodically (see `end`) instead of every frame -- shrinking every frame
+/// never lets steady-state capacity settle, causing perpetual realloc churn.
+_end_count: u32 = 0,
 render_target: dvui.RenderTarget = .{ .texture = null, .offset = .{} },
 end_rendering_done: bool = false,
 
@@ -387,13 +391,6 @@ pub fn init(
 
     self.subwindows.focused_id = self.data().id;
     self.frame_time_ns = 1;
-
-    if (dvui.useFreeType) {
-        dvui.Font.FreeType.intToError(c.FT_Init_FreeType(&dvui.ft2lib)) catch |err| {
-            dvui.log.err("freetype error {any} trying to init freetype library\n", .{err});
-            return error.freetypeError;
-        };
-    }
 
     return self;
 }
@@ -1783,22 +1780,35 @@ pub fn end(self: *Self, opts: endOptions) !?u32 {
     // event to the end this will print a debug message.
     self.positionMouseEventRemove();
 
-    {
-        const cap = self._arena.queryCapacity();
-        //std.log.debug("_arena capacity {d}", .{cap});
-        _ = self._arena.reset(.{ .retain_with_limit = cap - @divTrunc(cap, 10) });
-    }
+    // Shrinking every frame never lets steady-state capacity settle: once
+    // capacity converges toward what's actually used, a 10% cut forces a
+    // realloc that then gets immediately regrown next frame, forever. Only
+    // shrink periodically so a steady workload's arenas stabilize (zero
+    // reallocs) between shrinks; this still bounds long-term growth after
+    // a one-off spike (e.g. cold start).
+    self._end_count +%= 1;
+    if (self._end_count % 60 == 0) {
+        {
+            const cap = self._arena.queryCapacity();
+            //std.log.debug("_arena capacity {d}", .{cap});
+            _ = self._arena.reset(.{ .retain_with_limit = cap - @divTrunc(cap, 10) });
+        }
 
-    {
-        const cap = self._lifo_arena.queryCapacity();
-        //std.log.debug("_lifo_arena capacity {d}", .{cap});
-        _ = self._lifo_arena.reset(.{ .retain_with_limit = cap - @divTrunc(cap, 10) });
-    }
+        {
+            const cap = self._lifo_arena.queryCapacity();
+            //std.log.debug("_lifo_arena capacity {d}", .{cap});
+            _ = self._lifo_arena.reset(.{ .retain_with_limit = cap - @divTrunc(cap, 10) });
+        }
 
-    {
-        const cap = self._widget_stack.arena.queryCapacity();
-        //std.log.debug("_widget_stack capacity {d}", .{cap});
-        _ = self._widget_stack.reset(.{ .retain_with_limit = cap - @divTrunc(cap, 10) });
+        {
+            const cap = self._widget_stack.arena.queryCapacity();
+            //std.log.debug("_widget_stack capacity {d}", .{cap});
+            _ = self._widget_stack.reset(.{ .retain_with_limit = cap - @divTrunc(cap, 10) });
+        }
+    } else {
+        _ = self._arena.reset(.retain_capacity);
+        _ = self._lifo_arena.reset(.retain_capacity);
+        _ = self._widget_stack.reset(.retain_capacity);
     }
 
     // Do this here so subwindows that didn't show are gone for events.

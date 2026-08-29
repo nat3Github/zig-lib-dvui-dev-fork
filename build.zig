@@ -204,8 +204,12 @@ pub fn build(b: *std.Build) !void {
     }
 
     const libc_option = b.option(bool, "libc", "Use libc (default is backend specific)");
-    const freetype_option = b.option(bool, "freetype", "Freetype (or stb_truetype if false) for font rendering (default is backend specific)");
     const tiny_file_dialogs_option = b.option(bool, "tiny-file-dialogs", "OS-native file dialogs (default is backend specific)");
+    // Forwarded to the opentype dependency's font-discovery backends.
+    const opentype_fontconfig = b.option(bool, "fontconfig", "Enable the Fontconfig font-discovery backend (forwarded to opentype)") orelse (target.result.os.tag == .linux and target.result.abi != .android);
+    const opentype_core_text = b.option(bool, "core-text", "Enable the CoreText font-discovery backend (forwarded to opentype)") orelse target.result.os.tag.isDarwin();
+    const opentype_directwrite = b.option(bool, "directwrite", "Enable the DirectWrite font-discovery backend (forwarded to opentype)") orelse (target.result.os.tag == .windows);
+    const opentype_android = b.option(bool, "android", "Enable the Android font-discovery backend (forwarded to opentype)") orelse (target.result.abi == .android);
     const stb_image_option = b.option(bool, "stb-image", "Build stb_image (default is backend specific, some include stb_image)");
     const tree_sitter_option = b.option(bool, "tree-sitter", "Build tree sitter (default is backend specific)");
     const tvg_option = b.option(bool, "tvg", "Build tvg (default true)") orelse true;
@@ -300,7 +304,11 @@ pub fn build(b: *std.Build) !void {
         .render_backend = render_backend,
         .vertex_index = vertex_index,
         .libc = libc_option,
-        .freetype = freetype_option,
+        .opentype_fontconfig = opentype_fontconfig,
+        .opentype_core_text = opentype_core_text,
+        .opentype_directwrite = opentype_directwrite,
+        .opentype_android = opentype_android,
+
         .tiny_file_dialogs = tiny_file_dialogs_option,
         .linux_display_backend = linux_display_backend,
         .stb_image = stb_image_option,
@@ -439,7 +447,7 @@ pub fn buildBackend(
     const optimize = dvui_opts.optimize;
     switch (backend) {
         .custom => {
-            dvui_opts.setDefaults(.{ .libc = false, .freetype = false, .tiny_file_dialogs = false, .stb_image = false, .tree_sitter = true });
+            dvui_opts.setDefaults(.{ .libc = false,  .tiny_file_dialogs = false, .stb_image = false, .tree_sitter = true });
             const expose_vulkan_renderer = dvui_opts.render_backend == .vulkan;
             if (expose_vulkan_renderer) dvui_opts.render_backend = .default;
 
@@ -468,7 +476,7 @@ pub fn buildBackend(
             }
         },
         .testing => {
-            dvui_opts.setDefaults(.{ .libc = true, .freetype = true, .tiny_file_dialogs = true, .stb_image = true, .tree_sitter = true });
+            dvui_opts.setDefaults(.{ .libc = true,  .tiny_file_dialogs = true, .stb_image = true, .tree_sitter = true });
             const testing_mod = b.addModule("testing", .{
                 .root_source_file = b.path("src/backends/testing.zig"),
                 .target = target,
@@ -493,7 +501,7 @@ pub fn buildBackend(
             _ = addExample("frame-dump", b.path("examples/frame-dump.zig"), false, example_opts, dvui_opts);
         },
         .proxy => {
-            dvui_opts.setDefaults(.{ .libc = true, .freetype = true, .tiny_file_dialogs = false, .stb_image = true, .tree_sitter = true });
+            dvui_opts.setDefaults(.{ .libc = true,  .tiny_file_dialogs = false, .stb_image = true, .tree_sitter = true });
 
             const proxy_bridge_mod = b.addModule("proxy_bridge", .{
                 .root_source_file = b.path("src/backends/proxy_bridge.zig"),
@@ -516,7 +524,7 @@ pub fn buildBackend(
             linkBackend(dvui_proxy, proxy_mod);
         },
         .sdl2 => {
-            dvui_opts.setDefaults(.{ .libc = true, .freetype = true, .tiny_file_dialogs = true, .stb_image = true, .tree_sitter = true });
+            dvui_opts.setDefaults(.{ .libc = true,  .tiny_file_dialogs = true, .stb_image = true, .tree_sitter = true });
 
             const sdl_translate_c = b.addTranslateC(.{
                 .root_source_file = b.path("src/backends/sdl2-c.h"),
@@ -617,7 +625,7 @@ pub fn buildBackend(
             // _ = addExample("sdl2-multi-win", b.path("examples/sdl-multi-win.zig"), true, example_opts, dvui_opts);
         },
         .sdl3gpu => {
-            dvui_opts.setDefaults(.{ .libc = true, .freetype = true, .tiny_file_dialogs = true, .stb_image = true, .tree_sitter = true });
+            dvui_opts.setDefaults(.{ .libc = true,  .tiny_file_dialogs = true, .stb_image = true, .tree_sitter = true });
 
             const sdl_translate_c = b.addTranslateC(.{
                 .root_source_file = b.path("src/backends/sdl3-c.h"),
@@ -665,12 +673,12 @@ pub fn buildBackend(
         },
         .sdl3 => {
             if (target.result.abi.isAndroid()) {
-                dvui_opts.setDefaults(.{ .libc = true, .freetype = false, .tiny_file_dialogs = false, .stb_image = true, .tree_sitter = false });
+                dvui_opts.setDefaults(.{ .libc = true,  .tiny_file_dialogs = false, .stb_image = true, .tree_sitter = false });
             } else if (target.result.os.tag == .ios) {
                 // NOTE: freetype/tiny_file_dialogs/tree_sitter have no .ios build.zig support yet.
-                dvui_opts.setDefaults(.{ .libc = true, .freetype = false, .tiny_file_dialogs = false, .stb_image = true, .tree_sitter = false });
+                dvui_opts.setDefaults(.{ .libc = true,  .tiny_file_dialogs = false, .stb_image = true, .tree_sitter = false });
             } else {
-                dvui_opts.setDefaults(.{ .libc = true, .freetype = true, .tiny_file_dialogs = true, .stb_image = true, .tree_sitter = true });
+                dvui_opts.setDefaults(.{ .libc = true,  .tiny_file_dialogs = true, .stb_image = true, .tree_sitter = true });
             }
 
             const sdl_translate_c = b.addTranslateC(.{
@@ -789,7 +797,7 @@ pub fn buildBackend(
                 return error.IncompatibleVertexIndex;
             }
 
-            dvui_opts.setDefaults(.{ .libc = true, .freetype = true, .tiny_file_dialogs = true, .stb_image = false, .tree_sitter = true });
+            dvui_opts.setDefaults(.{ .libc = true,  .tiny_file_dialogs = true, .stb_image = false, .tree_sitter = true });
 
             const raylib_translate_c = b.addTranslateC(.{
                 .root_source_file = b.path("src/backends/raylib-c.h"),
@@ -871,7 +879,7 @@ pub fn buildBackend(
                 return error.IncompatibleVertexIndex;
             }
 
-            dvui_opts.setDefaults(.{ .libc = dvui_opts_in.libc orelse true, .freetype = true, .tiny_file_dialogs = true, .stb_image = false, .tree_sitter = true });
+            dvui_opts.setDefaults(.{ .libc = dvui_opts_in.libc orelse true,  .tiny_file_dialogs = true, .stb_image = false, .tree_sitter = true });
 
             const raylib_backend_mod = b.addModule("raylib_zig", .{
                 .root_source_file = b.path("src/backends/raylib-zig.zig"),
@@ -930,7 +938,7 @@ pub fn buildBackend(
                 return error.IncompatibleVertexIndex;
             }
 
-            dvui_opts.setDefaults(.{ .libc = true, .freetype = true, .tiny_file_dialogs = true, .stb_image = true, .tree_sitter = true });
+            dvui_opts.setDefaults(.{ .libc = true,  .tiny_file_dialogs = true, .stb_image = true, .tree_sitter = true });
             if (target.result.os.tag == .windows) {
                 const dx11_mod = b.addModule("dx11", .{
                     .root_source_file = b.path("src/backends/dx11.zig"),
@@ -963,7 +971,7 @@ pub fn buildBackend(
             }
         },
         .glfw => {
-            dvui_opts.setDefaults(.{ .libc = true, .freetype = true, .stb_image = true, .tiny_file_dialogs = true, .tree_sitter = true });
+            dvui_opts.setDefaults(.{ .libc = true,  .stb_image = true, .tiny_file_dialogs = true, .tree_sitter = true });
 
             if (dvui_opts.render_backend == .default) {
                 dvui_opts.render_backend = .opengl;
@@ -1026,7 +1034,7 @@ pub fn buildBackend(
                 return error.IncompatibleVertexIndex;
             }
 
-            dvui_opts.setDefaults(.{ .libc = false, .freetype = false, .tiny_file_dialogs = false, .stb_image = true, .tree_sitter = false });
+            dvui_opts.setDefaults(.{ .libc = false,  .tiny_file_dialogs = false, .stb_image = true, .tree_sitter = false });
             const export_symbol_names = &[_][]const u8{
                 "dvui_init",
                 "dvui_deinit",
@@ -1073,7 +1081,10 @@ pub fn buildBackend(
                     .test_filters = dvui_opts.test_filters,
                     .accesskit = .off,
                     .libc = false,
-                    .freetype = false,
+                    .opentype_fontconfig = false,
+                    .opentype_core_text = false,
+                    .opentype_directwrite = false,
+                    .opentype_android = false,
                     .tiny_file_dialogs = false,
                     .stb_image = true,
                     .tree_sitter = false,
@@ -1081,7 +1092,7 @@ pub fn buildBackend(
                     // no tests or checks needed, they are check above in native build
                 };
 
-                wasm_dvui_opts.setDefaults(.{ .libc = false, .freetype = false, .tiny_file_dialogs = false, .stb_image = true, .tree_sitter = false });
+                wasm_dvui_opts.setDefaults(.{ .libc = false,  .tiny_file_dialogs = false, .stb_image = true, .tree_sitter = false });
 
                 const web_mod_wasm = b.createModule(.{
                     .root_source_file = b.path("src/backends/web.zig"),
@@ -1101,7 +1112,7 @@ pub fn buildBackend(
             }
         },
         .wio => {
-            dvui_opts.setDefaults(.{ .libc = true, .freetype = true, .tiny_file_dialogs = true, .stb_image = true, .tree_sitter = true });
+            dvui_opts.setDefaults(.{ .libc = true,  .tiny_file_dialogs = true, .stb_image = true, .tree_sitter = true });
 
             if (dvui_opts.render_backend == .default) {
                 dvui_opts.render_backend = .opengl;
@@ -1151,7 +1162,7 @@ pub fn buildBackend(
             }
         },
         .pugl => {
-            dvui_opts.setDefaults(.{ .libc = true, .freetype = true, .tiny_file_dialogs = true, .stb_image = true, .tree_sitter = true });
+            dvui_opts.setDefaults(.{ .libc = true,  .tiny_file_dialogs = true, .stb_image = true, .tree_sitter = true });
 
             if (dvui_opts.render_backend == .default) {
                 dvui_opts.render_backend = .opengl;
@@ -1213,7 +1224,10 @@ const DvuiModuleOptions = struct {
     vertex_index: VertexIndex,
     libc: ?bool,
     tiny_file_dialogs: ?bool,
-    freetype: ?bool,
+    opentype_fontconfig: bool,
+    opentype_core_text: bool,
+    opentype_directwrite: bool,
+    opentype_android: bool,
     linux_display_backend: ?LinuxDisplayBackend = null,
     stb_image: ?bool,
     tree_sitter: ?bool,
@@ -1230,7 +1244,6 @@ const DvuiModuleOptions = struct {
 
     pub const DefaultOptions = struct {
         libc: bool,
-        freetype: bool,
         tiny_file_dialogs: bool,
         stb_image: bool,
         tree_sitter: bool,
@@ -1239,7 +1252,6 @@ const DvuiModuleOptions = struct {
     fn setDefaults(self: *@This(), defaults: DefaultOptions) void {
         self.libc = self.libc orelse defaults.libc;
         self.tiny_file_dialogs = self.tiny_file_dialogs orelse defaults.tiny_file_dialogs;
-        self.freetype = self.freetype orelse defaults.freetype;
         self.stb_image = self.stb_image orelse defaults.stb_image;
         self.tree_sitter = self.tree_sitter orelse defaults.tree_sitter;
     }
@@ -1255,11 +1267,6 @@ const DvuiModuleOptions = struct {
             bool,
             "tiny_file_dialogs",
             self.tiny_file_dialogs orelse @panic("makeDefaults: tiny_file_dialogs was null"),
-        );
-        ret.addOption(
-            bool,
-            "freetype",
-            self.freetype orelse @panic("makeDefaults: freetype was null"),
         );
         ret.addOption(
             bool,
@@ -1465,25 +1472,17 @@ pub fn addDvuiModule(
         });
     }
 
-    const freetype = opts.freetype orelse @panic("freetype was null");
-    if (freetype) {
-        dvui_translate_c.defineCMacro("DVUI_USE_FREETYPE", "1");
-        if (b.systemIntegrationOption("freetype", .{})) {
-            dvui_translate_c.linkSystemLibrary("freetype2", .{});
-            dvui_mod.linkSystemLibrary("freetype2", .{});
-        } else {
-            const freetype_dep = b.lazyDependency("freetype", .{
-                .target = target,
-                .optimize = optimize,
-            });
-            if (freetype_dep) |fd| {
-                dvui_translate_c.addIncludePath(fd.path("include"));
-                dvui_mod.linkLibrary(fd.artifact("freetype"));
-            }
-        }
-    } else {
-        dvui_mod.addCSourceFiles(.{ .files = &.{stb_source ++ "stb_truetype_impl.c"}, .flags = stb_flags });
-    }
+    // Text/font engine: lib-opentype-renderer, replacing FreeType/stb_truetype
+    // entirely (parsing/shaping/rasterization, no C font-rendering deps left).
+    const opentype_dep = b.dependency("opentype", .{
+        .target = target,
+        .optimize = optimize,
+        .fontconfig = opts.opentype_fontconfig,
+        .@"core-text" = opts.opentype_core_text,
+        .directwrite = opts.opentype_directwrite,
+        .android = opts.opentype_android,
+    });
+    dvui_mod.addImport("opentype", opentype_dep.module("opentype"));
 
     const tfd = opts.tiny_file_dialogs orelse @panic("tiny_file_dialogs was null");
     if (tfd) {

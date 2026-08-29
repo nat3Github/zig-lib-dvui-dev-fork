@@ -159,7 +159,7 @@ fn inspectorPanel(_: *Profiler) void {
     dvui.label(@src(), "src   {s}:{d}", .{ std.fs.path.basename(node.src_file), node.src_line }, .{});
     dvui.label(@src(), "rect  x{d:.0} y{d:.0}  {d:.0}x{d:.0}", .{ node.rect_border.x, node.rect_border.y, node.rect_border.w, node.rect_border.h }, .{});
     dvui.label(@src(), "expand {s}  style {s}", .{ @tagName(node.expand), @tagName(node.style) }, .{});
-    dvui.label(@src(), "font  {s} {d:.0}", .{ dvui.Font.string(&node.font.family), node.font.size }, .{});
+    dvui.label(@src(), "font  {s} {d:.0}", .{ node.font.familyName(), node.font.size }, .{});
     dvui.label(@src(), "focused {} active {} visible {}", .{ node.focused, node.active, node.visible }, .{});
 }
 

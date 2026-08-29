@@ -142,11 +142,7 @@ fn dvui_frame() !void {
     , .{});
     tl2.addText("Framerate is variable and adjusts as needed for input events and animations.\n\n", .{});
     tl2.addText("Cursor is always being set by dvui.\n\n", .{});
-    if (dvui.useFreeType) {
-        tl2.addText("Fonts are being rendered by FreeType 2.\n", .{});
-    } else {
-        tl2.addText("Fonts are being rendered by stb_truetype.\n", .{});
-    }
+    tl2.addText("Fonts are being rendered by opentype (lib-opentype-renderer).\n", .{});
     tl2.addText("\n", .{});
     tl2.format("Scale: {d:0.2} (try pinch-zoom)", .{dvui.windowNaturalScale()}, .{});
     tl2.deinit();
