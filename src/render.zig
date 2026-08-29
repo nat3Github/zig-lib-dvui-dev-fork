@@ -165,6 +165,8 @@ pub fn renderText(opts: TextOptions) Backend.GenericError!void {
     if (!cw.render_target.rendering) {
         var opts_copy = opts;
         opts_copy.text = try cw.arena().dupe(u8, utf8_text);
+        if (opts.kern_in) |ki| opts_copy.kern_in = try cw.arena().dupe(u32, ki);
+        if (opts.gradient) |g| opts_copy.gradient = try g.dupe(cw.arena());
         cw.addRenderCommand(.{ .text = opts_copy }, false);
         return;
     }
