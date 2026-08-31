@@ -33,7 +33,6 @@ pub const RenderCommand = struct {
     clip: Rect.Physical,
     alpha: f32,
     snap: bool,
-    kerning: bool,
     cmd: Command,
 
     pub const Command = union(enum) {
@@ -133,8 +132,6 @@ pub const TextOptions = struct {
     sel_end: ?usize = null,
     sel_color: ?Color = null,
     debug: bool = false,
-    kerning: ?bool = null,
-    kern_in: ?[]u32 = null,
     ak_opts: ?AccessKit.TextRunOptions = null,
     pre_shaped: ?*const Font.ShapedText = null,
     pre_shaped_glyph_limit: ?usize = null,
@@ -165,7 +162,6 @@ pub fn renderText(opts: TextOptions) Backend.GenericError!void {
     if (!cw.render_target.rendering) {
         var opts_copy = opts;
         opts_copy.text = try cw.arena().dupe(u8, utf8_text);
-        if (opts.kern_in) |ki| opts_copy.kern_in = try cw.arena().dupe(u32, ki);
         if (opts.gradient) |g| opts_copy.gradient = try g.dupe(cw.arena());
         cw.addRenderCommand(.{ .text = opts_copy }, false);
         return;
@@ -201,7 +197,7 @@ pub fn renderText(opts: TextOptions) Backend.GenericError!void {
         if (opts.font.line_height_factor < 1.0) {
             fallback_ascent = @round(fallback_ascent * opts.font.line_height_factor);
         }
-        line = cw.fonts.shapeLineText(cw.arena(), resolved, utf8_text) catch return error.OutOfMemory;
+        line = cw.fonts.shapeLineText(cw.arena(), cw.gpa, resolved, utf8_text) catch return error.OutOfMemory;
         owns_line = true;
     }
 
@@ -223,7 +219,7 @@ pub fn renderText(opts: TextOptions) Backend.GenericError!void {
 
     const color = opts.color.opacity(cw.alpha);
     const col: Color.PMA = .fromColor(color);
-    const white_pma: Color.PMA = .{ .r = 255, .g = 255, .b = 255, .a = 255 };
+    const white_pma: Color.PMA = .white;
 
     // Sample fresh per-vertex below when set; leave `col` as the flat
     // fallback for background/selection/underline/strike, which stay flat.

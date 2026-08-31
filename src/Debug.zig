@@ -508,7 +508,7 @@ fn dumpValue(writer: *std.Io.Writer, v: anytype) std.Io.Writer.Error!void {
     } else if (T == dvui.Font) {
         try writer.writeAll("{\"family\":");
         try dumpString(writer, v.familyName());
-        try writer.print(",\"size\":{d},\"weight\":\"{s}\",\"style\":\"{s}\"}}", .{ v.size, @tagName(v.weight), @tagName(v.style) });
+        try writer.print(",\"size\":{d},\"weight\":{d},\"style\":\"{s}\"}}", .{ v.size, v.weight.value, @tagName(v.style) });
     } else if (T == Options.Gravity) {
         try writer.print("{{\"x\":{d},\"y\":{d}}}", .{ v.x, v.y });
     } else if (T == dvui.Id) {

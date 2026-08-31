@@ -11,8 +11,6 @@ pub fn debuggingErrors() void {
         _ = dvui.sliderEntry(@src(), "{d:0.1}", .{ .value = &dvui.scroll_speed, .min = 0.1, .max = 100, .interval = 0.1 }, .{});
     }
 
-    _ = dvui.checkbox(@src(), &dvui.currentWindow().kerning, "Kerning", .{});
-
     _ = dvui.checkbox(@src(), &dvui.currentWindow().snap_to_pixels, "Snap to pixels", .{});
     dvui.label(@src(), "on non-hdpi screens watch the window title \"DVUI Demo\"", .{}, .{ .margin = .{ .x = 10 } });
     dvui.label(@src(), "- text, icons, and images rounded to nearest pixel", .{}, .{ .margin = .{ .x = 10 } });

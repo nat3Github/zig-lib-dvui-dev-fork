@@ -75,7 +75,6 @@ pub const InitOptions = struct {
     cache_layout: bool = false,
 
     break_lines: bool = false,
-    kerning: ?bool = null,
     scroll_vertical: ?bool = null, // default is value of multiline
     scroll_vertical_bar: ?ScrollInfo.ScrollBarMode = null, // default .auto
     scroll_horizontal: ?bool = null, // default true
@@ -212,7 +211,6 @@ pub fn init(self: *TextEntryWidget, src: std.builtin.SourceLocation, init_opts: 
 
     self.textLayout.init(@src(), .{
         .break_lines = self.init_opts.break_lines,
-        .kerning = self.init_opts.kerning,
         .touch_edit_just_focused = false,
         .cache_layout = self.init_opts.cache_layout,
         .focused = self.data().id == dvui.focusedWidgetId(),

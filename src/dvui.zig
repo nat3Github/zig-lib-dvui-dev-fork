@@ -981,20 +981,6 @@ pub fn snapToPixels() bool {
     return cw.snap_to_pixels;
 }
 
-/// Set kerning setting.  If true:
-/// * textSize includes kerning by default
-/// * renderText include kerning by default
-///
-/// Returns the previous setting.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn kerningSet(kern: bool) bool {
-    const cw = currentWindow();
-    const old = cw.kerning;
-    cw.kerning = kern;
-    return old;
-}
-
 /// Requests another frame to be shown.
 ///
 /// This only matters if you are using dvui to manage the framerate (by calling

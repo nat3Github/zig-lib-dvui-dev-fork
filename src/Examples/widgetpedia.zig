@@ -3071,7 +3071,6 @@ const DisplayTextEntry = struct {
                 },
                 .large => {
                     struct_ui.displayBool(@src(), "break_lines", &field_value_ptr.break_lines, .{ .boolean = .{ .widget_type = .checkbox } }, &al);
-                    struct_ui.displayOptional(@src(), T, "kerning", &field_value_ptr.kerning, 0, .{ .boolean = .{ .widget_type = .checkbox } }, .{}, &al, null);
                     struct_ui.displayBool(@src(), "cache_layout", &field_value_ptr.cache_layout, .{ .boolean = .{ .widget_type = .checkbox } }, &al);
                 },
                 else => unreachable,

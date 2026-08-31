@@ -28,7 +28,6 @@ scroll_to_focused: bool = false,
 text_input_rect: ?Rect.Natural = null,
 
 snap_to_pixels: bool = true,
-kerning: bool = true,
 /// The alpha value for all rendering. All colors alpha values will be
 /// multiplied by this value.
 alpha: f32 = 1.0,
@@ -152,10 +151,6 @@ _arena: std.heap.ArenaAllocator,
 _lifo_arena: std.heap.ArenaAllocator,
 /// Used to allocate widgets with a fixed location
 _widget_stack: WidgetStack,
-/// Counts calls to `end`, used to only shrink the per-frame arenas
-/// periodically (see `end`) instead of every frame -- shrinking every frame
-/// never lets steady-state capacity settle, causing perpetual realloc churn.
-_end_count: u32 = 0,
 render_target: dvui.RenderTarget = .{ .texture = null, .offset = .{} },
 end_rendering_done: bool = false,
 
@@ -1477,7 +1472,6 @@ pub fn addRenderCommand(self: *Self, cmd: dvui.RenderCommand.Command, after: boo
         .clip = self.clipRect,
         .alpha = self.alpha,
         .snap = self.snap_to_pixels,
-        .kerning = self.kerning,
         .cmd = cmd,
     };
     if (after) {
@@ -1495,9 +1489,6 @@ pub fn renderCommands(self: *Self, queue: []const dvui.RenderCommand) !void {
     const old_snap = self.snap_to_pixels;
     defer self.snap_to_pixels = old_snap;
 
-    const old_kern = self.kerning;
-    defer self.kerning = old_kern;
-
     const old_alpha = self.alpha;
     defer self.alpha = old_alpha;
 
@@ -1510,7 +1501,6 @@ pub fn renderCommands(self: *Self, queue: []const dvui.RenderCommand) !void {
 
     for (queue) |*drc| {
         self.snap_to_pixels = drc.snap;
-        self.kerning = drc.kerning;
         self.clipRect = drc.clip;
         self.alpha = drc.alpha;
         switch (drc.cmd) {
@@ -1780,35 +1770,22 @@ pub fn end(self: *Self, opts: endOptions) !?u32 {
     // event to the end this will print a debug message.
     self.positionMouseEventRemove();
 
-    // Shrinking every frame never lets steady-state capacity settle: once
-    // capacity converges toward what's actually used, a 10% cut forces a
-    // realloc that then gets immediately regrown next frame, forever. Only
-    // shrink periodically so a steady workload's arenas stabilize (zero
-    // reallocs) between shrinks; this still bounds long-term growth after
-    // a one-off spike (e.g. cold start).
-    self._end_count +%= 1;
-    if (self._end_count % 60 == 0) {
-        {
-            const cap = self._arena.queryCapacity();
-            //std.log.debug("_arena capacity {d}", .{cap});
-            _ = self._arena.reset(.{ .retain_with_limit = cap - @divTrunc(cap, 10) });
-        }
+    {
+        const cap = self._arena.queryCapacity();
+        //std.log.debug("_arena capacity {d}", .{cap});
+        _ = self._arena.reset(.{ .retain_with_limit = cap - @divTrunc(cap, 10) });
+    }
 
-        {
-            const cap = self._lifo_arena.queryCapacity();
-            //std.log.debug("_lifo_arena capacity {d}", .{cap});
-            _ = self._lifo_arena.reset(.{ .retain_with_limit = cap - @divTrunc(cap, 10) });
-        }
+    {
+        const cap = self._lifo_arena.queryCapacity();
+        //std.log.debug("_lifo_arena capacity {d}", .{cap});
+        _ = self._lifo_arena.reset(.{ .retain_with_limit = cap - @divTrunc(cap, 10) });
+    }
 
-        {
-            const cap = self._widget_stack.arena.queryCapacity();
-            //std.log.debug("_widget_stack capacity {d}", .{cap});
-            _ = self._widget_stack.reset(.{ .retain_with_limit = cap - @divTrunc(cap, 10) });
-        }
-    } else {
-        _ = self._arena.reset(.retain_capacity);
-        _ = self._lifo_arena.reset(.retain_capacity);
-        _ = self._widget_stack.reset(.retain_capacity);
+    {
+        const cap = self._widget_stack.arena.queryCapacity();
+        //std.log.debug("_widget_stack capacity {d}", .{cap});
+        _ = self._widget_stack.reset(.{ .retain_with_limit = cap - @divTrunc(cap, 10) });
     }
 
     // Do this here so subwindows that didn't show are gone for events.

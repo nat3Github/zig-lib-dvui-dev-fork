@@ -45,7 +45,6 @@ pub fn layoutText() void {
 
             const copies: *usize = dvui.dataGetPtrDefault(null, box.data().id, "copies", usize, 100);
             const break_lines: *bool = dvui.dataGetPtrDefault(null, box.data().id, "break_lines", bool, false);
-            const kerning: *usize = dvui.dataGetPtrDefault(null, box.data().id, "kerning", usize, 0);
             const refresh: *bool = dvui.dataGetPtrDefault(null, box.data().id, "refresh", bool, false);
             {
                 var box2 = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
@@ -71,23 +70,12 @@ pub fn layoutText() void {
                 if (dvui.checkbox(@src(), break_lines, "Break Lines", .{ .gravity_y = 0.5 })) {
                     cache_ok = false;
                 }
-
-                if (dvui.dropdown(@src(), &.{ "Kern null", "Kern true", "Kern false" }, .{ .choice = kerning }, .{}, .{ .gravity_y = 0.5, .min_size_content = .width(120) })) {
-                    cache_ok = false;
-                }
-
-                if (dvui.checkbox(@src(), &dvui.currentWindow().kerning, "Kern Global", .{ .gravity_y = 0.5 })) {
-                    cache_ok = false;
-                }
             }
 
             var scroll = dvui.scrollArea(@src(), .{}, .{ .expand = .both });
             defer scroll.deinit();
 
-            var kern: ?bool = null;
-            if (kerning.* == 1) kern = true;
-            if (kerning.* == 2) kern = false;
-            var tl = dvui.textLayout(@src(), .{ .cache_layout = cache_ok, .break_lines = break_lines.*, .kerning = kern }, .{ .expand = .both });
+            var tl = dvui.textLayout(@src(), .{ .cache_layout = cache_ok, .break_lines = break_lines.* }, .{ .expand = .both });
             defer tl.deinit();
 
             const lorem1 = "Header line with 9 indented (kerning test T.)\n" ++
