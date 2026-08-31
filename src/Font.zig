@@ -489,6 +489,15 @@ pub const Cache = struct {
     cache: dvui.TrackingAutoHashMap(u64, Entry, .get_and_put, void) = .empty,
     /// Stack-level coverage cache; separate from per-entry cache so reset doesn't evict it.
     resolved_stacks: dvui.TrackingAutoHashMap(u64, ResolvedStack, .get_and_put, void) = .empty,
+    /// Full-pipeline shape results, keyed by fnv(ResolvedStack.font_hash, text) --
+    /// otherwise every unchanged widget (grid cells, static labels) reruns bidi +
+    /// GSUB/GPOS from scratch every single frame. Segments hold `*Entry` pointers
+    /// into `cache`, which reset() can evict/reallocate, so this is cleared
+    /// alongside it rather than surviving resets like `resolved_stacks` does.
+    /// ponytail: unbounded growth for distinct (font, text) pairs until the next
+    /// reset; fine for grid/label-style static text, revisit with an LRU cap if a
+    /// scene with many unique per-frame strings (e.g. live-updating text) shows up.
+    shaped_line_cache: std.AutoHashMapUnmanaged(u64, CachedShapedLine) = .empty,
 
     pub fn deinit(self: *Cache, gpa: std.mem.Allocator, backend: Backend) void {
         defer self.* = undefined;
@@ -504,6 +513,10 @@ pub const Cache = struct {
         }
         self.resolved_stacks.deinit(gpa);
 
+        var lit = self.shaped_line_cache.valueIterator();
+        while (lit.next()) |line| line.deinit(gpa);
+        self.shaped_line_cache.deinit(gpa);
+
         for (self.database.items) |*source| {
             if (source.allocator) |a| {
                 a.free(source.bytes);
@@ -518,6 +531,10 @@ pub const Cache = struct {
             var fce = kv.value;
             fce.deinit(gpa, backend);
         }
+        // shaped_line_cache survives resets like resolved_stacks does -- its
+        // segments resolve `*Entry` by stable hash at read time (see
+        // materializeShapedLine), so a font this `reset()` evicted just drops
+        // out of the rebuilt segment list instead of dangling.
     }
 
     const max_family_variants = 64;
@@ -588,6 +605,8 @@ pub const Cache = struct {
     }
 
     pub const ResolvedStack = struct {
+        /// Font.hash() this stack was resolved from; used as a shaped_line_cache key.
+        font_hash: u64 = 0,
         /// Entry hashes; entries themselves live in Cache.cache.
         entry_hashes: [Font.max_families]u64 = @splat(0),
         entry_count: u8 = 0,
@@ -637,7 +656,7 @@ pub const Cache = struct {
         defer for (per_entry_ranges[0..count]) |r| gpa.free(r);
 
         const fallback = try Cmap.FallbackStack.build(gpa, per_entry_ranges[0..count]);
-        found.value_ptr.* = .{ .entry_hashes = entry_hashes, .entry_count = count, .fallback = fallback };
+        found.value_ptr.* = .{ .font_hash = h, .entry_hashes = entry_hashes, .entry_count = count, .fallback = fallback };
         return found.value_ptr;
     }
 
@@ -652,6 +671,12 @@ pub const Cache = struct {
     /// frame (cached in `resolved_stacks`) -- passing a per-frame arena there
     /// corrupts the map once the arena resets on the next frame.
     pub fn shapeLineText(self: *Cache, gpa: std.mem.Allocator, persist_gpa: std.mem.Allocator, resolved: *ResolvedStack, text: []const u8) std.mem.Allocator.Error!Entry.ShapedLine {
+        var key_hash = dvui.fnv.init();
+        key_hash.update(std.mem.asBytes(&resolved.font_hash));
+        key_hash.update(text);
+        const cache_key = key_hash.final();
+        if (self.shaped_line_cache.get(cache_key)) |cached| return self.materializeShapedLine(gpa, cached);
+
         const decoded = try Entry.decodeLine(gpa, text);
         errdefer gpa.free(decoded.codepoints);
         errdefer gpa.free(decoded.byte_offsets);
@@ -660,12 +685,14 @@ pub const Cache = struct {
         // evicted from `cache` since resolve (see `stackEntry`); skip it.
         var fonts_buf: [Font.max_families]OtFont = undefined;
         var entries_buf: [Font.max_families]*Entry = undefined;
+        var hashes_buf: [Font.max_families]u64 = undefined;
         var nfonts: usize = 0;
         var idx: u8 = 0;
         while (idx < resolved.entry_count) : (idx += 1) {
             if (self.stackEntry(resolved, idx)) |e| {
                 fonts_buf[nfonts] = e.parsed_font;
                 entries_buf[nfonts] = e;
+                hashes_buf[nfonts] = resolved.entry_hashes[idx];
                 nfonts += 1;
             }
         }
@@ -674,6 +701,12 @@ pub const Cache = struct {
         errdefer result.deinit();
         var segments: std.ArrayList(Entry.ShapedLine.EntrySegment) = .empty;
         errdefer segments.deinit(gpa);
+        // Entry-hash twin of `segments`, cached in place of raw `*Entry`
+        // pointers -- `cache`'s backing array can grow/rehash across frames
+        // (loading a new bold/italic/mono variant), which would otherwise
+        // leave a persisted segment's pointer dangling.
+        var cache_segments: std.ArrayList(CachedShapedLine.Segment) = .empty;
+        errdefer cache_segments.deinit(gpa);
 
         if (decoded.codepoints.len > 0 and nfonts > 0) {
             for (decoded.codepoints) |cp| _ = self.entryIndexForLogged(resolved, persist_gpa, cp); // diagnostics
@@ -693,6 +726,7 @@ pub const Cache = struct {
                 var h = g + 1;
                 while (h < shaped.font_indices.len and shaped.font_indices[h] == fi) h += 1;
                 try segments.append(gpa, .{ .entry = entries_buf[fi], .glyph_start = @intCast(g), .glyph_end = @intCast(h) });
+                try cache_segments.append(gpa, .{ .entry_hash = hashes_buf[fi], .glyph_start = @intCast(g), .glyph_end = @intCast(h) });
                 g = h;
             }
         }
@@ -700,13 +734,119 @@ pub const Cache = struct {
 
         const cluster_tables = try result.buildClusterTables(gpa, decoded.byte_offsets);
 
-        return .{
+        const line: Entry.ShapedLine = .{
             .allocator = gpa,
             .codepoints = decoded.codepoints,
             .byte_offsets = decoded.byte_offsets,
             .buffer = result,
             .cluster_starts = cluster_tables.starts,
             .cluster_ends = cluster_tables.ends,
+            .segments = try segments.toOwnedSlice(gpa),
+        };
+
+        const to_cache: CachedShapedLine = .{
+            .codepoints = decoded.codepoints,
+            .byte_offsets = decoded.byte_offsets,
+            .buffer = result,
+            .cluster_starts = cluster_tables.starts,
+            .cluster_ends = cluster_tables.ends,
+            .segments = cache_segments.items,
+        };
+        if (to_cache.clone(persist_gpa)) |persisted| {
+            var to_store = persisted;
+            self.shaped_line_cache.put(persist_gpa, cache_key, to_store) catch to_store.deinit(persist_gpa);
+        } else |_| {} // OOM on the persistent copy just means this shape isn't cached
+        cache_segments.deinit(gpa);
+
+        return line;
+    }
+
+    /// Owned copy of a shape result kept in `shaped_line_cache`. Segments
+    /// reference fonts by `entry_hash` (stable across `cache` rehashes)
+    /// rather than `*Entry` (see `shapeLineText`'s cache_segments comment);
+    /// `materializeShapedLine` resolves them back to live pointers per hit.
+    const CachedShapedLine = struct {
+        codepoints: []u21,
+        byte_offsets: []u32,
+        buffer: Buffer,
+        cluster_starts: []u32,
+        cluster_ends: []u32,
+        segments: []Segment,
+
+        const Segment = struct { entry_hash: u64, glyph_start: u32, glyph_end: u32 };
+
+        fn clone(self: CachedShapedLine, gpa: std.mem.Allocator) std.mem.Allocator.Error!CachedShapedLine {
+            var buffer = Buffer.init(gpa);
+            errdefer buffer.deinit();
+            try buffer.info.appendSlice(gpa, self.buffer.info.items);
+            try buffer.pos.appendSlice(gpa, self.buffer.pos.items);
+            buffer.have_positions = self.buffer.have_positions;
+
+            const codepoints = try gpa.dupe(u21, self.codepoints);
+            errdefer gpa.free(codepoints);
+            const byte_offsets = try gpa.dupe(u32, self.byte_offsets);
+            errdefer gpa.free(byte_offsets);
+            const cluster_starts = try gpa.dupe(u32, self.cluster_starts);
+            errdefer gpa.free(cluster_starts);
+            const cluster_ends = try gpa.dupe(u32, self.cluster_ends);
+            errdefer gpa.free(cluster_ends);
+            const segments = try gpa.dupe(Segment, self.segments);
+            errdefer gpa.free(segments);
+
+            return .{
+                .codepoints = codepoints,
+                .byte_offsets = byte_offsets,
+                .buffer = buffer,
+                .cluster_starts = cluster_starts,
+                .cluster_ends = cluster_ends,
+                .segments = segments,
+            };
+        }
+
+        fn deinit(self: *CachedShapedLine, gpa: std.mem.Allocator) void {
+            self.buffer.deinit();
+            gpa.free(self.codepoints);
+            gpa.free(self.byte_offsets);
+            gpa.free(self.cluster_starts);
+            gpa.free(self.cluster_ends);
+            gpa.free(self.segments);
+        }
+    };
+
+    /// Turns a `shaped_line_cache` hit into a caller-owned `Entry.ShapedLine`,
+    /// re-resolving each segment's `*Entry` from its stable hash (dropping
+    /// the segment entirely if that font was evicted from `cache` since the
+    /// line was cached -- same "skip it" behavior as a fresh `stackEntry` miss).
+    fn materializeShapedLine(self: *Cache, gpa: std.mem.Allocator, cached: CachedShapedLine) std.mem.Allocator.Error!Entry.ShapedLine {
+        var buffer = Buffer.init(gpa);
+        errdefer buffer.deinit();
+        try buffer.info.appendSlice(gpa, cached.buffer.info.items);
+        try buffer.pos.appendSlice(gpa, cached.buffer.pos.items);
+        buffer.have_positions = cached.buffer.have_positions;
+
+        const codepoints = try gpa.dupe(u21, cached.codepoints);
+        errdefer gpa.free(codepoints);
+        const byte_offsets = try gpa.dupe(u32, cached.byte_offsets);
+        errdefer gpa.free(byte_offsets);
+        const cluster_starts = try gpa.dupe(u32, cached.cluster_starts);
+        errdefer gpa.free(cluster_starts);
+        const cluster_ends = try gpa.dupe(u32, cached.cluster_ends);
+        errdefer gpa.free(cluster_ends);
+
+        var segments: std.ArrayList(Entry.ShapedLine.EntrySegment) = .empty;
+        errdefer segments.deinit(gpa);
+        for (cached.segments) |seg| {
+            const entry = self.cache.getPtr(seg.entry_hash) orelse continue;
+            try segments.append(gpa, .{ .entry = entry, .glyph_start = seg.glyph_start, .glyph_end = seg.glyph_end });
+        }
+
+        return .{
+            .allocator = gpa,
+            .codepoints = codepoints,
+            .byte_offsets = byte_offsets,
+            .buffer = buffer,
+            .cluster_starts = cluster_starts,
+            .cluster_ends = cluster_ends,
             .segments = try segments.toOwnedSlice(gpa),
         };
     }
@@ -912,7 +1052,7 @@ pub const Cache = struct {
             }
 
             const scale_f = ppem / units_per_em_f;
-            var entry: Entry = .{
+            const entry: Entry = .{
                 .name = fname,
                 .parsed_font = parsed_font,
                 .renderer = renderer,
@@ -920,17 +1060,6 @@ pub const Cache = struct {
                 .height = (raw_ascender - raw_descender) * scale_f,
                 .em_height = em_height,
             };
-
-            // Pre-place Latin-1 (0x20-0xFF) to avoid per-run atlas growth.
-            // CJK/emoji filled lazily to avoid load-time lag.
-            if (cmap_data) |cd| {
-                var codepoint: u21 = 0x20;
-                while (codepoint <= 0xFF) : (codepoint += 1) {
-                    const glyph_id = Cmap.lookup(cd, codepoint) orelse continue;
-                    if (glyph_id == 0) continue;
-                    _ = entry.glyphInfoGet(gpa, glyph_id) catch {};
-                }
-            }
 
             return entry;
         }

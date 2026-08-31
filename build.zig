@@ -499,6 +499,12 @@ pub fn buildBackend(
             };
             _ = addExample("testing-app", b.path("examples/app.zig"), test_dvui_and_app, example_opts, dvui_opts);
             _ = addExample("frame-dump", b.path("examples/frame-dump.zig"), false, example_opts, dvui_opts);
+            {
+                const font_bench_mod = addExample("font-bench", b.path("../dvui-dev/font-bench.zig"), false, example_opts, dvui_opts);
+                const font_bench_options = b.addOptions();
+                font_bench_options.addOption([]const u8, "variant", "opentype-integration");
+                font_bench_mod.addOptions("build_options", font_bench_options);
+            }
         },
         .proxy => {
             dvui_opts.setDefaults(.{ .libc = true,  .tiny_file_dialogs = false, .stb_image = true, .tree_sitter = true });
