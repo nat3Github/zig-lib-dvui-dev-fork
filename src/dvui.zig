@@ -4040,8 +4040,8 @@ pub fn debugFontAtlases(src: std.builtin.SourceLocation, opts: Options) void {
     var height: u32 = 0;
     var it = cw.fonts.cache.iterator();
     while (it.next()) |kv| {
-        const texture_atlas = kv.value_ptr.getTextureAtlas(cw.gpa, cw.backend) catch |err| {
-            dvui.logError(@src(), err, "Could not get texture atlast for '{s}' at height {d}", .{ kv.value_ptr.name, kv.value_ptr.height });
+        const texture_atlas = kv.value_ptr.*.getTextureAtlas(cw.gpa, cw.backend) catch |err| {
+            dvui.logError(@src(), err, "Could not get texture atlast for '{s}' at height {d}", .{ kv.value_ptr.*.name, kv.value_ptr.*.height });
             continue;
         };
         width = @max(width, texture_atlas.width);
@@ -4063,13 +4063,13 @@ pub fn debugFontAtlases(src: std.builtin.SourceLocation, opts: Options) void {
 
     it = cw.fonts.cache.iterator();
     while (it.next()) |kv| {
-        const texture_atlas = kv.value_ptr.getTextureAtlas(cw.gpa, cw.backend) catch continue;
+        const texture_atlas = kv.value_ptr.*.getTextureAtlas(cw.gpa, cw.backend) catch continue;
         rs.r = rs.r.toSize(.{
             .w = @floatFromInt(texture_atlas.width),
             .h = @floatFromInt(texture_atlas.height),
         });
         renderTexture(texture_atlas, rs, .{ .colormod = color }) catch |err| {
-            logError(@src(), err, "Could not render font atlast for '{s}'", .{kv.value_ptr.name});
+            logError(@src(), err, "Could not render font atlast for '{s}'", .{kv.value_ptr.*.name});
         };
         rs.r.y += rs.r.h;
     }

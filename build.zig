@@ -210,6 +210,7 @@ pub fn build(b: *std.Build) !void {
     const opentype_core_text = b.option(bool, "core-text", "Enable the CoreText font-discovery backend (forwarded to opentype)") orelse target.result.os.tag.isDarwin();
     const opentype_directwrite = b.option(bool, "directwrite", "Enable the DirectWrite font-discovery backend (forwarded to opentype)") orelse (target.result.os.tag == .windows);
     const opentype_android = b.option(bool, "android", "Enable the Android font-discovery backend (forwarded to opentype)") orelse (target.result.abi == .android);
+    const opentype_manifest = b.option(bool, "manifest", "Enable the manifest font-discovery backend, for fonts resolved by URL instead of an OS font source (forwarded to opentype)") orelse true;
     const stb_image_option = b.option(bool, "stb-image", "Build stb_image (default is backend specific, some include stb_image)");
     const tree_sitter_option = b.option(bool, "tree-sitter", "Build tree sitter (default is backend specific)");
     const tvg_option = b.option(bool, "tvg", "Build tvg (default true)") orelse true;
@@ -308,6 +309,7 @@ pub fn build(b: *std.Build) !void {
         .opentype_core_text = opentype_core_text,
         .opentype_directwrite = opentype_directwrite,
         .opentype_android = opentype_android,
+        .opentype_manifest = opentype_manifest,
 
         .tiny_file_dialogs = tiny_file_dialogs_option,
         .linux_display_backend = linux_display_backend,
@@ -1091,6 +1093,7 @@ pub fn buildBackend(
                     .opentype_core_text = false,
                     .opentype_directwrite = false,
                     .opentype_android = false,
+                    .opentype_manifest = true,
                     .tiny_file_dialogs = false,
                     .stb_image = true,
                     .tree_sitter = false,
@@ -1234,6 +1237,7 @@ const DvuiModuleOptions = struct {
     opentype_core_text: bool,
     opentype_directwrite: bool,
     opentype_android: bool,
+    opentype_manifest: bool,
     linux_display_backend: ?LinuxDisplayBackend = null,
     stb_image: ?bool,
     tree_sitter: ?bool,
@@ -1487,6 +1491,7 @@ pub fn addDvuiModule(
         .@"core-text" = opts.opentype_core_text,
         .directwrite = opts.opentype_directwrite,
         .android = opts.opentype_android,
+        .manifest = opts.opentype_manifest,
     });
     dvui_mod.addImport("opentype", opentype_dep.module("opentype"));
 

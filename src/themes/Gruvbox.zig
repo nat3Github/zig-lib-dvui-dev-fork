@@ -3,23 +3,12 @@ const dvui = @import("../dvui.zig");
 pub const fonts: []const dvui.Font.Source = &.{
     .{
         .family = dvui.Font.array("Aleo"),
-        .bytes = @embedFile("../fonts/Aleo/static/Aleo-Regular.ttf"),
-    },
-    .{
-        .family = dvui.Font.array("Aleo"),
-        .weight = .bold,
-        .bytes = @embedFile("../fonts/Aleo/static/Aleo-Bold.ttf"),
+        .bytes = @embedFile("../fonts/Aleo/Aleo-VariableFont_wght.ttf"),
     },
     .{
         .family = dvui.Font.array("Aleo"),
         .style = .italic,
-        .bytes = @embedFile("../fonts/Aleo/static/Aleo-Italic.ttf"),
-    },
-    .{
-        .family = dvui.Font.array("Aleo"),
-        .weight = .bold,
-        .style = .italic,
-        .bytes = @embedFile("../fonts/Aleo/static/Aleo-BoldItalic.ttf"),
+        .bytes = @embedFile("../fonts/Aleo/Aleo-Italic-VariableFont_wght.ttf"),
     },
 };
 

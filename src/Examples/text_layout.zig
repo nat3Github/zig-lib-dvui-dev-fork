@@ -3,6 +3,23 @@ var underline_thick: f32 = 0.0;
 var strike_thick: f32 = 0.0;
 var wght_axis: f32 = 400;
 var variable_font_registered = false;
+var manifest_font_state: enum { unresolved, loaded, failed } = .unresolved;
+
+/// css2-API-style manifest (family name -> variants -> font URL); see
+/// `opentype.discovery_manifest.ManifestSource`. Points at a real,
+/// statically-hosted OFL font so the demo can fetch it over HTTP.
+const manifest_test_fixture =
+    \\{
+    \\  "families": [
+    \\    {
+    \\      "name": "Tinos",
+    \\      "variants": [
+    \\        {"weight": 400, "style": "normal", "url": "https://raw.githubusercontent.com/google/fonts/main/ofl/tinos/Tinos-Regular.ttf"}
+    \\      ]
+    \\    }
+    \\  ]
+    \\}
+;
 
 /// ![image](Examples-text_layout.png)
 pub fn layoutText() void {
@@ -17,6 +34,7 @@ pub fn layoutText() void {
         defer box.deinit();
 
         const show_large_doc: *bool = dvui.dataGetPtrDefault(null, box.data().id, "show_large_doc", bool, false);
+        const show_multi_script: *bool = dvui.dataGetPtrDefault(null, box.data().id, "show_multi_script", bool, false);
 
         {
             var vbox = dvui.box(@src(), .{}, .{});
@@ -28,8 +46,60 @@ pub fn layoutText() void {
             _ = dvui.sliderEntry(@src(), "weight axis: {d:0.0}", .{ .value = &wght_axis, .min = 100, .max = 900, .interval = 1 }, .{});
         }
 
+        if (dvui.button(@src(), "Multi-Script", .{}, .{ .gravity_x = 1.0 })) {
+            show_multi_script.* = !show_multi_script.*;
+        }
+
         if (dvui.button(@src(), "Large Doc", .{}, .{ .gravity_x = 1.0 })) {
             show_large_doc.* = !show_large_doc.*;
+        }
+
+        if (show_multi_script.*) {
+            var fw = dvui.floatingWindow(@src(), .{}, .{ .max_size_content = .width(500) });
+            defer fw.deinit();
+            fw.dragAreaSet(dvui.windowHeader("Multi-Script (system fonts)", "", show_multi_script));
+
+            var scroll = dvui.scrollArea(@src(), .{}, .{ .expand = .both, .min_size_content = .{ .h = 400 } });
+            defer scroll.deinit();
+
+            var mtl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal });
+            defer mtl.deinit();
+
+            const size: f32 = 20;
+            // Label is plain ASCII in the default (Latin) font; the sample
+            // sentence after it is set in the target script's font -- most
+            // script-only system fonts (e.g. Geeza Pro, Apple Color Emoji)
+            // have no Latin glyphs, so mixing label+sample under one font
+            // tofu's the label.
+            const scripts = [_]struct { label: []const u8, family: []const u8, sample: []const u8 }{
+                .{ .label = "Latin", .family = system_fonts.table.latin, .sample = "The quick brown fox jumps over the lazy dog." },
+                .{ .label = "Arabic", .family = system_fonts.table.arabic, .sample = "هذه جملة اختبارية باللغة العربية." },
+                .{ .label = "Devanagari", .family = system_fonts.table.devanagari, .sample = "यह हिन्दी में एक परीक्षण वाक्य है।" },
+                .{ .label = "Japanese", .family = system_fonts.table.japanese, .sample = "これは日本語のテスト文です。" },
+                .{ .label = "Korean", .family = system_fonts.table.korean, .sample = "이것은 한국어 테스트 문장입니다." },
+                .{ .label = "Chinese", .family = system_fonts.table.chinese, .sample = "这是一个中文测试句子。" },
+                .{ .label = "Emoji (color)", .family = system_fonts.table.emoji_color, .sample = "\u{1F600}\u{1F389}\u{1F680}\u{2764}\u{FE0F}\u{1F525}\u{1F30D}" },
+                .{ .label = "Emoji (grey/mono)", .family = system_fonts.table.emoji_grey, .sample = "\u{2600}\u{2602}\u{267B}" },
+            };
+            for (scripts) |s| {
+                mtl.format("{s}: {s}\n", .{ s.label, s.family }, .{});
+                mtl.format("{s}\n\n", .{s.sample}, .{ .font = system_fonts.find(s.family, size) });
+            }
+
+            mtl.format("Manifest (remote font, fetched once): Tinos\n", .{}, .{});
+            const manifest_font = dvui.Font.find(.{ .family = "Tinos", .size = size });
+            if (manifest_font_state == .unresolved) {
+                manifest_font_state = .failed;
+                if (dvui.Font.resolveManifestFont(dvui.currentWindow().gpa, manifest_test_fixture, manifest_font)) |source| {
+                    dvui.currentWindow().fonts.database.append(dvui.currentWindow().gpa, source) catch {};
+                    manifest_font_state = .loaded;
+                }
+            }
+            switch (manifest_font_state) {
+                .unresolved => unreachable,
+                .loaded => mtl.format("Fetched over HTTP from a manifest URL: the quick brown fox\n\n", .{}, .{ .font = manifest_font }),
+                .failed => mtl.format("Manifest fetch failed (offline, or not available on this target)\n\n", .{}, .{}),
+            }
         }
 
         if (show_large_doc.*) {
@@ -323,3 +393,4 @@ const dvui = @import("../dvui.zig");
 const entypo = dvui.entypo;
 const TextLayoutWidget = dvui.TextLayoutWidget;
 const Rect = dvui.Rect;
+const system_fonts = @import("system_fonts.zig");

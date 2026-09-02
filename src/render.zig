@@ -192,13 +192,17 @@ pub fn renderText(opts: TextOptions) Backend.GenericError!void {
         line = shaped.line;
     } else {
         const resolved = try cw.fonts.resolveStack(cw.gpa, sized_font);
+        line = cw.fonts.shapeLineText(cw.arena(), cw.gpa, resolved, utf8_text) catch return error.OutOfMemory;
+        owns_line = true;
+        // Fetched after shapeLineText, not before: shapeLineText can insert
+        // into self.cache while lazily materializing fallback-family
+        // entries, which can grow/rehash the map and invalidate any *Entry
+        // captured beforehand.
         fallback_entry = cw.fonts.stackEntry(resolved, 0) orelse return error.OutOfMemory;
         fallback_ascent = fallback_entry.ascent;
         if (opts.font.line_height_factor < 1.0) {
             fallback_ascent = @round(fallback_ascent * opts.font.line_height_factor);
         }
-        line = cw.fonts.shapeLineText(cw.arena(), cw.gpa, resolved, utf8_text) catch return error.OutOfMemory;
-        owns_line = true;
     }
 
     // Generate new texture atlas if needed to update glyph uv coords
@@ -258,7 +262,7 @@ pub fn renderText(opts: TextOptions) Backend.GenericError!void {
     const glyph_limit = if (opts.pre_shaped != null) opts.pre_shaped_glyph_limit orelse line.buffer.info.items.len else line.buffer.info.items.len;
 
     for (line.buffer.info.items[0..glyph_limit], line.buffer.pos.items[0..glyph_limit], 0..) |info, pos, gidx| {
-        // ponytail: metrics/rasterization use each glyph's own entry
+        // NOTE: metrics/rasterization use each glyph's own entry
         // (correct for a multi-family Font), but the triangle batch below
         // is drawn in one pass against `texture_atlas` (fallback_entry's
         // atlas only) -- a glyph from a non-fallback family would sample

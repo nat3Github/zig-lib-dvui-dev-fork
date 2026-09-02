@@ -415,9 +415,14 @@ pub fn addFont(self: *Self, name: []const u8, ttf_bytes: []const u8, ttf_bytes_a
     const font: dvui.Font = .find(.{ .family = name });
     // Test if we can successfully open this font
     // TODO: Find some more elegant way of validating ttf files
-    var entry = try dvui.Font.Cache.Entry.init(self.gpa, ttf_bytes, font);
+    const entry = try dvui.Font.Cache.Entry.init(self.gpa, ttf_bytes, 0, font);
     // Try and cache the entry since the work is already done
-    self.fonts.cache.put(self.gpa, font.hash(), entry) catch entry.deinit(self.gpa, self.backend);
+    const boxed = try self.gpa.create(dvui.Font.Cache.Entry);
+    boxed.* = entry;
+    self.fonts.cache.put(self.gpa, font.hash(), boxed) catch {
+        boxed.deinit(self.gpa, self.backend);
+        self.gpa.destroy(boxed);
+    };
     self.fonts.database.appendAssumeCapacity(.{
         .family = dvui.Font.array(name),
         .bytes = ttf_bytes,
