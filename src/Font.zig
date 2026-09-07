@@ -13,6 +13,7 @@ const Buffer = opentype.Buffer;
 const BidiFallbackResult = opentype.BidiFallbackResult;
 const DiscoveryHandle = opentype.DiscoveryHandle;
 const DiscoveryProperties = opentype.DiscoveryProperties;
+const DiscoveryFamilyName = opentype.DiscoveryFamilyName;
 const OtFont = opentype.Font;
 const PositionedGlyph = opentype.PositionedGlyph;
 const Renderer = opentype.Renderer;
@@ -39,7 +40,8 @@ pub const NAME_MAX_LEN = 50;
 
 pub fn array(s: []const u8) [NAME_MAX_LEN:0]u8 {
     var v: [NAME_MAX_LEN:0]u8 = @splat(0);
-    @memcpy(v[0..s.len], s);
+    const len = @min(s.len, NAME_MAX_LEN); // OS-supplied family names can exceed the key size
+    @memcpy(v[0..len], s[0..len]);
     return v;
 }
 
@@ -63,12 +65,34 @@ pub const Strike = struct {
     thick: f32 = 0.1,
 };
 
-pub const max_families = 4;
 pub const max_variations = 4;
 
-/// Ordered family names, most-preferred first (CSS font-family model).
-families: [max_families][NAME_MAX_LEN:0]u8 = @splat(@splat(0)),
-family_count: u8 = 1,
+/// One slot of a family alias: a family name plus optional per-family
+/// tweaks, for stacks whose fonts don't agree on size or weight (a CJK
+/// fallback that runs visually large next to the Latin primary, say).
+pub const FamilyEntry = struct {
+    family: [NAME_MAX_LEN:0]u8 = @splat(0),
+    size_scale: f32 = 1,
+    weight: ?Weight = null,
+    style: ?Style = null,
+    stretch: ?Stretch = null,
+
+    pub fn apply(self: FamilyEntry, font: Font) Font {
+        var r = font.withFamily(string(&self.family));
+        r.size *= self.size_scale;
+        if (self.weight) |w| r.weight = w;
+        if (self.style) |st| r.style = st;
+        if (self.stretch) |sr| r.stretch = sr;
+        return r;
+    }
+};
+
+/// A single family name, or an alias registered with `dvui.addFontFamily`
+/// standing for an ordered list of families (CSS font-family model). Name
+/// every script you need in that list (e.g. a Latin font, an Arabic font, a
+/// CJK font) rather than relying on dynamic OS fallback, which is unreliable
+/// on Android/Windows and varies by what's installed elsewhere.
+family: [NAME_MAX_LEN:0]u8 = @splat(0),
 
 /// Height of a capital M in logical pixels.  After converting to physical
 /// pixels, the font will have an integer M height <= size.
@@ -99,15 +123,13 @@ pub const FindOptions = struct {
 };
 
 pub fn find(opts: FindOptions) Font {
-    return Font.init(&.{opts.family}).withSize(opts.size).withWeight(opts.weight).withStyle(opts.style).withStretch(opts.stretch).withLineHeight(opts.line_height_factor);
+    return Font.init(opts.family).withSize(opts.size).withWeight(opts.weight).withStyle(opts.style).withStretch(opts.stretch).withLineHeight(opts.line_height_factor);
 }
 
-/// Builds Font with 1-4 families; chainable with withSize/withWeight/etc.
-pub fn init(names: []const []const u8) Font {
-    std.debug.assert(names.len >= 1 and names.len <= max_families);
-    var r: Font = .{ .family_count = @intCast(names.len) };
-    for (names, 0..) |n, i| r.families[i] = array(n);
-    return r;
+/// Builds Font for a family name or family alias; chainable with
+/// withSize/withWeight/etc.
+pub fn init(family: []const u8) Font {
+    return .{ .family = array(family) };
 }
 
 pub const ThemeFontName = enum {
@@ -126,12 +148,9 @@ pub fn theme(which: ThemeFontName) Font {
     }
 }
 
-/// Collapses to a single family, discarding any others already set.
 pub fn withFamily(self: Font, n: []const u8) Font {
     var r: Font = self;
-    r.families = @splat(@splat(0));
-    r.families[0] = array(n);
-    r.family_count = 1;
+    r.family = array(n);
     return r;
 }
 
@@ -200,21 +219,8 @@ pub fn withStrike(self: Font, strike: ?Strike) Font {
     return r;
 }
 
-pub fn familyAt(self: *const Font, i: usize) []const u8 {
-    return string(&self.families[i]);
-}
-
 pub fn familyName(self: *const Font) []const u8 {
-    return self.familyAt(0);
-}
-
-/// Single-family Font for family index i (used by Cache.resolveStack).
-fn singleFamily(self: Font, i: usize) Font {
-    var r = self;
-    r.families = @splat(@splat(0));
-    r.families[0] = self.families[i];
-    r.family_count = 1;
-    return r;
+    return string(&self.family);
 }
 
 fn weightLabel(w: Weight) []const u8 {
@@ -240,7 +246,7 @@ pub fn format(self: *const Font, writer: *std.Io.Writer) !void {
 /// Fonts that hash the same value use the same glyphs (same Font.Entry).
 pub fn hash(self: *const Font) u64 {
     var h = dvui.fnv.init();
-    for (self.families[0..self.family_count]) |f| h.update(&f);
+    h.update(&self.family);
     h.update(std.mem.asBytes(&self.size));
     h.update(std.mem.asBytes(&self.weight));
     h.update(std.mem.asBytes(&self.style));
@@ -269,9 +275,21 @@ pub const Source = struct {
     /// discovery can match a specific weight/style to a non-zero face);
     /// ignored for a plain sfnt.
     collection_index: u32 = 0,
+    /// Human-readable family name from the font's own `name` table, for UI
+    /// display only -- `family` itself is a synthetic key (e.g. "fb:1a2b3c")
+    /// for dynamic-fallback sources, so it isn't fit to print. Empty unless
+    /// set by `Cache.loadDynamicFallback`.
+    display_family: [NAME_MAX_LEN:0]u8 = @splat(0),
 
     pub fn familyName(self: *const Source) []const u8 {
         return string(&self.family);
+    }
+
+    /// `display_family` if set, else `familyName()` -- use this to show the
+    /// user which font a `Source` came from.
+    pub fn displayName(self: *const Source) []const u8 {
+        const d = string(&self.display_family);
+        return if (d.len > 0) d else self.familyName();
     }
 
     pub fn name(self: *const Source, allocator: std.mem.Allocator) []const u8 {
@@ -280,9 +298,7 @@ pub const Source = struct {
 
     /// Font that renders from this source.
     pub fn font(self: *const Source) Font {
-        var r: Font = .{ .weight = self.weight, .style = self.style, .stretch = self.stretch };
-        r.families[0] = self.family;
-        return r;
+        return .{ .family = self.family, .weight = self.weight, .style = self.style, .stretch = self.stretch };
     }
 
     pub fn deinit(self: *Source) void {
@@ -306,6 +322,49 @@ const system_font_backend: ?type = blk: {
     break :blk null;
 };
 
+const system_font_size_limit = 256 * 1024 * 1024; // needed for big emoji fonts (Apple Color Emoji.ttc is ~180MB)
+
+/// The CSS Fonts Level 3 generic family keywords ("serif", "monospace",
+/// ...), usable as a `Font` family anywhere a real family name is -- the
+/// OS backend resolves each to whatever it means on this machine.
+pub const generic_families = DiscoveryFamilyName.generic_keywords;
+
+/// Every font family installed on this machine, alphabetically, as reported
+/// by the OS discovery backend -- so it's device-dependent by nature (a
+/// different list on macOS vs. an Android phone), unlike `generic_families`.
+/// Empty when there's no backend compiled in (e.g. wasm).
+///
+/// Names are slices into caller-owned `name_storage`, and both buffers are
+/// hard caps: a machine with more families installed than fit yields a
+/// truncated list. `gpa` is only borrowed for the duration of the call.
+pub fn systemFamilies(names_buf: [][]const u8, name_storage: []u8, gpa: std.mem.Allocator) []const []const u8 {
+    const SysBackend = system_font_backend orelse return names_buf[0..0];
+
+    var backend = SysBackend.init() catch return names_buf[0..0];
+    defer backend.deinit();
+
+    const needs_allocator = @typeInfo(@TypeOf(SysBackend.availableFamilies)).@"fn".params.len == 4;
+    const args = .{ &backend, names_buf, name_storage };
+    const families = @call(.auto, SysBackend.availableFamilies, if (needs_allocator) args ++ .{gpa} else args);
+
+    // A `Font`'s family key is a fixed NAME_MAX_LEN array, so a longer name
+    // can't round-trip back into a lookup -- drop it rather than offer it.
+    var count: usize = 0;
+    for (names_buf[0..families.len]) |family| {
+        if (family.len > NAME_MAX_LEN) continue;
+        names_buf[count] = family;
+        count += 1;
+    }
+
+    const sorted = names_buf[0..count];
+    std.mem.sortUnstable([]const u8, sorted, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.ascii.lessThanIgnoreCase(a, b);
+        }
+    }.lessThan);
+    return sorted;
+}
+
 /// Resolves `font`'s family against the OS font-discovery backend, reads
 /// the matched font file, and returns it as a `Source` -- the last resort
 /// before `Cache.getOrCreate` falls back to the embedded Vera font, for
@@ -328,7 +387,7 @@ fn discoverSystemFont(gpa: std.mem.Allocator, font: Font) ?Source {
 
     const handle = selectBestFontMatch(
         &backend,
-        &.{.{ .title = font.familyName() }},
+        &.{DiscoveryFamilyName.fromString(font.familyName())},
         properties,
         &handle_buf,
         &properties_buf,
@@ -336,7 +395,6 @@ fn discoverSystemFont(gpa: std.mem.Allocator, font: Font) ?Source {
         scratch,
     ) orelse return null;
 
-    const system_font_size_limit = 256 * 1024 * 1024; // needed for bis emoji fonts
     const loaded: struct { bytes: []const u8, collection_index: u32 } = switch (handle) {
         .path => |p| .{ .bytes = std.Io.Dir.cwd().readFileAlloc(dvui.io, p.path, gpa, .limited(system_font_size_limit)) catch return null, .collection_index = p.font_index },
         .memory => |m| .{ .bytes = gpa.dupe(u8, m.bytes) catch return null, .collection_index = m.font_index },
@@ -403,27 +461,59 @@ pub fn resolveManifestFont(gpa: std.mem.Allocator, manifest_json: []const u8, fo
     };
 }
 
-/// Blocking HTTP GET, used only by `resolveManifestFont`. Not available on
-/// wasm -- a WASM host has no synchronous network I/O, so fetching a
-/// manifest-resolved URL there needs the JS host's async `fetch()` plus a
-/// per-frame poll (the same pattern `openFilePicker` uses for the async file
-/// picker), which isn't implemented yet.
+/// Blocking HTTP GET (bounded by `fetch_timeout`), used only by
+/// `resolveManifestFont`. Not available on wasm -- a WASM host has no
+/// synchronous network I/O, so fetching a manifest-resolved URL there needs
+/// the JS host's async `fetch()` plus a per-frame poll (the same pattern
+/// `openFilePicker` uses for the async file picker), which isn't implemented
+/// yet.
+const fetch_timeout = std.Io.Duration.fromSeconds(10);
+
 fn fetchUrl(gpa: std.mem.Allocator, url: []const u8) ?[]const u8 {
     if (comptime builtin.cpu.arch.isWasm()) return null;
 
-    var client: std.http.Client = .{ .allocator = gpa, .io = dvui.io };
-    defer client.deinit();
+    const io = dvui.io;
+    const Result = union(enum) { fetched: ?[]const u8, timed_out: void };
 
-    var response: std.Io.Writer.Allocating = .init(gpa);
-    defer response.deinit();
+    const run = struct {
+        fn fetch(a: std.mem.Allocator, u: []const u8) ?[]const u8 {
+            var client: std.http.Client = .{ .allocator = a, .io = dvui.io };
+            defer client.deinit();
 
-    const result = client.fetch(.{
-        .location = .{ .url = url },
-        .response_writer = &response.writer,
-    }) catch return null;
-    if (result.status != .ok) return null;
+            var response: std.Io.Writer.Allocating = .init(a);
+            defer response.deinit();
 
-    return response.toOwnedSlice() catch null;
+            const result = client.fetch(.{
+                .location = .{ .url = u },
+                .response_writer = &response.writer,
+            }) catch return null;
+            if (result.status != .ok) return null;
+
+            return response.toOwnedSlice() catch null;
+        }
+        fn sleep(io_: std.Io) void {
+            io_.sleep(fetch_timeout, .awake) catch {};
+        }
+    };
+
+    var buf: [2]Result = undefined;
+    var sel: std.Io.Select(Result) = .init(io, &buf);
+    sel.async(.fetched, run.fetch, .{ gpa, url });
+    sel.async(.timed_out, run.sleep, .{io});
+
+    const first = sel.await() catch Result{ .timed_out = {} };
+
+    // Drain and free whatever the loser produced -- if the fetch lost the
+    // race, it may still complete (and allocate) after we've decided to
+    // return the timeout result.
+    while (sel.cancel()) |leftover| {
+        if (leftover == .fetched) if (leftover.fetched) |bytes| gpa.free(bytes);
+    }
+
+    return switch (first) {
+        .fetched => |bytes| bytes,
+        .timed_out => null,
+    };
 }
 
 pub fn textHeight(self: Font) f32 {
@@ -435,7 +525,21 @@ pub fn lineHeight(self: Font) f32 {
 }
 
 pub fn sizeM(self: Font, wide: f32, tall: f32) Size {
-    const msize: Size = self.textSize("M");
+    const ss = dvui.parentGet().screenRectScale(Rect{}).s;
+    const ask_size = self.size * ss;
+    if (ask_size == 0.0) return .{};
+
+    const cw = dvui.currentWindow();
+    const sized_font = self.withSize(ask_size);
+    const resolved = cw.fonts.resolveStack(cw.gpa, sized_font) catch return .{ .w = 10, .h = 10 };
+
+    if (resolved.m_size == null) {
+        var result = cw.fonts.textSizeRawShaped(cw.arena(), cw.gpa, resolved, "M", .{}) catch return .{ .w = 10, .h = 10 };
+        result.line.deinit();
+        resolved.m_size = result.size;
+    }
+
+    const msize = resolved.m_size.?.scale(1.0 / ss, Size);
     return .{ .w = msize.w * wide, .h = msize.h * tall };
 }
 
@@ -596,6 +700,10 @@ pub const Cache = struct {
     /// missing from every registered family only ever triggers one OS query,
     /// not one per shaped line/frame that contains it.
     dynamic_fallback: std.AutoHashMapUnmanaged(u21, ?Font) = .empty,
+    /// Family aliases from `dvui.addFontFamily`: alias -> ordered family
+    /// names, most-preferred first. Unbounded in length, unlike the family
+    /// name a `Font` itself carries.
+    family_aliases: std.StringHashMapUnmanaged([]const FamilyEntry) = .empty,
 
     pub fn deinit(self: *Cache, gpa: std.mem.Allocator, backend: Backend) void {
         defer self.* = undefined;
@@ -623,6 +731,42 @@ pub const Cache = struct {
         }
         self.database.deinit(gpa);
         self.dynamic_fallback.deinit(gpa);
+
+        var ait = self.family_aliases.iterator();
+        while (ait.next()) |kv| {
+            gpa.free(kv.key_ptr.*);
+            gpa.free(kv.value_ptr.*);
+        }
+        self.family_aliases.deinit(gpa);
+    }
+
+    /// Register `alias` as an ordered fallback stack of family names.
+    /// Re-registering an alias replaces its list; only stacks resolved after
+    /// this call see the change, so register up front.
+    pub fn addFamily(self: *Cache, gpa: std.mem.Allocator, alias: []const u8, names: []const []const u8) std.mem.Allocator.Error!void {
+        const list = try gpa.alloc(FamilyEntry, names.len);
+        defer gpa.free(list);
+        for (names, list) |n, *dst| dst.* = .{ .family = array(n) };
+        return self.addFamilyEntries(gpa, alias, list);
+    }
+
+    /// `addFamily` with per-family size/weight/style/stretch overrides.
+    pub fn addFamilyEntries(self: *Cache, gpa: std.mem.Allocator, alias: []const u8, entries: []const FamilyEntry) std.mem.Allocator.Error!void {
+        std.debug.assert(entries.len >= 1);
+        const list = try gpa.dupe(FamilyEntry, entries);
+        errdefer gpa.free(list);
+
+        // A Font's family key is truncated to NAME_MAX_LEN, so a longer
+        // alias could never be looked up under its full name.
+        const key = alias[0..@min(alias.len, NAME_MAX_LEN)];
+        if (self.family_aliases.getEntry(key)) |e| {
+            gpa.free(e.value_ptr.*);
+            e.value_ptr.* = list;
+            return;
+        }
+        const owned_key = try gpa.dupe(u8, key);
+        errdefer gpa.free(owned_key);
+        try self.family_aliases.put(gpa, owned_key, list);
     }
 
     pub fn reset(self: *Cache, gpa: std.mem.Allocator, backend: Backend) void {
@@ -634,8 +778,10 @@ pub const Cache = struct {
         }
         // shaped_line_cache survives resets like resolved_stacks does -- its
         // segments resolve `*Entry` by stable hash at read time (see
-        // materializeShapedLine), so a font this `reset()` evicted just drops
-        // out of the rebuilt segment list instead of dangling.
+        // materializeShapedLine), which invalidates and reshapes any line
+        // referencing a font this `reset()` evicted (e.g. scrolled out of
+        // view and not re-touched before the next reset) rather than
+        // rendering it with segments silently missing.
     }
 
     const max_family_variants = 64;
@@ -671,7 +817,10 @@ pub const Cache = struct {
     /// variant match, OS discovery, or the embedded fallback -- in that
     /// order. Shared by `getOrCreate` (full calibrated `Entry`) and
     /// `resolveStack` (cheap parse-only probe for fallback-stack coverage).
-    fn resolveSource(self: *Cache, gpa: std.mem.Allocator, font: Font) std.mem.Allocator.Error!Source {
+    fn resolveSource(self: *Cache, gpa: std.mem.Allocator, raw_font: Font) std.mem.Allocator.Error!Source {
+        // An alias names no font of its own; on its own (outside resolveStack)
+        // it resolves to its first family.
+        const font = if (self.family_aliases.get(raw_font.familyName())) |list| list[0].apply(raw_font) else raw_font;
         const exact, const second = self.findSource(font);
         if (exact) |s| return s;
 
@@ -706,13 +855,16 @@ pub const Cache = struct {
 
         const boxed = try gpa.create(Entry);
         errdefer gpa.destroy(boxed);
-        boxed.* = Entry.init(gpa, source.bytes, source.collection_index, font) catch |err| {
+        boxed.* = Entry.init(gpa, source.bytes, source.collection_index, font) catch |err| blk: {
             dvui.log.err("Font {s} init got {any}, using fallback", .{ fname, err });
-            // Remove the invalid font cache entry, something went wrong reading the ttf_bytes
-            self.cache.map.removeByPtr(entry.key_ptr);
-            gpa.destroy(boxed);
-            // Substitute the known good fallback font
-            return self.getOrCreate(gpa, Source.fallback.font());
+            // Fallback bytes under the *requested* hash, not the fallback
+            // font's: callers (resolveStack/stackEntry) look this entry up by
+            // the hash they asked for, and would find nothing otherwise.
+            break :blk Entry.init(gpa, Source.fallback.bytes, Source.fallback.collection_index, font) catch {
+                self.cache.map.removeByPtr(entry.key_ptr);
+                gpa.destroy(boxed);
+                return error.OutOfMemory;
+            };
         };
         entry.value_ptr.* = boxed;
         //log.debug("- size {d} ascent {d} height {d}", .{ font.size, entry.ascent, entry.height });
@@ -723,24 +875,31 @@ pub const Cache = struct {
         /// Font.hash() this stack was resolved from; used as a shaped_line_cache key.
         font_hash: u64 = 0,
         /// Entry hashes; entries themselves live in Cache.cache.
-        entry_hashes: [Font.max_families]u64 = @splat(0),
+        entry_hashes: []u64 = &.{},
         /// Single-family Font per stack slot, used to lazily materialize a
         /// full calibrated Entry via `Cache.getOrCreate` the first time a
         /// shaped line actually assigns it a glyph -- see `shapeLineText`.
-        family_fonts: [Font.max_families]Font = undefined,
-        entry_count: u8 = 0,
+        family_fonts: []Font = &.{},
         /// Parse-only (no renderer/calibration) font per stack slot, owned
         /// by this struct and independent of `Cache.cache` -- cheap to build
         /// up front for coverage purposes without paying for a fallback
         /// family's Renderer init + ppem calibration until it's actually used.
-        raw_fonts: [Font.max_families]OtFont = undefined,
+        raw_fonts: []OtFont = &.{},
         /// Merged codepoint coverage across all entries; built once per stack.
         fallback: Cmap.FallbackStack = .{},
         /// Warned codepoint blocks (cp >> 8) to suppress duplicate warnings.
         logged_missing: std.AutoHashMapUnmanaged(u21, void) = .empty,
+        /// Memoized `textSizeRawShaped(..., "M", .{})` result (screen pixels,
+        /// pre-`ss`-descale) -- `sizeM`/`textHeight` are called pervasively
+        /// (every label/slider/grid cell), so skip Buffer/segments/
+        /// materializeShapedLine on every call past the first for this stack.
+        m_size: ?Size = null,
 
         pub fn deinit(self: *ResolvedStack, gpa: std.mem.Allocator) void {
-            for (self.raw_fonts[0..self.entry_count]) |*rf| rf.deinit(gpa);
+            for (self.raw_fonts) |*rf| rf.deinit(gpa);
+            gpa.free(self.raw_fonts);
+            gpa.free(self.entry_hashes);
+            gpa.free(self.family_fonts);
             self.fallback.deinit(gpa);
             self.logged_missing.deinit(gpa);
         }
@@ -765,22 +924,30 @@ pub const Cache = struct {
         if (found.found_existing) {
             // Re-touch the primary family to recreate it if evicted by reset;
             // fallback families re-materialize lazily on next use.
-            _ = try self.getOrCreate(gpa, font.singleFamily(0));
+            _ = try self.getOrCreate(gpa, found.value_ptr.family_fonts[0]);
             return found.value_ptr;
         }
 
-        var entry_hashes: [Font.max_families]u64 = @splat(0);
-        var family_fonts: [Font.max_families]Font = undefined;
-        var raw_fonts: [Font.max_families]OtFont = undefined;
-        var per_entry_ranges: [Font.max_families][]Cmap.Range = undefined;
-        var count: u8 = 0;
+        const single: [1]FamilyEntry = .{.{ .family = font.family }};
+        const names: []const FamilyEntry = self.family_aliases.get(font.familyName()) orelse &single;
+
+        const entry_hashes = try gpa.alloc(u64, names.len);
+        errdefer gpa.free(entry_hashes);
+        const family_fonts = try gpa.alloc(Font, names.len);
+        errdefer gpa.free(family_fonts);
+        const raw_fonts = try gpa.alloc(OtFont, names.len);
+        errdefer gpa.free(raw_fonts);
+        const per_entry_ranges = try gpa.alloc([]Cmap.Range, names.len);
+        defer gpa.free(per_entry_ranges);
+
+        var count: usize = 0;
         errdefer {
             for (per_entry_ranges[0..count]) |r| gpa.free(r);
             for (raw_fonts[0..count]) |*rf| rf.deinit(gpa);
         }
 
-        for (0..font.family_count) |i| {
-            const family_font = font.singleFamily(i);
+        for (names) |family| {
+            const family_font = family.apply(font);
             family_fonts[count] = family_font;
             entry_hashes[count] = family_font.hash();
 
@@ -793,22 +960,22 @@ pub const Cache = struct {
                 },
             };
 
-            if (i == 0) _ = try self.getOrCreate(gpa, family_font); // primary family is virtually always needed
+            if (count == 0) _ = try self.getOrCreate(gpa, family_font); // primary family is virtually always needed
 
             const cmap_data = raw_fonts[count].tableData(.{ 'c', 'm', 'a', 'p' }) orelse &.{};
             per_entry_ranges[count] = try Cmap.coverageRanges(cmap_data, gpa);
             count += 1;
         }
-        defer for (per_entry_ranges[0..count]) |r| gpa.free(r);
+        defer for (per_entry_ranges) |r| gpa.free(r);
 
-        const fallback = try Cmap.FallbackStack.build(gpa, per_entry_ranges[0..count]);
-        found.value_ptr.* = .{ .font_hash = h, .entry_hashes = entry_hashes, .family_fonts = family_fonts, .entry_count = count, .raw_fonts = raw_fonts, .fallback = fallback };
+        const fallback = try Cmap.FallbackStack.build(gpa, per_entry_ranges);
+        found.value_ptr.* = .{ .font_hash = h, .entry_hashes = entry_hashes, .family_fonts = family_fonts, .raw_fonts = raw_fonts, .fallback = fallback };
         return found.value_ptr;
     }
 
     /// Entry at stack index; null if evicted by reset.
     pub fn stackEntry(self: *Cache, resolved: *const ResolvedStack, index: u8) ?*Entry {
-        if (index >= resolved.entry_count) return null;
+        if (index >= resolved.entry_hashes.len) return null;
         return if (self.cache.getPtr(resolved.entry_hashes[index])) |p| p.* else null;
     }
 
@@ -822,21 +989,36 @@ pub const Cache = struct {
     /// missing from every registered family costs one OS query total, not
     /// one per shaped line that contains it.
     ///
-    /// Not implemented for every backend: Android's system fallback is a
-    /// static ordered list in fonts.xml keyed by codepoint *ranges*, not a
-    /// query API, and DirectWrite's equivalent
-    /// (`IDWriteFontFallback::MapCharacters`) needs an `IDWriteTextAnalysisSource`
-    /// implementation the (already unverified, never-built) DirectWrite
-    /// backend doesn't have yet -- both just return null here, same as "OS
-    /// discovery found nothing".
-    fn discoverDynamicFallback(self: *Cache, gpa: std.mem.Allocator, codepoint: u21) ?Font {
+    /// Backends without a `selectFallbackForCodepoint` (e.g. the manifest
+    /// source) just return null here, same as "OS discovery found nothing".
+    ///
+    /// `persist_gpa` (not a frame arena): both `dynamic_fallback` (this
+    /// function's own memo) and `database`/the loaded font bytes (inside
+    /// `loadDynamicFallback`) live in `Cache`, which outlives the frame --
+    /// growing them with an arena that resets after this frame leaves their
+    /// backing storage dangling, corrupting the heap the next time anything
+    /// touches them (a later frame's `dynamic_fallback.get`, or the byte
+    /// buffer's owning-allocator free in `Cache.deinit`).
+    pub fn discoverDynamicFallback(self: *Cache, persist_gpa: std.mem.Allocator, codepoint: u21) ?Font {
         if (self.dynamic_fallback.get(codepoint)) |cached| return cached;
-        const found = self.loadDynamicFallback(gpa, codepoint);
-        self.dynamic_fallback.put(gpa, codepoint, found) catch {};
+        const found = self.loadDynamicFallback(persist_gpa, codepoint);
+        self.dynamic_fallback.put(persist_gpa, codepoint, found) catch {};
         return found;
     }
 
-    fn loadDynamicFallback(self: *Cache, gpa: std.mem.Allocator, codepoint: u21) ?Font {
+    /// Reads the human-readable family name out of `bytes`' `name` table, for
+    /// `Source.display_family` -- best-effort, run once per newly-discovered
+    /// fallback font (memoized by `discoverDynamicFallback`).
+    fn readDisplayFamilyName(gpa: std.mem.Allocator, bytes: []const u8, collection_index: u32) [NAME_MAX_LEN:0]u8 {
+        const parsed = Entry.parseFontOrCollection(gpa, bytes, collection_index) catch return @splat(0);
+        defer parsed.deinit(gpa);
+        const name_table = parsed.tableData(.{ 'n', 'a', 'm', 'e' }) orelse return @splat(0);
+        var buf: [NAME_MAX_LEN]u8 = undefined;
+        const found = opentype.parsing.Table.name.familyName(name_table, &buf) orelse return @splat(0);
+        return array(found);
+    }
+
+    fn loadDynamicFallback(self: *Cache, persist_gpa: std.mem.Allocator, codepoint: u21) ?Font {
         const SysBackend = system_font_backend orelse return null;
         if (!@hasDecl(SysBackend, "selectFallbackForCodepoint")) return null;
 
@@ -846,7 +1028,7 @@ pub const Cache = struct {
         var path_storage: [4096]u8 = undefined;
         const needs_allocator = @typeInfo(@TypeOf(SysBackend.selectFallbackForCodepoint)).@"fn".params.len == 4;
         const handle: DiscoveryHandle = if (needs_allocator)
-            backend.selectFallbackForCodepoint(codepoint, &path_storage, gpa) catch return null
+            backend.selectFallbackForCodepoint(codepoint, &path_storage, persist_gpa) catch return null
         else
             backend.selectFallbackForCodepoint(codepoint, &path_storage) catch return null;
 
@@ -865,18 +1047,19 @@ pub const Cache = struct {
         hasher.update(std.mem.asBytes(&p.font_index));
         var family_buf: [32]u8 = undefined;
         const family_name = std.fmt.bufPrint(&family_buf, "fb:{x}", .{hasher.final()}) catch return null;
-        const synthetic = Font.init(&.{family_name});
+        const synthetic = Font.init(family_name);
 
         if (self.findSource(synthetic).@"0" != null) return synthetic; // already loaded
 
-        const bytes = std.Io.Dir.cwd().readFileAlloc(dvui.io, p.path, gpa, .limited(64 * 1024 * 1024)) catch return null;
-        self.database.append(gpa, .{
+        const bytes = std.Io.Dir.cwd().readFileAlloc(dvui.io, p.path, persist_gpa, .limited(system_font_size_limit)) catch return null;
+        self.database.append(persist_gpa, .{
             .family = array(family_name),
             .bytes = bytes,
-            .allocator = gpa,
+            .allocator = persist_gpa,
             .collection_index = p.font_index,
+            .display_family = readDisplayFamilyName(persist_gpa, bytes, p.font_index),
         }) catch {
-            gpa.free(bytes);
+            persist_gpa.free(bytes);
             return null;
         };
         return synthetic;
@@ -891,7 +1074,18 @@ pub const Cache = struct {
         key_hash.update(std.mem.asBytes(&resolved.font_hash));
         key_hash.update(text);
         const cache_key = key_hash.final();
-        if (self.shaped_line_cache.get(cache_key)) |cached| return self.materializeShapedLine(gpa, cached);
+        if (self.shaped_line_cache.get(cache_key)) |cached| {
+            if (try self.materializeShapedLine(gpa, cached)) |line| return line;
+            // A segment's font was evicted from `cache` (unused since the
+            // last reset -- e.g. scrolled out of view) since this line was
+            // cached: the cached line is now unrenderable as-is, so drop it
+            // and fall through to reshape from scratch instead of silently
+            // rendering with missing segments.
+            if (self.shaped_line_cache.fetchRemove(cache_key)) |kv| {
+                var v = kv.value;
+                v.deinit(persist_gpa);
+            }
+        }
 
         const decoded = try Entry.decodeLine(gpa, text);
         errdefer gpa.free(decoded.codepoints);
@@ -899,39 +1093,72 @@ pub const Cache = struct {
 
         // Fallback font stack in priority order, from the cheap parse-only
         // fonts `resolveStack` built -- no `cache` lookup/eviction concerns
-        // since `raw_fonts` is owned by `resolved` itself. One extra trailing
-        // slot for a dynamically discovered system font (see below), for a
-        // codepoint no registered family covers.
-        const max_stack_fonts = Font.max_families + 1;
-        var fonts_buf: [max_stack_fonts]OtFont = undefined;
-        var hashes_buf: [max_stack_fonts]u64 = undefined;
-        var family_fonts_buf: [max_stack_fonts]Font = undefined;
-        var nfonts: usize = resolved.entry_count;
+        // since `raw_fonts` is owned by `resolved` itself. A few trailing
+        // slots for dynamically discovered system fonts (see below), for
+        // codepoints no registered family covers.
+        const dynamic_fallback_cap = 4;
+        const max_stack_fonts = resolved.entry_hashes.len + dynamic_fallback_cap;
+        const fonts_buf = try gpa.alloc(OtFont, max_stack_fonts);
+        defer gpa.free(fonts_buf);
+        const hashes_buf = try gpa.alloc(u64, max_stack_fonts);
+        defer gpa.free(hashes_buf);
+        const family_fonts_buf = try gpa.alloc(Font, max_stack_fonts);
+        defer gpa.free(family_fonts_buf);
+        var nfonts: usize = resolved.entry_hashes.len;
         for (0..nfonts) |i| {
             fonts_buf[i] = resolved.raw_fonts[i];
             hashes_buf[i] = resolved.entry_hashes[i];
             family_fonts_buf[i] = resolved.family_fonts[i];
         }
 
-        // Only one dynamic lookup per line -- covers the common case (a
-        // single missing script, e.g. CJK/emoji on a Latin-only stack)
-        // without turning every uncovered codepoint into its own OS query.
-        var dynamic_cmap: []const u8 = &.{};
+        // Query the OS for each newly-uncovered codepoint (skipping any
+        // already covered by a font discovered earlier in this same line),
+        // until the line is covered or `dynamic_fallback_cap` slots are used
+        // -- a line mixing several scripts absent from the static stack
+        // needs more than one dynamic font, not just the first.
+        var dynamic_cmaps: [dynamic_fallback_cap][]const u8 = undefined;
+        var ndynamic: usize = 0;
         if (nfonts > 0) {
             for (decoded.codepoints) |cp| {
+                if (nfonts >= max_stack_fonts) break;
                 if (resolved.entryIndexFor(cp) != null) continue;
-                if (self.discoverDynamicFallback(gpa, cp)) |dyn_font| {
+                var covered = false;
+                for (dynamic_cmaps[0..ndynamic]) |cm| {
+                    if (Cmap.lookup(cm, cp) != null) {
+                        covered = true;
+                        break;
+                    }
+                }
+                if (covered) continue;
+                // discoverDynamicFallback's memo is keyed on codepoint only
+                // (which family covers it, independent of size), so its
+                // result carries Font.DefaultSize -- rescale to the size the
+                // primary font was actually requested at.
+                if (self.discoverDynamicFallback(persist_gpa, cp)) |raw_dyn_font| {
+                    const dyn_font = raw_dyn_font.withSize(resolved.family_fonts[0].size);
+                    const dyn_hash = dyn_font.hash();
+                    var already_added = false;
+                    for (hashes_buf[resolved.entry_hashes.len..nfonts]) |h| {
+                        if (h == dyn_hash) {
+                            already_added = true;
+                            break;
+                        }
+                    }
+                    if (already_added) continue;
                     // persist_gpa: getOrCreate inserts into self.cache, which
                     // outlives this frame -- gpa here may be a frame-scoped
                     // arena that resets right after this call returns.
                     const dyn_entry = try self.getOrCreate(persist_gpa, dyn_font);
                     fonts_buf[nfonts] = dyn_entry.parsed_font;
-                    hashes_buf[nfonts] = dyn_font.hash();
+                    hashes_buf[nfonts] = dyn_hash;
                     family_fonts_buf[nfonts] = dyn_font;
-                    dynamic_cmap = dyn_entry.parsed_font.tableData(.{ 'c', 'm', 'a', 'p' }) orelse &.{};
                     nfonts += 1;
+                    const cmap = dyn_entry.parsed_font.tableData(.{ 'c', 'm', 'a', 'p' }) orelse &.{};
+                    if (cmap.len > 0 and ndynamic < dynamic_fallback_cap) {
+                        dynamic_cmaps[ndynamic] = cmap;
+                        ndynamic += 1;
+                    }
                 }
-                break;
             }
         }
 
@@ -949,7 +1176,14 @@ pub const Cache = struct {
         if (decoded.codepoints.len > 0 and nfonts > 0) {
             for (decoded.codepoints) |cp| {
                 if (resolved.entryIndexFor(cp) != null) continue;
-                if (dynamic_cmap.len > 0 and Cmap.lookup(dynamic_cmap, cp) != null) continue;
+                var covered = false;
+                for (dynamic_cmaps[0..ndynamic]) |cm| {
+                    if (Cmap.lookup(cm, cp) != null) {
+                        covered = true;
+                        break;
+                    }
+                }
+                if (covered) continue;
                 _ = self.entryIndexForLogged(resolved, persist_gpa, cp); // diagnostics
             }
             // Bidi outer, font fallback inner, so visual reordering crosses font boundaries.
@@ -1074,10 +1308,11 @@ pub const Cache = struct {
     };
 
     /// Turns a `shaped_line_cache` hit into a caller-owned `Entry.ShapedLine`,
-    /// re-resolving each segment's `*Entry` from its stable hash (dropping
-    /// the segment entirely if that font was evicted from `cache` since the
-    /// line was cached -- same "skip it" behavior as a fresh `stackEntry` miss).
-    fn materializeShapedLine(self: *Cache, gpa: std.mem.Allocator, cached: CachedShapedLine) std.mem.Allocator.Error!Entry.ShapedLine {
+    /// re-resolving each segment's `*Entry` from its stable hash -- `null` if
+    /// any segment's font was evicted from `cache` since the line was cached
+    /// (the caller reshapes from scratch rather than rendering with segments
+    /// silently missing).
+    fn materializeShapedLine(self: *Cache, gpa: std.mem.Allocator, cached: CachedShapedLine) std.mem.Allocator.Error!?Entry.ShapedLine {
         var buffer = Buffer.init(gpa);
         errdefer buffer.deinit();
         try buffer.info.appendSlice(gpa, cached.buffer.info.items);
@@ -1096,7 +1331,15 @@ pub const Cache = struct {
         var segments: std.ArrayList(Entry.ShapedLine.EntrySegment) = .empty;
         errdefer segments.deinit(gpa);
         for (cached.segments) |seg| {
-            const entry_ptr = self.cache.getPtr(seg.entry_hash) orelse continue;
+            const entry_ptr = self.cache.getPtr(seg.entry_hash) orelse {
+                segments.deinit(gpa);
+                buffer.deinit();
+                gpa.free(codepoints);
+                gpa.free(byte_offsets);
+                gpa.free(cluster_starts);
+                gpa.free(cluster_ends);
+                return null;
+            };
             try segments.append(gpa, .{ .entry = entry_ptr.*, .glyph_start = seg.glyph_start, .glyph_end = seg.glyph_end });
         }
 
@@ -1477,7 +1720,7 @@ pub const Cache = struct {
 
         /// Ensure all placed glyphs have reached GPU texture (full build or incremental upload).
         pub fn getTextureAtlas(self: *Entry, gpa: std.mem.Allocator, backend: Backend) Backend.TextureError!Texture {
-            if (self.glyphs.count() == 0) {
+            if (self.atlas_width == 0) {
                 if (self.texture_atlas_cache) |tex| return tex;
                 const blank = [1]dvui.Color.PMA{.transparent};
                 self.texture_atlas_cache = try dvui.textureCreate(&blank, .{ .width = 1, .height = 1 });
@@ -1740,6 +1983,33 @@ test "smoke: shape + measure + rasterize against embedded Vera.ttf" {
     try std.testing.expect(gi.h > 0);
 }
 
+test "sizeM: memoized result matches a fresh textSizeRawShaped(\"M\") call" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    const gpa = std.testing.allocator;
+
+    const font: Font = .find(.{ .family = "Vera", .size = 24 });
+    const cw = dvui.currentWindow();
+
+    const ss = dvui.parentGet().screenRectScale(Rect{}).s;
+    const resolved = try cw.fonts.resolveStack(cw.gpa, font.withSize(font.size * ss));
+
+    var reference = try cw.fonts.textSizeRawShaped(gpa, gpa, resolved, "M", .{});
+    defer reference.line.deinit();
+
+    const expected = reference.size.scale(1.0 / ss, Size);
+
+    const first = font.sizeM(1, 1);
+    try std.testing.expectApproxEqAbs(expected.w, first.w, 0.01);
+    try std.testing.expectApproxEqAbs(expected.h, first.h, 0.01);
+    try std.testing.expect(resolved.m_size != null);
+
+    // Second call hits the memoized ResolvedStack.m_size, not the shaping pipeline.
+    const second = font.sizeM(2, 3);
+    try std.testing.expectApproxEqAbs(expected.w * 2, second.w, 0.02);
+    try std.testing.expectApproxEqAbs(expected.h * 3, second.h, 0.03);
+}
+
 test "smoke: bidi/RTL text shapes without crashing" {
     var t = try dvui.testing.init(.{});
     defer t.deinit();
@@ -1778,7 +2048,7 @@ test "Cache.buildCoverage: earlier stack entries win overlapping coverage" {
     var fallback = try Cmap.FallbackStack.build(gpa, &.{ &entry0, &entry1 });
     defer fallback.deinit(gpa);
 
-    var resolved: Cache.ResolvedStack = .{ .entry_count = 2, .fallback = fallback };
+    var resolved: Cache.ResolvedStack = .{ .fallback = fallback };
 
     // Covered only by entry 0.
     try std.testing.expectEqual(@as(?u8, 0), resolved.entryIndexFor('A'));
@@ -1803,7 +2073,8 @@ test "Cache.shapeLineText: mixed-script text splits glyphs by stack entry" {
     // a fallback family stays unmaterialized until shaped text needs it).
     try cw.fonts.database.append(cw.gpa, .{ .family = array("TestKorean"), .bytes = @embedFile("fonts/NotoSansKR-Regular.ttf") });
 
-    const stack: Font = .init(&.{ "TestLatin", "TestKorean" });
+    try dvui.addFontFamily("TestStack", &.{ "TestLatin", "TestKorean" });
+    const stack: Font = .init("TestStack");
     const resolved = try cw.fonts.resolveStack(cw.gpa, stack);
 
     // Fallback family (index 1) isn't materialized into a full Entry until
@@ -1843,3 +2114,142 @@ test "Cache.shapeLineText: mixed-script text splits glyphs by stack entry" {
         }
     }
 }
+
+test "Cache.resolveStack: per-family entry overrides apply to the stack fonts" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+
+    try dvui.addFont("TestLatin", Source.fallback.bytes, null);
+    const cw = dvui.currentWindow();
+    try cw.fonts.database.append(cw.gpa, .{ .family = array("TestKorean"), .bytes = @embedFile("fonts/NotoSansKR-Regular.ttf") });
+
+    try dvui.addFontFamilyEntries("TestStack", &.{
+        .{ .family = array("TestLatin") },
+        .{ .family = array("TestKorean"), .size_scale = 0.5, .weight = .bold },
+    });
+    const stack: Font = .init("TestStack");
+    const resolved = try cw.fonts.resolveStack(cw.gpa, stack);
+
+    try std.testing.expectEqual(stack.size, resolved.family_fonts[0].size);
+    try std.testing.expectEqual(Font.Weight.normal, resolved.family_fonts[0].weight);
+    try std.testing.expectEqual(stack.size * 0.5, resolved.family_fonts[1].size);
+    try std.testing.expectEqual(Font.Weight.bold, resolved.family_fonts[1].weight);
+
+    // Metrics come from stack entry 0, so they track the (unscaled) primary.
+    const primary = try cw.fonts.getOrCreate(cw.gpa, resolved.family_fonts[0]);
+    try std.testing.expectEqual(primary, cw.fonts.stackEntry(resolved, 0).?);
+
+    var line = try cw.fonts.shapeLineText(std.testing.allocator, std.testing.allocator, resolved, "A\u{AC00}");
+    defer line.deinit();
+    const korean_entry = cw.fonts.stackEntry(resolved, 1).?;
+    try std.testing.expect(korean_entry.height < primary.height);
+}
+
+test "Cache.shapeLineText: a shaped_line_cache hit reshapes instead of dropping segments when a fallback font was evicted by reset()" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+
+    try dvui.addFont("TestLatin", Source.fallback.bytes, null);
+    const cw = dvui.currentWindow();
+    try cw.fonts.database.append(cw.gpa, .{ .family = array("TestKorean"), .bytes = @embedFile("fonts/NotoSansKR-Regular.ttf") });
+
+    try dvui.addFontFamily("TestStack", &.{ "TestLatin", "TestKorean" });
+    const stack: Font = .init("TestStack");
+    const resolved = try cw.fonts.resolveStack(cw.gpa, stack);
+    const text = "AB\u{AC00}\u{AC01}CD";
+
+    var line = try cw.fonts.shapeLineText(std.testing.allocator, cw.gpa, resolved, text);
+    defer line.deinit();
+    try std.testing.expectEqual(@as(usize, 3), line.segments.len);
+
+    // Simulate the Korean fragment scrolling out of view: nothing touches
+    // `cache` for two frames, so it's unused across both resets and gets
+    // evicted (used-since-last-reset only survives one reset cycle).
+    cw.fonts.reset(cw.gpa, cw.backend);
+    cw.fonts.reset(cw.gpa, cw.backend);
+    try std.testing.expectEqual(@as(?*Cache.Entry, null), cw.fonts.stackEntry(resolved, 1));
+
+    // Scrolled back into view: same text, same stack -- shaped_line_cache
+    // still has the old line cached, but its Korean segment now points at
+    // an evicted entry. Must reshape from scratch, not silently drop the
+    // Korean segment and leave the caller thinking it's Latin-only.
+    var line2 = try cw.fonts.shapeLineText(std.testing.allocator, cw.gpa, resolved, text);
+    defer line2.deinit();
+    try std.testing.expectEqual(@as(usize, 3), line2.segments.len);
+
+    const korean_entry_after = cw.fonts.stackEntry(resolved, 1).?;
+    try std.testing.expectEqual(korean_entry_after, line2.segments[1].entry);
+}
+
+test "Cache.loadDynamicFallback: rejects a discovered font with no rasterizable outline table" {
+    if (system_font_backend == null) return error.SkipZigTest;
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    const gpa = std.testing.allocator;
+
+    try dvui.addFont("Vera Sans", Source.fallback.bytes, null);
+    const cw = dvui.currentWindow();
+    const font: Font = .find(.{ .family = "Vera Sans", .size = 20 });
+    const resolved = try cw.fonts.resolveStack(cw.gpa, font);
+
+    // Simplified Chinese: on recent macOS, CoreText's cascade list for this
+    // script can bottom out at a system-UI PingFang face (PingFangUI.ttc)
+    // whose glyphs live only in Apple's proprietary `hvgl` table (no glyf/
+    // CFF/CFF2) -- unrasterizable here. Whatever font (if any) ends up
+    // materialized for this text must have a real outline table; a rejected
+    // candidate should leave the codepoints uncovered (rendered via the
+    // primary font's notdef) rather than registering a font that produces
+    // zero-size glyphs for everything.
+    const text = "这是一个中文测试句子。";
+    var line = try cw.fonts.shapeLineText(gpa, gpa, resolved, text);
+    defer line.deinit();
+
+    for (line.segments) |seg| {
+        const has_outlines = seg.entry.parsed_font.tableData(.{ 'g', 'l', 'y', 'f' }) != null or
+            seg.entry.parsed_font.tableData(.{ 'C', 'F', 'F', ' ' }) != null or
+            seg.entry.parsed_font.tableData(.{ 'C', 'F', 'F', '2' }) != null;
+        try std.testing.expect(has_outlines);
+    }
+}
+
+test "Cache.shapeLineText: emoji next to CJK gets its own dynamic-fallback font, not notdef" {
+    if (system_font_backend == null) return error.SkipZigTest;
+
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    const gpa = std.testing.allocator;
+
+    try dvui.addFont("TestLatin", Source.fallback.bytes, null);
+    const cw = dvui.currentWindow();
+
+    const stack: Font = .init("TestLatin");
+    const resolved = try cw.fonts.resolveStack(cw.gpa, stack);
+
+    // CJK immediately followed by an emoji, both uncovered by TestLatin:
+    // each needs its own OS-discovered fallback font. Regression test for
+    // two bugs found together: (1) a weak/Common-script codepoint (the
+    // emoji, or the space next to it) could ride along in the same shaped
+    // run as an adjacent strong-script codepoint's font even when that font
+    // doesn't cover it (shaping.zig's font_of run-break check only fired for
+    // "strong" script codepoints); (2) `loadDynamicFallback` capped the
+    // fallback font file read at 64MiB, silently failing to load Apple
+    // Color Emoji.ttc (~180MiB on modern macOS) and returning null.
+    const text = "\u{4E2D}\u{6587}\u{1F600}";
+    var line = try cw.fonts.shapeLineText(gpa, gpa, resolved, text);
+    defer line.deinit();
+
+    if (line.segments.len < 2) return error.SkipZigTest; // no dynamic fallback available in this environment
+
+    // Only glyphs actually shaped against a dynamically-discovered fallback
+    // font must be non-notdef -- a CJK codepoint can legitimately have no
+    // usable fallback at all (e.g. recent macOS's CJK system-UI face is
+    // `hvgl`-only and gets rejected by discovery's outline-table check) and
+    // falls back to the primary font's .notdef, which is correct, not a
+    // regression.
+    const primary = cw.fonts.stackEntry(resolved, 0).?;
+    for (line.buffer.info.items, 0..) |info, gidx| {
+        if (line.entryForGlyph(primary, gidx) == primary) continue;
+        try std.testing.expect(info.codepoint != 0); // no glyph should be .notdef
+    }
+}
+

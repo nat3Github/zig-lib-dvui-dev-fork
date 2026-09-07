@@ -205,22 +205,6 @@ pub fn renderText(opts: TextOptions) Backend.GenericError!void {
         }
     }
 
-    // Generate new texture atlas if needed to update glyph uv coords
-    const texture_atlas = fallback_entry.getTextureAtlas(cw.gpa, cw.backend) catch |err| switch (err) {
-        error.OutOfMemory => |e| return e,
-        else => {
-            const fname = opts.font.name(cw.arena());
-            defer cw.arena().free(fname);
-            dvui.log.err("Could not get texture atlas for font {s}, text area marked in magenta, to display '{s}'", .{ fname, opts.text });
-            opts.rs.r.fill(.{}, .{ .color = .magenta });
-            return;
-        },
-    };
-
-    // Over allocate the internal buffers assuming each byte is a character
-    var builder = try dvui.Triangles.Builder.init(cw.lifo(), 4 * utf8_text.len, 6 * utf8_text.len);
-    defer builder.deinit(cw.lifo());
-
     const color = opts.color.opacity(cw.alpha);
     const col: Color.PMA = .fromColor(color);
     const white_pma: Color.PMA = .white;
@@ -253,7 +237,6 @@ pub fn renderText(opts: TextOptions) Backend.GenericError!void {
     // if we will definitely have a selected region or not
     const sel: bool = sel_start < sel_end;
 
-    const atlas_size: Size = .{ .w = @floatFromInt(texture_atlas.width), .h = @floatFromInt(texture_atlas.height) };
     const snap = cw.snap_to_pixels;
 
     // `line` may cover more than `utf8_text` when reusing a wider
@@ -261,104 +244,140 @@ pub fn renderText(opts: TextOptions) Backend.GenericError!void {
     // rendered range) -- only draw the glyphs that correspond to it.
     const glyph_limit = if (opts.pre_shaped != null) opts.pre_shaped_glyph_limit orelse line.buffer.info.items.len else line.buffer.info.items.len;
 
-    for (line.buffer.info.items[0..glyph_limit], line.buffer.pos.items[0..glyph_limit], 0..) |info, pos, gidx| {
-        // NOTE: metrics/rasterization use each glyph's own entry
-        // (correct for a multi-family Font), but the triangle batch below
-        // is drawn in one pass against `texture_atlas` (fallback_entry's
-        // atlas only) -- a glyph from a non-fallback family would sample
-        // the wrong atlas. Unreachable today (nothing wires a multi-family
-        // Font into rendering, so `fce` is always `fallback_entry` here);
-        // upgrade path if that changes is per-segment triangle batches,
-        // one `renderTriangles` call per atlas.
-        const fce = line.entryForGlyph(fallback_entry, gidx);
-        const gi = fce.glyphInfoGet(cw.gpa, info.codepoint) catch continue;
+    // Glyphs can come from different `Entry`s (multi-family fallback), and
+    // each `Entry` owns its own atlas texture -- one shared vertex batch
+    // can only ever sample one atlas correctly, so batch per contiguous
+    // same-entry run and issue one `renderTriangles` call per atlas.
+    // Submission is deferred until after the loop (rather than per-segment)
+    // because `start.x` can still shift below (negative leftBearing/offset
+    // correction), and every segment must rotate around the same final
+    // `start`.
+    const SegRender = struct { tri: Triangles, tex: Texture };
+    var seg_renders: std.ArrayList(SegRender) = .empty;
+    defer {
+        for (seg_renders.items) |*sr| sr.tri.deinit(cw.lifo());
+        seg_renders.deinit(cw.lifo());
+    }
 
-        const off_x = fce.toPixels(pos.x_offset);
-        const off_y = fce.toPixels(pos.y_offset);
-        const adv = fce.toPixels(pos.x_advance);
-        const adv_used = if (snap) @round(adv) else adv;
+    var seg_start: usize = 0;
+    while (seg_start < glyph_limit) {
+        const fce = line.entryForGlyph(fallback_entry, seg_start);
+        var seg_end = seg_start + 1;
+        while (seg_end < glyph_limit and line.entryForGlyph(fallback_entry, seg_end) == fce) seg_end += 1;
 
-        if (x + off_x + gi.leftBearing < start.x) {
-            start.x -= off_x + gi.leftBearing;
-            x = start.x;
-        }
+        const texture_atlas = fce.getTextureAtlas(cw.gpa, cw.backend) catch |err| switch (err) {
+            error.OutOfMemory => |e| return e,
+            else => {
+                const fname = opts.font.name(cw.arena());
+                defer cw.arena().free(fname);
+                dvui.log.err("Could not get texture atlas for font {s}, text area marked in magenta, to display '{s}'", .{ fname, opts.text });
+                opts.rs.r.fill(.{}, .{ .color = .magenta });
+                return;
+            },
+        };
+        const atlas_size: Size = .{ .w = @floatFromInt(texture_atlas.width), .h = @floatFromInt(texture_atlas.height) };
 
-        const nextx = x + adv_used;
-        const leftx = x + off_x + gi.leftBearing;
+        var builder = try dvui.Triangles.Builder.init(cw.lifo(), 4 * (seg_end - seg_start), 6 * (seg_end - seg_start));
+        errdefer builder.deinit(cw.lifo());
 
-        if (sel) {
-            const range = line.clusterByteRange(gidx);
-            const in_sel = range.start < sel_end and range.end > sel_start;
-            if (!sel_in and in_sel) {
-                sel_in = true;
-                sel_start_x = @min(x, leftx);
-            } else if (sel_in and !in_sel) {
-                sel_in = false;
+        for (line.buffer.info.items[seg_start..seg_end], line.buffer.pos.items[seg_start..seg_end], seg_start..) |info, pos, gidx| {
+            const gi = fce.glyphInfoGet(cw.gpa, info.codepoint) catch continue;
+
+            const off_x = fce.toPixels(pos.x_offset);
+            const off_y = fce.toPixels(pos.y_offset);
+            const adv = fce.toPixels(pos.x_advance);
+            const adv_used = if (snap) @round(adv) else adv;
+
+            if (x + off_x + gi.leftBearing < start.x) {
+                start.x -= off_x + gi.leftBearing;
+                x = start.x;
             }
 
-            if (sel_in) {
-                sel_end_x = nextx;
+            const nextx = x + adv_used;
+            const leftx = x + off_x + gi.leftBearing;
+
+            if (sel) {
+                const range = line.clusterByteRange(gidx);
+                const in_sel = range.start < sel_end and range.end > sel_start;
+                if (!sel_in and in_sel) {
+                    sel_in = true;
+                    sel_start_x = @min(x, leftx);
+                } else if (sel_in and !in_sel) {
+                    sel_in = false;
+                }
+
+                if (sel_in) {
+                    sel_end_x = nextx;
+                }
             }
-        }
-        if (dvui.accesskit_enabled) {
-            if (opts.ak_opts) |_| {
-                const cluster_start = line.byte_offsets[info.cluster];
-                const cluster_end = line.byte_offsets[info.cluster + 1];
-                text_info.append(cw.arena(), .{
-                    .l = @intCast(cluster_end - cluster_start),
-                    .w = if (gi.w == 0) nextx - x else gi.w,
-                    .x = std.math.clamp(x - clipped_rect.x, 0, clipped_rect.w),
-                }) catch {};
-            }
-        }
-
-        if (gi.w > 0) {
-            const vtx_offset: dvui.Vertex.Index = @intCast(builder.vertexes.items.len);
-            var v: Vertex = undefined;
-            const base_col: Color.PMA = if (gi.is_color) white_pma else col;
-            const uv0: @Vector(2, f32) = .{ gi.origin[0] / atlas_size.w, gi.origin[1] / atlas_size.h };
-
-            v.pos.x = leftx;
-            v.pos.y = start.y - off_y + (fallback_ascent - gi.topBearing);
-            v.col = if (!gi.is_color and opts.gradient != null) .fromColor(opts.gradient.?.sample(gradient_bounds, v.pos).opacity(cw.alpha)) else base_col;
-            v.uv = uv0;
-            builder.appendVertex(v);
-
-            if (opts.debug) {
-                dvui.log.debug(" - x {d} y {d}", .{ v.pos.x, v.pos.y });
+            if (dvui.accesskit_enabled) {
+                if (opts.ak_opts) |_| {
+                    const cluster_start = line.byte_offsets[info.cluster];
+                    const cluster_end = line.byte_offsets[info.cluster + 1];
+                    text_info.append(cw.arena(), .{
+                        .l = @intCast(cluster_end - cluster_start),
+                        .w = if (gi.w == 0) nextx - x else gi.w,
+                        .x = std.math.clamp(x - clipped_rect.x, 0, clipped_rect.w),
+                    }) catch {};
+                }
             }
 
-            v.pos.x = x + off_x + gi.leftBearing + gi.w;
-            max_x = @max(max_x, v.pos.x);
-            v.uv[0] = uv0[0] + gi.w / atlas_size.w;
-            if (!gi.is_color) if (opts.gradient) |g| {
-                v.col = .fromColor(g.sample(gradient_bounds, v.pos).opacity(cw.alpha));
-            };
-            builder.appendVertex(v);
+            if (gi.w > 0) {
+                const vtx_offset: dvui.Vertex.Index = @intCast(builder.vertexes.items.len);
+                var v: Vertex = undefined;
+                const base_col: Color.PMA = if (gi.is_color) white_pma else col;
+                const uv0: @Vector(2, f32) = .{ gi.origin[0] / atlas_size.w, gi.origin[1] / atlas_size.h };
 
-            v.pos.y = start.y - off_y + (fallback_ascent - gi.topBearing + gi.h);
-            sel_max_y = @max(sel_max_y, v.pos.y);
-            v.uv[1] = uv0[1] + gi.h / atlas_size.h;
-            if (!gi.is_color) if (opts.gradient) |g| {
-                v.col = .fromColor(g.sample(gradient_bounds, v.pos).opacity(cw.alpha));
-            };
-            builder.appendVertex(v);
+                v.pos.x = leftx;
+                v.pos.y = start.y - off_y + (fallback_ascent - gi.topBearing);
+                v.col = if (!gi.is_color and opts.gradient != null) .fromColor(opts.gradient.?.sample(gradient_bounds, v.pos).opacity(cw.alpha)) else base_col;
+                v.uv = uv0;
+                builder.appendVertex(v);
 
-            v.pos.x = leftx;
-            v.uv[0] = uv0[0];
-            if (!gi.is_color) if (opts.gradient) |g| {
-                v.col = .fromColor(g.sample(gradient_bounds, v.pos).opacity(cw.alpha));
-            };
-            builder.appendVertex(v);
+                if (opts.debug) {
+                    dvui.log.debug(" - x {d} y {d}", .{ v.pos.x, v.pos.y });
+                }
 
-            // triangles must be counter-clockwise (y going down) to avoid backface culling
-            builder.appendTriangles(&.{
-                vtx_offset + 0, vtx_offset + 2, vtx_offset + 1,
-                vtx_offset + 0, vtx_offset + 3, vtx_offset + 2,
-            });
+                v.pos.x = x + off_x + gi.leftBearing + gi.w;
+                max_x = @max(max_x, v.pos.x);
+                v.uv[0] = uv0[0] + gi.w / atlas_size.w;
+                if (!gi.is_color) if (opts.gradient) |g| {
+                    v.col = .fromColor(g.sample(gradient_bounds, v.pos).opacity(cw.alpha));
+                };
+                builder.appendVertex(v);
+
+                v.pos.y = start.y - off_y + (fallback_ascent - gi.topBearing + gi.h);
+                sel_max_y = @max(sel_max_y, v.pos.y);
+                v.uv[1] = uv0[1] + gi.h / atlas_size.h;
+                if (!gi.is_color) if (opts.gradient) |g| {
+                    v.col = .fromColor(g.sample(gradient_bounds, v.pos).opacity(cw.alpha));
+                };
+                builder.appendVertex(v);
+
+                v.pos.x = leftx;
+                v.uv[0] = uv0[0];
+                if (!gi.is_color) if (opts.gradient) |g| {
+                    v.col = .fromColor(g.sample(gradient_bounds, v.pos).opacity(cw.alpha));
+                };
+                builder.appendVertex(v);
+
+                // triangles must be counter-clockwise (y going down) to avoid backface culling
+                builder.appendTriangles(&.{
+                    vtx_offset + 0, vtx_offset + 2, vtx_offset + 1,
+                    vtx_offset + 0, vtx_offset + 3, vtx_offset + 2,
+                });
+            }
+
+            x = nextx;
         }
 
-        x = nextx;
+        if (builder.vertexes.items.len > 0) {
+            try seg_renders.append(cw.lifo(), .{ .tri = builder.build(), .tex = texture_atlas });
+        } else {
+            builder.deinit(cw.lifo());
+        }
+
+        seg_start = seg_end;
     }
 
     if (opts.background_color) |bgcol| {
@@ -406,12 +425,10 @@ pub fn renderText(opts: TextOptions) Backend.GenericError!void {
         }
     }
 
-    var tri = builder.build();
-    defer tri.deinit(cw.lifo());
-
-    tri.rotate(.{ .x = start.x, .y = start.y }, opts.rotation);
-
-    try renderTriangles(tri, texture_atlas);
+    for (seg_renders.items) |*sr| {
+        sr.tri.rotate(.{ .x = start.x, .y = start.y }, opts.rotation);
+        try renderTriangles(sr.tri, sr.tex);
+    }
 
     if (dvui.accesskit_enabled) if (opts.ak_opts) |ak_opts| {
         cw.accesskit.textRunPopulate(opts.text, ak_opts, &text_info, clipped_rect);

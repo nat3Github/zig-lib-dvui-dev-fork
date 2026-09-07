@@ -3,7 +3,7 @@
 pub const zig_favicon = @embedFile("zig-favicon.png");
 pub const zig_svg = @embedFile("zig-mark.svg");
 
-pub var show_demo_window: bool = false;
+pub var show_demo_window: bool = true;
 pub var show_widgetpedia_window: bool = false;
 pub var icon_browser_show: bool = false;
 pub var stroke_test_show: bool = false;
@@ -80,7 +80,7 @@ pub const demoKind = enum {
     }
 };
 
-pub var demo_active: demoKind = .basic_widgets;
+pub var demo_active: demoKind = .text_layout;
 pub const demo_window_tag = "dvui_example_window";
 
 pub fn floatRetainClear(ptr: *anyopaque) void {

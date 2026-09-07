@@ -160,10 +160,17 @@ fn fonts(theme: *Theme) bool {
     const hbox = dvui.box(@src(), .{ .dir = .horizontal }, .{ .role = .tab_panel });
     defer hbox.deinit();
 
-    const edited_font: *dvui.Font = &theme.font_body;
-
     var vbox = dvui.box(@src(), .{}, .{ .expand = .both });
     defer vbox.deinit();
+
+    const which = dvui.dataGetPtrDefault(null, vbox.data().id, "which_font", dvui.Font.ThemeFontName, .body);
+    _ = dvui.dropdownEnum(@src(), dvui.Font.ThemeFontName, .{ .choice = which }, .{}, .{});
+    const edited_font: *dvui.Font = switch (which.*) {
+        .body => &theme.font_body,
+        .heading => &theme.font_heading,
+        .title => &theme.font_title,
+        .mono => &theme.font_mono,
+    };
 
     if (dvui.sliderEntry(@src(), "Size: {d:0}", .{ .min = 4, .max = 100, .interval = 1, .value = &edited_font.size }, .{})) {
         changed = true;
@@ -172,23 +179,43 @@ fn fonts(theme: *Theme) bool {
         changed = true;
     }
 
+    const cw = dvui.currentWindow();
     var current_font_index: ?usize = null;
     var current_font_name: []const u8 = "Unknown";
-    for (dvui.currentWindow().fonts.database.items, 0..) |dbs, i| {
+    for (cw.fonts.database.items, 0..) |dbs, i| {
         if (std.mem.eql(u8, dbs.familyName(), edited_font.familyName())) {
             current_font_index = i;
             current_font_name = edited_font.familyName();
+        }
+    }
+    {
+        var i = cw.fonts.database.items.len;
+        var it = cw.fonts.family_aliases.keyIterator();
+        while (it.next()) |key| : (i += 1) {
+            if (std.mem.eql(u8, key.*, edited_font.familyName())) {
+                current_font_index = i;
+                current_font_name = key.*;
+            }
         }
     }
 
     var dd: dvui.DropdownWidget = undefined;
     dd.init(@src(), .{ .selected_index = current_font_index, .label = current_font_name }, .{});
     if (dd.dropped()) {
-        for (dvui.currentWindow().fonts.database.items) |dbs| {
-            const font_name = dbs.name(dvui.currentWindow().lifo());
-            defer dvui.currentWindow().lifo().free(font_name);
+        for (cw.fonts.database.items) |dbs| {
+            const font_name = dbs.name(cw.lifo());
+            defer cw.lifo().free(font_name);
             if (dd.addChoiceLabel(font_name)) {
                 edited_font.* = edited_font.withFamily(dbs.familyName()).withStyle(dbs.style).withWeight(dbs.weight);
+                changed = true;
+            }
+        }
+        // Aliases name a whole stack, not one face -- style/weight belong to
+        // the entries inside it, so don't overwrite them here.
+        var it = cw.fonts.family_aliases.keyIterator();
+        while (it.next()) |key| {
+            if (dd.addChoiceLabel(key.*)) {
+                edited_font.* = edited_font.withFamily(key.*);
                 changed = true;
             }
         }

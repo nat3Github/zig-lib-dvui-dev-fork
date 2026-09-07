@@ -595,6 +595,28 @@ pub fn addFont(name: []const u8, ttf_bytes: []const u8, ttf_bytes_allocator: ?st
     try currentWindow().addFont(name, ttf_bytes, ttf_bytes_allocator);
 }
 
+/// Register `alias` as an ordered fallback stack of family names, usable as
+/// a `Font` family anywhere a real family name is: the first family covering
+/// a codepoint renders it. Name one family per script you care about (Latin,
+/// Arabic, CJK, ...) instead of relying on OS fallback.
+///
+/// Only affects text shaped after this call, so register at startup.
+///
+/// Only valid between `Window.begin` and `Window.end`.
+pub fn addFontFamily(alias: []const u8, families: []const []const u8) std.mem.Allocator.Error!void {
+    const cw = currentWindow();
+    try cw.fonts.addFamily(cw.gpa, alias, families);
+}
+
+/// `addFontFamily` with per-family overrides (size scale, weight, style,
+/// stretch) applied to each family in the stack.
+///
+/// Only valid between `Window.begin` and `Window.end`.
+pub fn addFontFamilyEntries(alias: []const u8, entries: []const Font.FamilyEntry) std.mem.Allocator.Error!void {
+    const cw = currentWindow();
+    try cw.fonts.addFamilyEntries(cw.gpa, alias, entries);
+}
+
 // Get or load the underlying font at an integer size <= font.size (guaranteed to have a minimum pixel size of 1)
 pub fn fontCacheGet(font: Font) std.mem.Allocator.Error!*Font.Cache.Entry {
     const cw = currentWindow();

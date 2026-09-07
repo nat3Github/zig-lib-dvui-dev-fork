@@ -86,3 +86,4 @@ targets:
       - sdk: OpenGLES.framework
       - sdk: CoreGraphics.framework
       - sdk: CoreHaptics.framework
+      - sdk: CoreText.framework

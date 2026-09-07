@@ -1311,8 +1311,11 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
 
     const options = self.data().options.override(opts);
     const font = options.fontGet();
+    // font.lineHeight() is textHeight() * factor, and textHeight() is
+    // sizeM(1,1).h -- reuse msize instead of re-shaping "M" a second time
+    // for the same font/scale.
     const msize = font.sizeM(1, 1);
-    const line_height = font.lineHeight();
+    const line_height = msize.h * font.line_height_factor;
 
     var container_width = self.data().contentRect().w;
     if (container_width == 0) {

@@ -10,7 +10,7 @@ comptime {
 const window_icon_png = @embedFile("zig-favicon.png");
 
 const vsync = true;
-const show_demo = false;
+const show_demo = true;
 var scale_val: f32 = 1.0;
 
 var show_dialog_outside_frame: bool = false;

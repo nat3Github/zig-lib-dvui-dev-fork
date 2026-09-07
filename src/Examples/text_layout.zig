@@ -2,8 +2,19 @@ var line_height_factor: f32 = 1.2;
 var underline_thick: f32 = 0.0;
 var strike_thick: f32 = 0.0;
 var wght_axis: f32 = 400;
+var multi_script_font_size: f32 = 18;
+var multi_script_family_choice: usize = 0;
 var variable_font_registered = false;
+/// Registered stack alias, first entry in the family dropdown below.
+const demo_stack_alias = "Demo Stack (Aleo + Noto KR)";
+/// Dropdown entries: the 5 CSS generics, then every family this device
+/// actually has installed (`dvui.Font.systemFamilies`), enumerated once --
+/// the OS query walks the whole font catalog, too slow to redo per frame.
+var family_choices: ?[]const []const u8 = null;
+var family_choices_buf: [1024][]const u8 = undefined;
+var family_names_storage: [64 * 1024]u8 = undefined;
 var manifest_font_state: enum { unresolved, loaded, failed } = .unresolved;
+var manifest_woff2_font_state: enum { unresolved, loaded, failed } = .unresolved;
 
 /// css2-API-style manifest (family name -> variants -> font URL); see
 /// `opentype.discovery_manifest.ManifestSource`. Points at a real,
@@ -21,12 +32,40 @@ const manifest_test_fixture =
     \\}
 ;
 
+/// Same font, WOFF2-encoded (Google Fonts' actual serving format) -- exercises
+/// the `opentype` WOFF2 decoder end to end, which the plain-.ttf fixture above
+/// never touches. Requires the library built with `-Dwoff2=true`; otherwise
+/// `resolveManifestFont` fails with `error.Woff2NotSupported`, same as any
+/// other unsupported-format failure.
+const manifest_woff2_test_fixture =
+    \\{
+    \\  "families": [
+    \\    {
+    \\      "name": "Tinos WOFF2",
+    \\      "variants": [
+    \\        {"weight": 400, "style": "normal", "url": "https://fonts.gstatic.com/s/tinos/v26/buE4poGnedXvwjX7fmQ.woff2"}
+    \\      ]
+    \\    }
+    \\  ]
+    \\}
+;
+
 /// ![image](Examples-text_layout.png)
 pub fn layoutText() void {
     // Register a variable font once so the wght slider below has an fvar axis
     // to move. Bytes are embedded (static), so pass null allocator.
     if (!variable_font_registered) {
         dvui.addFont("Aleo VF", @embedFile("../fonts/Aleo/Aleo-VariableFont_wght.ttf"), null) catch {};
+        dvui.addFont("Noto Sans KR", @embedFile("../fonts/NotoSansKR-Regular.ttf"), null) catch {};
+        // An explicit family stack (CSS font-family model): Latin from Aleo,
+        // Hangul from Noto Sans KR, everything else from whatever the OS
+        // calls sans-serif. The KR slot is scaled down because Noto's
+        // Hangul runs visually larger than Aleo's Latin at the same size.
+        dvui.addFontFamilyEntries(demo_stack_alias, &.{
+            .{ .family = dvui.Font.array("Aleo VF") },
+            .{ .family = dvui.Font.array("Noto Sans KR"), .size_scale = 0.85 },
+            .{ .family = dvui.Font.array("sans-serif") },
+        }) catch {};
         variable_font_registered = true;
     }
     {
@@ -59,46 +98,116 @@ pub fn layoutText() void {
             defer fw.deinit();
             fw.dragAreaSet(dvui.windowHeader("Multi-Script (system fonts)", "", show_multi_script));
 
+            // A single font is used for every sample line below; whatever
+            // its family (or generic alias) doesn't cover goes to dvui's
+            // dynamic OS-fallback (Font.Cache.discoverDynamicFallback). The
+            // label after each script name is the font that actually renders
+            // it -- shown so a broken/absent fallback (wrong font, or "no
+            // fallback available") is visible here instead of only showing
+            // up as tofu boxes in the sample text.
+            const families = family_choices orelse blk: {
+                family_choices_buf[0] = demo_stack_alias;
+                const generics = dvui.Font.generic_families;
+                for (generics, 0..) |g, i| family_choices_buf[1 + i] = g;
+                var head = 1 + generics.len;
+                // CoreText hides the system UI font from
+                // CTFontManagerCopyAvailableFontFamilyNames, so SF never shows
+                // up below -- but "System Font" still resolves by name.
+                if (@import("builtin").os.tag.isDarwin()) {
+                    family_choices_buf[head] = "System Font";
+                    head += 1;
+                }
+                const system = dvui.Font.systemFamilies(
+                    family_choices_buf[head..],
+                    &family_names_storage,
+                    dvui.currentWindow().gpa,
+                );
+                family_choices = family_choices_buf[0 .. head + system.len];
+                break :blk family_choices.?;
+            };
+            {
+                // Must be a sibling of the scroll area/text layout below, not
+                // a child of `mtl` -- TextLayoutWidget.rectFor only places
+                // children at its 4 corners (for overlay buttons), so a plain
+                // flow widget placed inside it lands on top of/under the text.
+                var hbox = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
+                defer hbox.deinit();
+                _ = dvui.sliderEntry(@src(), "font size: {d:0.0}", .{ .value = &multi_script_font_size, .min = 8, .max = 48, .interval = 1 }, .{ .gravity_y = 0.5 });
+                _ = dvui.dropdown(@src(), families, .{ .choice = &multi_script_family_choice }, .{}, .{ .gravity_y = 0.5 });
+
+                // Fetch only on explicit click, not every time this panel is
+                // shown -- resolveManifestFont blocks the UI thread on a
+                // synchronous HTTP GET, which would freeze the whole app
+                // (including its first frame, if this panel is open by
+                // default) for as long as the network call takes.
+                if (manifest_font_state == .unresolved and dvui.button(@src(), "Fetch Tinos", .{}, .{ .gravity_y = 0.5 })) {
+                    manifest_font_state = .failed;
+                    if (dvui.Font.resolveManifestFont(dvui.currentWindow().gpa, manifest_test_fixture, dvui.Font.find(.{ .family = "Tinos" }))) |source| {
+                        dvui.currentWindow().fonts.database.append(dvui.currentWindow().gpa, source) catch {};
+                        manifest_font_state = .loaded;
+                    }
+                }
+                if (manifest_woff2_font_state == .unresolved and dvui.button(@src(), "Fetch Tinos WOFF2", .{}, .{ .gravity_y = 0.5 })) {
+                    manifest_woff2_font_state = .failed;
+                    if (dvui.Font.resolveManifestFont(dvui.currentWindow().gpa, manifest_woff2_test_fixture, dvui.Font.find(.{ .family = "Tinos WOFF2" }))) |source| {
+                        dvui.currentWindow().fonts.database.append(dvui.currentWindow().gpa, source) catch {};
+                        manifest_woff2_font_state = .loaded;
+                    }
+                }
+            }
+
             var scroll = dvui.scrollArea(@src(), .{}, .{ .expand = .both, .min_size_content = .{ .h = 400 } });
             defer scroll.deinit();
 
             var mtl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal });
             defer mtl.deinit();
 
-            const size: f32 = 20;
-            // Label is plain ASCII in the default (Latin) font; the sample
-            // sentence after it is set in the target script's font -- most
-            // script-only system fonts (e.g. Geeza Pro, Apple Color Emoji)
-            // have no Latin glyphs, so mixing label+sample under one font
-            // tofu's the label.
-            const scripts = [_]struct { label: []const u8, family: []const u8, sample: []const u8 }{
-                .{ .label = "Latin", .family = system_fonts.table.latin, .sample = "The quick brown fox jumps over the lazy dog." },
-                .{ .label = "Arabic", .family = system_fonts.table.arabic, .sample = "هذه جملة اختبارية باللغة العربية." },
-                .{ .label = "Devanagari", .family = system_fonts.table.devanagari, .sample = "यह हिन्दी में एक परीक्षण वाक्य है।" },
-                .{ .label = "Japanese", .family = system_fonts.table.japanese, .sample = "これは日本語のテスト文です。" },
-                .{ .label = "Korean", .family = system_fonts.table.korean, .sample = "이것은 한국어 테스트 문장입니다." },
-                .{ .label = "Chinese", .family = system_fonts.table.chinese, .sample = "这是一个中文测试句子。" },
-                .{ .label = "Emoji (color)", .family = system_fonts.table.emoji_color, .sample = "\u{1F600}\u{1F389}\u{1F680}\u{2764}\u{FE0F}\u{1F525}\u{1F30D}" },
-                .{ .label = "Emoji (grey/mono)", .family = system_fonts.table.emoji_grey, .sample = "\u{2600}\u{2602}\u{267B}" },
+            const font_size = multi_script_font_size;
+            const font = dvui.Font.init(families[multi_script_family_choice]).withSize(font_size);
+
+            const scripts = [_]struct { label: []const u8, sample: []const u8 }{
+                .{ .label = "Latin", .sample = "The quick brown fox jumps over the lazy dog." },
+                .{ .label = "Arabic", .sample = "هذه جملة اختبارية باللغة العربية." },
+                .{ .label = "Devanagari", .sample = "यह हिन्दी में एक परीक्षण वाक्य है।" },
+                .{ .label = "Japanese", .sample = "これは日本語のテスト文です。" },
+                .{ .label = "Korean", .sample = "이것은 한국어 테스트 문장입니다." },
+                .{ .label = "Chinese", .sample = "这是一个中文测试句子。" },
+                .{ .label = "Emoji (color)", .sample = "\u{1F600}\u{1F389}\u{1F680}\u{2764}\u{FE0F}\u{1F525}\u{1F30D}" },
+                .{ .label = "Emoji (grey/mono)", .sample = "\u{2600}\u{2602}\u{267B}" },
             };
             for (scripts) |s| {
-                mtl.format("{s}: {s}\n", .{ s.label, s.family }, .{});
-                mtl.format("{s}\n\n", .{s.sample}, .{ .font = system_fonts.find(s.family, size) });
+                // Outlives the block below: `displayName()` borrows from it.
+                var source: dvui.Font.Source = undefined;
+                const resolved_name: []const u8 = blk: {
+                    const len = std.unicode.utf8ByteSequenceLength(s.sample[0]) catch 1;
+                    const cp = std.unicode.utf8Decode(s.sample[0..len]) catch break :blk "not text";
+                    const cw = dvui.currentWindow();
+                    const stack = cw.fonts.resolveStack(cw.gpa, font) catch break :blk "out of memory";
+                    if (stack.entryIndexFor(cp)) |idx| {
+                        const family_font = stack.family_fonts[idx];
+                        source = family_font.findSource() orelse break :blk family_font.familyName();
+                        break :blk source.displayName();
+                    }
+                    const fb_font = cw.fonts.discoverDynamicFallback(cw.gpa, cp) orelse break :blk "no fallback available";
+                    source = fb_font.findSource() orelse break :blk "no fallback available";
+                    break :blk source.displayName();
+                };
+                mtl.format("{s}: {s}\n", .{ s.label, resolved_name }, .{ .font = font });
+                mtl.format("{s}\n\n", .{s.sample}, .{ .font = font });
             }
 
-            mtl.format("Manifest (remote font, fetched once): Tinos\n", .{}, .{});
-            const manifest_font = dvui.Font.find(.{ .family = "Tinos", .size = size });
-            if (manifest_font_state == .unresolved) {
-                manifest_font_state = .failed;
-                if (dvui.Font.resolveManifestFont(dvui.currentWindow().gpa, manifest_test_fixture, manifest_font)) |source| {
-                    dvui.currentWindow().fonts.database.append(dvui.currentWindow().gpa, source) catch {};
-                    manifest_font_state = .loaded;
-                }
-            }
+            const manifest_font = dvui.Font.find(.{ .family = "Tinos", .size = font_size });
             switch (manifest_font_state) {
-                .unresolved => unreachable,
+                .unresolved => mtl.format("Manifest (remote font): press \"Fetch Tinos\"\n\n", .{}, .{}),
                 .loaded => mtl.format("Fetched over HTTP from a manifest URL: the quick brown fox\n\n", .{}, .{ .font = manifest_font }),
                 .failed => mtl.format("Manifest fetch failed (offline, or not available on this target)\n\n", .{}, .{}),
+            }
+
+            const manifest_woff2_font = dvui.Font.find(.{ .family = "Tinos WOFF2", .size = font_size });
+            switch (manifest_woff2_font_state) {
+                .unresolved => mtl.format("Manifest (remote WOFF2 font): press \"Fetch Tinos WOFF2\"\n\n", .{}, .{}),
+                .loaded => mtl.format("Fetched WOFF2 over HTTP from a manifest URL: the quick brown fox\n\n", .{}, .{ .font = manifest_woff2_font }),
+                .failed => mtl.format("WOFF2 manifest fetch failed (offline, not built with -Dwoff2=true, or not available on this target)\n\n", .{}, .{}),
             }
         }
 
@@ -263,7 +372,7 @@ pub fn layoutText() void {
         tl.addText("ugly text ", .{ .font = dvui.Font.theme(.body).larger(8), .color_text = .{ .color = .{ .r = 100, .g = 100 } }, .color_fill = .teal });
         tl.addText("that shows styling.", .{ .font = dvui.Font.theme(.body).larger(-2), .color_text = .{ .color = .{ .r = 100, .g = 50, .b = 50 } } });
 
-        const variable_font = dvui.Font.init(&.{"Aleo VF"}).larger(4).withVariation("wght", wght_axis);
+        const variable_font = dvui.Font.init("Aleo VF").larger(4).withVariation("wght", wght_axis);
         tl.format("\n\nVariable font (wght={d:0.0}): the quick brown fox\n", .{wght_axis}, .{ .font = variable_font });
     }
 
@@ -393,4 +502,3 @@ const dvui = @import("../dvui.zig");
 const entypo = dvui.entypo;
 const TextLayoutWidget = dvui.TextLayoutWidget;
 const Rect = dvui.Rect;
-const system_fonts = @import("system_fonts.zig");
