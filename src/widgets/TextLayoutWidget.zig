@@ -1516,243 +1516,17 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
             }
         }
 
-        // `end` is now final for this fragment: how many leading glyphs of
-        // `shaped` (if any) correspond to `txt[0..end]`, for reuse by
-        // cursor/selection tracking and the render call below.
-        const shaped_glyph_limit: ?usize = if (shaped) |*st| st.line.glyphLimitForByteOffset(end) else null;
-
-        // now we know the line of text we are about to render
-
-        if (self.current_line_ascent == 0.0) {
-            // this is the first text
-            self.current_line_ascent = ascent;
-
-            while (self.line_ascents.len > self.line_ascents_idx + 1 and self.line_ascents[self.line_ascents_idx].line < self.line) {
-                self.line_ascents_idx += 1;
-            }
-            if (self.line_ascents_idx < self.line_ascents.len and self.line_ascents[self.line_ascents_idx].line == self.line) {
-                self.current_line_ascent_recorded = self.line_ascents[self.line_ascents_idx].ascent;
-            }
-        } else if (ascent > self.current_line_ascent) {
-            // we only care if the ascent got bigger, meaning we already laid
-            // out some text badly, so need this info for next frame
-            if (self.line_ascents_new.items.len > 0 and self.line_ascents_new.items[self.line_ascents_new.items.len - 1].line == self.line) {
-                self.line_ascents_new.items[self.line_ascents_new.items.len - 1].ascent = ascent;
-            } else {
-                self.line_ascents_new.append(cw.arena(), .{ .line = self.line, .ascent = ascent }) catch {};
-            }
-
-            self.current_line_ascent = ascent;
-        }
-
-        // see if selection needs to be updated
-
-        // if the text changed our selection might be in the middle of utf8 chars, so fix it up
-        while (self.selection.start >= self.bytes_seen and self.selection.start < self.bytes_seen + end and txt[self.selection.start - self.bytes_seen] & 0xc0 == 0x80) {
-            self.selection.start += 1;
-        }
-
-        while (self.selection.cursor >= self.bytes_seen and self.selection.cursor < self.bytes_seen + end and txt[self.selection.cursor - self.bytes_seen] & 0xc0 == 0x80) {
-            self.selection.cursor += 1;
-        }
-
-        while (self.selection.end >= self.bytes_seen and self.selection.end < self.bytes_seen + end and txt[self.selection.end - self.bytes_seen] & 0xc0 == 0x80) {
-            self.selection.end += 1;
-        }
-
-        if (action != .none) {
-            if (self.cursor_pt) |p| {
-                const rs = Rect{ .x = self.insert_pt.x, .y = self.insert_pt.y, .w = s.w, .h = s.h };
-                if (p.x > rs.x and p.x < (rs.x + rs.w) and p.y > rs.y and p.y < (rs.y + rs.h)) {
-                    // point is in this text
-                    if (action == .click) {
-                        dvui.cursorSet(.hand);
-                    } else if (action == .hover) {
-                        ret = .{ .event = self.cursor_event.?, .rect = rs };
-                    }
-                }
-            }
-
-            if (self.click_pt) |p| {
-                const rs = Rect{ .x = self.insert_pt.x, .y = self.insert_pt.y, .w = s.w, .h = s.h };
-                if (p.x > rs.x and p.x < (rs.x + rs.w) and p.y > rs.y and p.y < (rs.y + rs.h)) {
-                    if (action == .click) {
-                        ret = .{ .event = self.click_event.?, .rect = rs };
-                    }
-                }
-            }
-        }
-
-        // handle selection movement
-        const text_rect = Rect{ .x = self.insert_pt.x, .y = self.insert_pt.y, .w = s.w, .h = s.h };
-        self.selMovePre(txt, end, text_rect, options, if (shaped) |*st| st else null, shaped_glyph_limit);
-
-        if (self.sel_pts[0] != null or self.sel_pts[1] != null) {
-            var sel_bytes = [2]?usize{ null, null };
-            for (self.sel_pts, 0..) |maybe_pt, i| {
-                if (maybe_pt) |p| {
-                    const rs = Rect{ .x = self.insert_pt.x, .y = self.insert_pt.y, .w = s.w, .h = s.h };
-                    if (p.y < rs.y or (p.y < (rs.y + rs.h) and p.x < rs.x)) {
-                        // point is before this text
-                        sel_bytes[i] = self.bytes_seen;
-                        self.sel_pts[i] = null;
-                    } else if (p.y < (rs.y + rs.h) and p.x < (rs.x + rs.w)) {
-                        // point is in this text (touch drag-selection hit
-                        // test -- reuse the already-shaped line instead of
-                        // reshaping `txt` from scratch, same as findPoint)
-                        const how_far = p.x - rs.x;
-                        var pt_end: usize = undefined;
-                        var found = false;
-                        if (shaped) |*st| {
-                            if (shaped_glyph_limit) |gl| {
-                                if (st.byteOffsetForWidth(cw.gpa, gl, how_far, .nearest)) |b| {
-                                    pt_end = b;
-                                    found = true;
-                                } else |_| {}
-                            }
-                        }
-                        if (!found) {
-                            _ = font.textSizeEx(txt, .{ .max_width = how_far, .end_idx = &pt_end, .end_metric = .nearest });
-                        }
-                        sel_bytes[i] = self.bytes_seen + pt_end;
-                        self.sel_pts[i] = null;
-                    } else {
-                        if (self.newline and p.y < (rs.y + rs.h)) {
-                            // point is after this text on this same horizontal line
-                            sel_bytes[i] = self.bytes_seen + end - 1;
-                            self.sel_pts[i] = null;
-                        } else {
-                            // point is after this text, but we might not get anymore
-                            sel_bytes[i] = self.bytes_seen + end;
-                        }
-                    }
-                }
-            }
-
-            //std.debug.print("sel_bytes {?d} {?d}\n", .{ sel_bytes[0], sel_bytes[1] });
-
-            // start off getting both, then maybe getting one
-            if (sel_bytes[0] != null and sel_bytes[1] != null) {
-                self.selection.cursor = @min(sel_bytes[0].?, sel_bytes[1].?);
-                self.selection.start = @min(sel_bytes[0].?, sel_bytes[1].?);
-                self.selection.end = @max(sel_bytes[0].?, sel_bytes[1].?);
-
-                // changing touch selection, need to refresh to move draggables
-                dvui.refresh(null, @src(), self.data().id);
-            } else if (sel_bytes[0] != null or sel_bytes[1] != null) {
-                self.selection.end = sel_bytes[0] orelse sel_bytes[1].?;
-            }
-        }
-
-        // record screen position of selection for touch editing (use s for
-        // height in case we are calling textSize with an empty slice)
-        if (self.selection.start >= self.bytes_seen and self.selection.start <= self.bytes_seen + end) {
-            const off = self.selection.start -| self.bytes_seen;
-            const start_off = if (shaped) |*st| st.measureUpToByteOffset(cw.gpa, off) catch font.textSize(txt[0..off]) else font.textSize(txt[0..off]);
-            self.sel_start_r_new = .{ .x = self.insert_pt.x + start_off.w, .y = self.insert_pt.y, .w = 1, .h = s.h };
-        }
-
-        if (self.selection.end >= self.bytes_seen and self.selection.end <= self.bytes_seen + end) {
-            const off = self.selection.end -| self.bytes_seen;
-            const end_off = if (shaped) |*st| st.measureUpToByteOffset(cw.gpa, off) catch font.textSize(txt[0..off]) else font.textSize(txt[0..off]);
-            self.sel_end_r_new = .{ .x = self.insert_pt.x + end_off.w, .y = self.insert_pt.y, .w = 1, .h = s.h };
-        }
-
-        if (!self.cursor_seen and (self.selection.cursor < self.bytes_seen + end or (self.selection.cursor == self.bytes_seen + end and self.selection.affinity == .before))) {
-            std.debug.assert(self.selection.cursor >= self.bytes_seen);
-            const cursor_offset = self.selection.cursor - self.bytes_seen;
-            const text_to_cursor = txt[0..cursor_offset];
-            const size = if (shaped) |*st| st.measureUpToByteOffset(cw.gpa, cursor_offset) catch font.textSize(text_to_cursor) else font.textSize(text_to_cursor);
-            self.cursor_rect = Rect{ .x = self.insert_pt.x + size.w, .y = self.insert_pt.y, .w = 1, .h = s.h };
-
-            self.selMoveText(text_to_cursor, self.bytes_seen);
-            self.cursorSeen(); // might alter selection
-            self.selMoveText(txt[cursor_offset..end], self.bytes_seen + cursor_offset);
-        } else {
-            self.selMoveText(txt[0..end], self.bytes_seen);
-        }
-
-        { // Scope here is for deallocating rtxt before handling copying to clipboard on the arena
-            const max_ascent = @max(self.current_line_ascent, self.current_line_ascent_recorded);
-            const y = self.insert_pt.y + (max_ascent - ascent);
-            const r: Rect = .{ .x = self.insert_pt.x, .y = y, .w = s.w, .h = @min(s.h, self.data().contentRect().h - y) };
-            const rs = self.screenRectScale(r);
-            //std.debug.print("renderText: {} {s}\n", .{ rs.r, txt[0..end] });
-            const rtxt = txt[0..end];
-
-            const textrun_info: ?AccessKit.TextRunOptions = info: {
-                if (dvui.accesskit_enabled and cw.accesskit.text_run_parent != null) {
-                    if (cw.accesskit.nodes.get(cw.accesskit.text_run_parent.?)) |_| {
-                        var text_run_widget = dvui.overlay(textRunSrc(), .{
-                            .name = "Text Run",
-                            .role = .text_run,
-                            .id_extra = self.bytes_seen,
-                            .rect = r,
-                        });
-                        defer text_run_widget.deinit();
-                        self.textrun_last = .{ .node_id = text_run_widget.data().id, .pos = self.bytes_seen + end };
-                        if (!self.selection.empty()) {
-                            if (self.textrun_focus == null and self.selection.cursor >= self.bytes_seen and self.selection.cursor < self.bytes_seen + rtxt.len) {
-                                self.textrun_focus = .{ .node_id = text_run_widget.data().id, .pos = self.selection.cursor - self.bytes_seen };
-                            }
-                            if (self.textrun_anchor == null) {
-                                const anchor = if (self.selection.cursor == self.selection.start) self.selection.end else self.selection.start;
-                                if (anchor >= self.bytes_seen and anchor < self.bytes_seen + rtxt.len) {
-                                    self.textrun_anchor = .{ .node_id = text_run_widget.data().id, .pos = anchor - self.bytes_seen };
-                                }
-                            }
-                        }
-                        if (self.textrun_cursor == null and self.selection.cursor >= self.bytes_seen and self.selection.cursor < self.bytes_seen + rtxt.len) {
-                            self.textrun_cursor = .{ .node_id = text_run_widget.data().id, .pos = self.selection.cursor - self.bytes_seen };
-                        }
-                        break :info .{
-                            .node_id = text_run_widget.data().id,
-                            .node_parent_id = cw.accesskit.text_run_parent.?,
-                            .controlling_widget_id = if (self.data().options.role.? == .none) cw.accesskit.text_run_parent.? else self.data().id,
-                            .line = self.line,
-                            .char_offset = self.bytes_seen,
-                        };
-                    }
-                }
-                break :info null;
-            };
-
-            // Hand the shape from above to renderText instead of letting
-            // it reshape `rtxt` from scratch -- but it needs to outlive
-            // this function (a floating window's render can be deferred to
-            // later this frame), so copy the small `ShapedText` header
-            // (not the shape's own arrays, already arena-owned) onto
-            // `cw.arena()` rather than pointing at this stack frame.
-            const pre_shaped: ?*const Font.ShapedText = blk: {
-                const st = shaped orelse break :blk null;
-                const p = cw.arena().create(Font.ShapedText) catch break :blk null;
-                p.* = st;
-                break :blk p;
-            };
-
-            // Sampled against this run's own `rs.r`, so a gradient resets at
-            // each line/style-run boundary; set `gradient.anchor` to a
-            // shared rect (e.g. the whole TextLayoutWidget) for a continuous
-            // sweep across multiple lines/runs.
-            const text_col = options.color(.text).split();
-            dvui.renderText(.{
-                .font = font,
-                .text = rtxt,
-                .rs = rs,
-                .color = text_col.color,
-                .gradient = text_col.gradient,
-                // TODO: Should this take `options.background` into account?
-                .background_color = if (options.color_fill) |cog| cog.toColor() else null,
-                .sel_start = self.selection.start -| self.bytes_seen,
-                .sel_end = self.selection.end -| self.bytes_seen,
-                .sel_color = (dvui.themeGet().text_select orelse dvui.themeGet().color(.highlight, .fill)).opacity(0.75),
-                .ak_opts = textrun_info,
-                .pre_shaped = pre_shaped,
-                .pre_shaped_glyph_limit = shaped_glyph_limit,
-            }) catch |err| {
-                dvui.logError(@src(), err, "Failed to render text: {s}", .{rtxt});
-            };
-        }
+        self.emitFragment(.{
+            .text = txt[0..end],
+            .size = s,
+            .ascent = ascent,
+            .shaped = shaped,
+            .options = options,
+            .font = font,
+            .action = action,
+            .x = self.insert_pt.x,
+            .y = self.insert_pt.y,
+        }, &ret);
 
         // Even if we don't actually render (might be outside clipping region),
         // need to update insert_pt and minSize like we did because our parent
@@ -1762,39 +1536,6 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
         const size = self.data().options.padSize(.{ .w = self.current_line_width, .h = self.insert_pt.y + s.h });
         self.data().min_size.w = @max(self.data().min_size.w, size.w + width_after);
         self.data().min_size.h = @max(self.data().min_size.h, size.h);
-
-        if (self.copy_sel) |sel| {
-            // we are copying to clipboard
-            if (sel.start < self.bytes_seen + end) {
-                // need to copy some
-                const cstart = if (sel.start < self.bytes_seen) 0 else (sel.start - self.bytes_seen);
-                const cend = if (sel.end < self.bytes_seen + end) (sel.end - self.bytes_seen) else end;
-
-                // initialize or realloc
-                if (self.copy_slice) |slice| {
-                    const old_len = slice.len;
-                    self.copy_slice = cw.arena().realloc(slice, slice.len + (cend - cstart)) catch slice;
-                    if (self.copy_slice.?.len == old_len) {
-                        dvui.log.debug("copy_slice realloc failed, copying will be incomplete", .{});
-                    } else {
-                        @memcpy(self.copy_slice.?[old_len..], txt[cstart..cend]);
-                    }
-                } else {
-                    self.copy_slice = cw.arena().dupe(u8, txt[cstart..cend]) catch |err| blk: {
-                        dvui.logError(@src(), err, "Could not allocate copy slice for text: {s}", .{txt[cstart..cend]});
-                        break :blk null;
-                    };
-                }
-
-                // push to clipboard if done
-                if (sel.end <= self.bytes_seen + end) {
-                    dvui.clipboardTextSet(self.copy_slice.?);
-                    self.copy_sel = null;
-                    cw.arena().free(self.copy_slice.?);
-                    self.copy_slice = null;
-                }
-            }
-        }
 
         // discard bytes we've dealt with
         txt = txt[end..];
@@ -1865,6 +1606,272 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
     }
 
     return ret;
+}
+
+/// One laid-out fragment, ready to draw. Everything here is decided by the
+/// layout half of `addTextEx`; emitting is pure logical-order work (selection,
+/// cursor, clipboard, accesskit, render), so `x`/`y` are the only inputs that
+/// visual reordering has to change.
+const Fragment = struct {
+    text: []const u8,
+    size: Size,
+    ascent: f32,
+    shaped: ?Font.ShapedText,
+    options: Options,
+    font: Font,
+    action: AddTextExAction,
+    x: f32,
+    y: f32,
+};
+
+fn emitFragment(self: *TextLayoutWidget, f: Fragment, ret: *?HoverMatch) void {
+    const cw = dvui.currentWindow();
+    var shaped = f.shaped;
+    // How many leading glyphs of
+    // `shaped` (if any) correspond to `f.text`, for reuse by
+    // cursor/selection tracking and the render call below.
+    const shaped_glyph_limit: ?usize = if (shaped) |*st| st.line.glyphLimitForByteOffset(f.text.len) else null;
+    // see if selection needs to be updated
+
+    // if the text changed our selection might be in the middle of utf8 chars, so fix it up
+    while (self.selection.start >= self.bytes_seen and self.selection.start < self.bytes_seen + f.text.len and f.text[self.selection.start - self.bytes_seen] & 0xc0 == 0x80) {
+        self.selection.start += 1;
+    }
+
+    while (self.selection.cursor >= self.bytes_seen and self.selection.cursor < self.bytes_seen + f.text.len and f.text[self.selection.cursor - self.bytes_seen] & 0xc0 == 0x80) {
+        self.selection.cursor += 1;
+    }
+
+    while (self.selection.end >= self.bytes_seen and self.selection.end < self.bytes_seen + f.text.len and f.text[self.selection.end - self.bytes_seen] & 0xc0 == 0x80) {
+        self.selection.end += 1;
+    }
+
+    if (f.action != .none) {
+        if (self.cursor_pt) |p| {
+            const rs = Rect{ .x = f.x, .y = f.y, .w = f.size.w, .h = f.size.h };
+            if (p.x > rs.x and p.x < (rs.x + rs.w) and p.y > rs.y and p.y < (rs.y + rs.h)) {
+                // point is in this text
+                if (f.action == .click) {
+                    dvui.cursorSet(.hand);
+                } else if (f.action == .hover) {
+                    ret.* = .{ .event = self.cursor_event.?, .rect = rs };
+                }
+            }
+        }
+
+        if (self.click_pt) |p| {
+            const rs = Rect{ .x = f.x, .y = f.y, .w = f.size.w, .h = f.size.h };
+            if (p.x > rs.x and p.x < (rs.x + rs.w) and p.y > rs.y and p.y < (rs.y + rs.h)) {
+                if (f.action == .click) {
+                    ret.* = .{ .event = self.click_event.?, .rect = rs };
+                }
+            }
+        }
+    }
+
+    // handle selection movement
+    const text_rect = Rect{ .x = f.x, .y = f.y, .w = f.size.w, .h = f.size.h };
+    self.selMovePre(f.text, f.text.len, text_rect, f.options, if (shaped) |*st| st else null, shaped_glyph_limit);
+
+    if (self.sel_pts[0] != null or self.sel_pts[1] != null) {
+        var sel_bytes = [2]?usize{ null, null };
+        for (self.sel_pts, 0..) |maybe_pt, i| {
+            if (maybe_pt) |p| {
+                const rs = Rect{ .x = f.x, .y = f.y, .w = f.size.w, .h = f.size.h };
+                if (p.y < rs.y or (p.y < (rs.y + rs.h) and p.x < rs.x)) {
+                    // point is before this text
+                    sel_bytes[i] = self.bytes_seen;
+                    self.sel_pts[i] = null;
+                } else if (p.y < (rs.y + rs.h) and p.x < (rs.x + rs.w)) {
+                    // point is in this text (touch drag-selection hit
+                    // test -- reuse the already-shaped line instead of
+                    // reshaping `f.text` from scratch, same as findPoint)
+                    const how_far = p.x - rs.x;
+                    var pt_end: usize = undefined;
+                    var found = false;
+                    if (shaped) |*st| {
+                        if (shaped_glyph_limit) |gl| {
+                            if (st.byteOffsetForWidth(cw.gpa, gl, how_far, .nearest)) |b| {
+                                pt_end = b;
+                                found = true;
+                            } else |_| {}
+                        }
+                    }
+                    if (!found) {
+                        _ = f.font.textSizeEx(f.text, .{ .max_width = how_far, .end_idx = &pt_end, .end_metric = .nearest });
+                    }
+                    sel_bytes[i] = self.bytes_seen + pt_end;
+                    self.sel_pts[i] = null;
+                } else {
+                    if (self.newline and p.y < (rs.y + rs.h)) {
+                        // point is after this text on this same horizontal line
+                        sel_bytes[i] = self.bytes_seen + f.text.len - 1;
+                        self.sel_pts[i] = null;
+                    } else {
+                        // point is after this text, but we might not get anymore
+                        sel_bytes[i] = self.bytes_seen + f.text.len;
+                    }
+                }
+            }
+        }
+
+        //std.debug.print("sel_bytes {?d} {?d}\n", .{ sel_bytes[0], sel_bytes[1] });
+
+        // start off getting both, then maybe getting one
+        if (sel_bytes[0] != null and sel_bytes[1] != null) {
+            self.selection.cursor = @min(sel_bytes[0].?, sel_bytes[1].?);
+            self.selection.start = @min(sel_bytes[0].?, sel_bytes[1].?);
+            self.selection.end = @max(sel_bytes[0].?, sel_bytes[1].?);
+
+            // changing touch selection, need to refresh to move draggables
+            dvui.refresh(null, @src(), self.data().id);
+        } else if (sel_bytes[0] != null or sel_bytes[1] != null) {
+            self.selection.end = sel_bytes[0] orelse sel_bytes[1].?;
+        }
+    }
+
+    // record screen position of selection for touch editing (use s for
+    // height in case we are calling textSize with an empty slice)
+    if (self.selection.start >= self.bytes_seen and self.selection.start <= self.bytes_seen + f.text.len) {
+        const off = self.selection.start -| self.bytes_seen;
+        const start_off = if (shaped) |*st| st.measureUpToByteOffset(cw.gpa, off) catch f.font.textSize(f.text[0..off]) else f.font.textSize(f.text[0..off]);
+        self.sel_start_r_new = .{ .x = f.x + start_off.w, .y = f.y, .w = 1, .h = f.size.h };
+    }
+
+    if (self.selection.end >= self.bytes_seen and self.selection.end <= self.bytes_seen + f.text.len) {
+        const off = self.selection.end -| self.bytes_seen;
+        const end_off = if (shaped) |*st| st.measureUpToByteOffset(cw.gpa, off) catch f.font.textSize(f.text[0..off]) else f.font.textSize(f.text[0..off]);
+        self.sel_end_r_new = .{ .x = f.x + end_off.w, .y = f.y, .w = 1, .h = f.size.h };
+    }
+
+    if (!self.cursor_seen and (self.selection.cursor < self.bytes_seen + f.text.len or (self.selection.cursor == self.bytes_seen + f.text.len and self.selection.affinity == .before))) {
+        std.debug.assert(self.selection.cursor >= self.bytes_seen);
+        const cursor_offset = self.selection.cursor - self.bytes_seen;
+        const text_to_cursor = f.text[0..cursor_offset];
+        const size = if (shaped) |*st| st.measureUpToByteOffset(cw.gpa, cursor_offset) catch f.font.textSize(text_to_cursor) else f.font.textSize(text_to_cursor);
+        self.cursor_rect = Rect{ .x = f.x + size.w, .y = f.y, .w = 1, .h = f.size.h };
+
+        self.selMoveText(text_to_cursor, self.bytes_seen);
+        self.cursorSeen(); // might alter selection
+        self.selMoveText(f.text[cursor_offset..], self.bytes_seen + cursor_offset);
+    } else {
+        self.selMoveText(f.text, self.bytes_seen);
+    }
+
+    { // Scope here is for deallocating rtxt before handling copying to clipboard on the arena
+        const max_ascent = @max(self.current_line_ascent, self.current_line_ascent_recorded);
+        const y = f.y + (max_ascent - f.ascent);
+        const r: Rect = .{ .x = f.x, .y = y, .w = f.size.w, .h = @min(f.size.h, self.data().contentRect().h - y) };
+        const rs = self.screenRectScale(r);
+        //std.debug.print("renderText: {} {s}\n", .{ rs.r, f.text });
+        const rtxt = f.text;
+
+        const textrun_info: ?AccessKit.TextRunOptions = info: {
+            if (dvui.accesskit_enabled and cw.accesskit.text_run_parent != null) {
+                if (cw.accesskit.nodes.get(cw.accesskit.text_run_parent.?)) |_| {
+                    var text_run_widget = dvui.overlay(textRunSrc(), .{
+                        .name = "Text Run",
+                        .role = .text_run,
+                        .id_extra = self.bytes_seen,
+                        .rect = r,
+                    });
+                    defer text_run_widget.deinit();
+                    self.textrun_last = .{ .node_id = text_run_widget.data().id, .pos = self.bytes_seen + f.text.len };
+                    if (!self.selection.empty()) {
+                        if (self.textrun_focus == null and self.selection.cursor >= self.bytes_seen and self.selection.cursor < self.bytes_seen + rtxt.len) {
+                            self.textrun_focus = .{ .node_id = text_run_widget.data().id, .pos = self.selection.cursor - self.bytes_seen };
+                        }
+                        if (self.textrun_anchor == null) {
+                            const anchor = if (self.selection.cursor == self.selection.start) self.selection.end else self.selection.start;
+                            if (anchor >= self.bytes_seen and anchor < self.bytes_seen + rtxt.len) {
+                                self.textrun_anchor = .{ .node_id = text_run_widget.data().id, .pos = anchor - self.bytes_seen };
+                            }
+                        }
+                    }
+                    if (self.textrun_cursor == null and self.selection.cursor >= self.bytes_seen and self.selection.cursor < self.bytes_seen + rtxt.len) {
+                        self.textrun_cursor = .{ .node_id = text_run_widget.data().id, .pos = self.selection.cursor - self.bytes_seen };
+                    }
+                    break :info .{
+                        .node_id = text_run_widget.data().id,
+                        .node_parent_id = cw.accesskit.text_run_parent.?,
+                        .controlling_widget_id = if (self.data().options.role.? == .none) cw.accesskit.text_run_parent.? else self.data().id,
+                        .line = self.line,
+                        .char_offset = self.bytes_seen,
+                    };
+                }
+            }
+            break :info null;
+        };
+
+        // Hand the shape from above to renderText instead of letting
+        // it reshape `rtxt` from scratch -- but it needs to outlive
+        // this function (a floating window's render can be deferred to
+        // later this frame), so copy the small `ShapedText` header
+        // (not the shape's own arrays, already arena-owned) onto
+        // `cw.arena()` rather than pointing at this stack frame.
+        const pre_shaped: ?*const Font.ShapedText = blk: {
+            const st = shaped orelse break :blk null;
+            const p = cw.arena().create(Font.ShapedText) catch break :blk null;
+            p.* = st;
+            break :blk p;
+        };
+
+        // Sampled against this run's own `rs.r`, so a gradient resets at
+        // each line/style-run boundary; set `gradient.anchor` to a
+        // shared rect (e.g. the whole TextLayoutWidget) for a continuous
+        // sweep across multiple lines/runs.
+        const text_col = f.options.color(.text).split();
+        dvui.renderText(.{
+            .font = f.font,
+            .text = rtxt,
+            .rs = rs,
+            .color = text_col.color,
+            .gradient = text_col.gradient,
+            // TODO: Should this take `f.options.background` into account?
+            .background_color = if (f.options.color_fill) |cog| cog.toColor() else null,
+            .sel_start = self.selection.start -| self.bytes_seen,
+            .sel_end = self.selection.end -| self.bytes_seen,
+            .sel_color = (dvui.themeGet().text_select orelse dvui.themeGet().color(.highlight, .fill)).opacity(0.75),
+            .ak_opts = textrun_info,
+            .pre_shaped = pre_shaped,
+            .pre_shaped_glyph_limit = shaped_glyph_limit,
+        }) catch |err| {
+            dvui.logError(@src(), err, "Failed to render text: {s}", .{rtxt});
+        };
+    }
+
+    if (self.copy_sel) |sel| {
+        // we are copying to clipboard
+        if (sel.start < self.bytes_seen + f.text.len) {
+            // need to copy some
+            const cstart = if (sel.start < self.bytes_seen) 0 else (sel.start - self.bytes_seen);
+            const cend = if (sel.end < self.bytes_seen + f.text.len) (sel.end - self.bytes_seen) else f.text.len;
+
+            // initialize or realloc
+            if (self.copy_slice) |slice| {
+                const old_len = slice.len;
+                self.copy_slice = cw.arena().realloc(slice, slice.len + (cend - cstart)) catch slice;
+                if (self.copy_slice.?.len == old_len) {
+                    dvui.log.debug("copy_slice realloc failed, copying will be incomplete", .{});
+                } else {
+                    @memcpy(self.copy_slice.?[old_len..], f.text[cstart..cend]);
+                }
+            } else {
+                self.copy_slice = cw.arena().dupe(u8, f.text[cstart..cend]) catch |err| blk: {
+                    dvui.logError(@src(), err, "Could not allocate copy slice for text: {s}", .{f.text[cstart..cend]});
+                    break :blk null;
+                };
+            }
+
+            // push to clipboard if done
+            if (sel.end <= self.bytes_seen + f.text.len) {
+                dvui.clipboardTextSet(self.copy_slice.?);
+                self.copy_sel = null;
+                cw.arena().free(self.copy_slice.?);
+                self.copy_slice = null;
+            }
+        }
+    }
 }
 
 pub fn addTextDone(self: *TextLayoutWidget, opts: Options) void {
