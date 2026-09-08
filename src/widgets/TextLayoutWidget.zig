@@ -1524,8 +1524,15 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
             .options = options,
             .font = font,
             .action = action,
+            .bytes_seen = self.bytes_seen,
+            .line = self.line,
+            .newline = self.newline,
+            .max_ascent = @max(self.current_line_ascent, self.current_line_ascent_recorded),
             .x = self.insert_pt.x,
             .y = self.insert_pt.y,
+            // Where the pen lands if this fragment closes the line; the line
+            // advance below hasn't run yet, but current_line_height is final.
+            .newline_pt = .{ .x = 0, .y = self.insert_pt.y + self.current_line_height },
         }, &ret);
 
         // Even if we don't actually render (might be outside clipping region),
@@ -1540,12 +1547,6 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
         // discard bytes we've dealt with
         txt = txt[end..];
         self.bytes_seen += end;
-
-        if (!self.cursor_seen) {
-            // until we see the cursor, record the last position it could be
-            // in, could be moving to a new line next iteration
-            self.cursor_rect = Rect{ .x = self.insert_pt.x, .y = self.insert_pt.y, .w = 1, .h = s.h };
-        }
 
         // move insert_pt to next line if we have more text
         if (self.newline or txt.len > 0) {
@@ -1576,14 +1577,6 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
             }
 
             self.first_byte_in_line = self.bytes_seen;
-        }
-
-        if (self.newline and (self.selection.start == self.bytes_seen)) {
-            self.sel_start_r_new = .{ .x = self.insert_pt.x, .y = self.insert_pt.y, .w = 1, .h = s.h };
-        }
-
-        if (self.newline and (self.selection.end == self.bytes_seen)) {
-            self.sel_end_r_new = .{ .x = self.insert_pt.x, .y = self.insert_pt.y, .w = 1, .h = s.h };
         }
 
         if (self.data().options.rect != null) {
@@ -1620,8 +1613,15 @@ const Fragment = struct {
     options: Options,
     font: Font,
     action: AddTextExAction,
+    /// Logical byte offset of `text` within the widget's text.
+    bytes_seen: usize,
+    line: usize,
+    newline: bool,
+    max_ascent: f32,
     x: f32,
     y: f32,
+    /// Pen origin after this fragment closes its line; only read when `newline`.
+    newline_pt: Point,
 };
 
 fn emitFragment(self: *TextLayoutWidget, f: Fragment, ret: *?HoverMatch) void {
@@ -1634,15 +1634,15 @@ fn emitFragment(self: *TextLayoutWidget, f: Fragment, ret: *?HoverMatch) void {
     // see if selection needs to be updated
 
     // if the text changed our selection might be in the middle of utf8 chars, so fix it up
-    while (self.selection.start >= self.bytes_seen and self.selection.start < self.bytes_seen + f.text.len and f.text[self.selection.start - self.bytes_seen] & 0xc0 == 0x80) {
+    while (self.selection.start >= f.bytes_seen and self.selection.start < f.bytes_seen + f.text.len and f.text[self.selection.start - f.bytes_seen] & 0xc0 == 0x80) {
         self.selection.start += 1;
     }
 
-    while (self.selection.cursor >= self.bytes_seen and self.selection.cursor < self.bytes_seen + f.text.len and f.text[self.selection.cursor - self.bytes_seen] & 0xc0 == 0x80) {
+    while (self.selection.cursor >= f.bytes_seen and self.selection.cursor < f.bytes_seen + f.text.len and f.text[self.selection.cursor - f.bytes_seen] & 0xc0 == 0x80) {
         self.selection.cursor += 1;
     }
 
-    while (self.selection.end >= self.bytes_seen and self.selection.end < self.bytes_seen + f.text.len and f.text[self.selection.end - self.bytes_seen] & 0xc0 == 0x80) {
+    while (self.selection.end >= f.bytes_seen and self.selection.end < f.bytes_seen + f.text.len and f.text[self.selection.end - f.bytes_seen] & 0xc0 == 0x80) {
         self.selection.end += 1;
     }
 
@@ -1680,7 +1680,7 @@ fn emitFragment(self: *TextLayoutWidget, f: Fragment, ret: *?HoverMatch) void {
                 const rs = Rect{ .x = f.x, .y = f.y, .w = f.size.w, .h = f.size.h };
                 if (p.y < rs.y or (p.y < (rs.y + rs.h) and p.x < rs.x)) {
                     // point is before this text
-                    sel_bytes[i] = self.bytes_seen;
+                    sel_bytes[i] = f.bytes_seen;
                     self.sel_pts[i] = null;
                 } else if (p.y < (rs.y + rs.h) and p.x < (rs.x + rs.w)) {
                     // point is in this text (touch drag-selection hit
@@ -1700,16 +1700,16 @@ fn emitFragment(self: *TextLayoutWidget, f: Fragment, ret: *?HoverMatch) void {
                     if (!found) {
                         _ = f.font.textSizeEx(f.text, .{ .max_width = how_far, .end_idx = &pt_end, .end_metric = .nearest });
                     }
-                    sel_bytes[i] = self.bytes_seen + pt_end;
+                    sel_bytes[i] = f.bytes_seen + pt_end;
                     self.sel_pts[i] = null;
                 } else {
-                    if (self.newline and p.y < (rs.y + rs.h)) {
+                    if (f.newline and p.y < (rs.y + rs.h)) {
                         // point is after this text on this same horizontal line
-                        sel_bytes[i] = self.bytes_seen + f.text.len - 1;
+                        sel_bytes[i] = f.bytes_seen + f.text.len - 1;
                         self.sel_pts[i] = null;
                     } else {
                         // point is after this text, but we might not get anymore
-                        sel_bytes[i] = self.bytes_seen + f.text.len;
+                        sel_bytes[i] = f.bytes_seen + f.text.len;
                     }
                 }
             }
@@ -1732,34 +1732,34 @@ fn emitFragment(self: *TextLayoutWidget, f: Fragment, ret: *?HoverMatch) void {
 
     // record screen position of selection for touch editing (use s for
     // height in case we are calling textSize with an empty slice)
-    if (self.selection.start >= self.bytes_seen and self.selection.start <= self.bytes_seen + f.text.len) {
-        const off = self.selection.start -| self.bytes_seen;
+    if (self.selection.start >= f.bytes_seen and self.selection.start <= f.bytes_seen + f.text.len) {
+        const off = self.selection.start -| f.bytes_seen;
         const start_off = if (shaped) |*st| st.measureUpToByteOffset(cw.gpa, off) catch f.font.textSize(f.text[0..off]) else f.font.textSize(f.text[0..off]);
         self.sel_start_r_new = .{ .x = f.x + start_off.w, .y = f.y, .w = 1, .h = f.size.h };
     }
 
-    if (self.selection.end >= self.bytes_seen and self.selection.end <= self.bytes_seen + f.text.len) {
-        const off = self.selection.end -| self.bytes_seen;
+    if (self.selection.end >= f.bytes_seen and self.selection.end <= f.bytes_seen + f.text.len) {
+        const off = self.selection.end -| f.bytes_seen;
         const end_off = if (shaped) |*st| st.measureUpToByteOffset(cw.gpa, off) catch f.font.textSize(f.text[0..off]) else f.font.textSize(f.text[0..off]);
         self.sel_end_r_new = .{ .x = f.x + end_off.w, .y = f.y, .w = 1, .h = f.size.h };
     }
 
-    if (!self.cursor_seen and (self.selection.cursor < self.bytes_seen + f.text.len or (self.selection.cursor == self.bytes_seen + f.text.len and self.selection.affinity == .before))) {
-        std.debug.assert(self.selection.cursor >= self.bytes_seen);
-        const cursor_offset = self.selection.cursor - self.bytes_seen;
+    if (!self.cursor_seen and (self.selection.cursor < f.bytes_seen + f.text.len or (self.selection.cursor == f.bytes_seen + f.text.len and self.selection.affinity == .before))) {
+        std.debug.assert(self.selection.cursor >= f.bytes_seen);
+        const cursor_offset = self.selection.cursor - f.bytes_seen;
         const text_to_cursor = f.text[0..cursor_offset];
         const size = if (shaped) |*st| st.measureUpToByteOffset(cw.gpa, cursor_offset) catch f.font.textSize(text_to_cursor) else f.font.textSize(text_to_cursor);
         self.cursor_rect = Rect{ .x = f.x + size.w, .y = f.y, .w = 1, .h = f.size.h };
 
-        self.selMoveText(text_to_cursor, self.bytes_seen);
+        self.selMoveText(text_to_cursor, f.bytes_seen);
         self.cursorSeen(); // might alter selection
-        self.selMoveText(f.text[cursor_offset..], self.bytes_seen + cursor_offset);
+        self.selMoveText(f.text[cursor_offset..], f.bytes_seen + cursor_offset);
     } else {
-        self.selMoveText(f.text, self.bytes_seen);
+        self.selMoveText(f.text, f.bytes_seen);
     }
 
     { // Scope here is for deallocating rtxt before handling copying to clipboard on the arena
-        const max_ascent = @max(self.current_line_ascent, self.current_line_ascent_recorded);
+        const max_ascent = f.max_ascent;
         const y = f.y + (max_ascent - f.ascent);
         const r: Rect = .{ .x = f.x, .y = y, .w = f.size.w, .h = @min(f.size.h, self.data().contentRect().h - y) };
         const rs = self.screenRectScale(r);
@@ -1772,31 +1772,31 @@ fn emitFragment(self: *TextLayoutWidget, f: Fragment, ret: *?HoverMatch) void {
                     var text_run_widget = dvui.overlay(textRunSrc(), .{
                         .name = "Text Run",
                         .role = .text_run,
-                        .id_extra = self.bytes_seen,
+                        .id_extra = f.bytes_seen,
                         .rect = r,
                     });
                     defer text_run_widget.deinit();
-                    self.textrun_last = .{ .node_id = text_run_widget.data().id, .pos = self.bytes_seen + f.text.len };
+                    self.textrun_last = .{ .node_id = text_run_widget.data().id, .pos = f.bytes_seen + f.text.len };
                     if (!self.selection.empty()) {
-                        if (self.textrun_focus == null and self.selection.cursor >= self.bytes_seen and self.selection.cursor < self.bytes_seen + rtxt.len) {
-                            self.textrun_focus = .{ .node_id = text_run_widget.data().id, .pos = self.selection.cursor - self.bytes_seen };
+                        if (self.textrun_focus == null and self.selection.cursor >= f.bytes_seen and self.selection.cursor < f.bytes_seen + rtxt.len) {
+                            self.textrun_focus = .{ .node_id = text_run_widget.data().id, .pos = self.selection.cursor - f.bytes_seen };
                         }
                         if (self.textrun_anchor == null) {
                             const anchor = if (self.selection.cursor == self.selection.start) self.selection.end else self.selection.start;
-                            if (anchor >= self.bytes_seen and anchor < self.bytes_seen + rtxt.len) {
-                                self.textrun_anchor = .{ .node_id = text_run_widget.data().id, .pos = anchor - self.bytes_seen };
+                            if (anchor >= f.bytes_seen and anchor < f.bytes_seen + rtxt.len) {
+                                self.textrun_anchor = .{ .node_id = text_run_widget.data().id, .pos = anchor - f.bytes_seen };
                             }
                         }
                     }
-                    if (self.textrun_cursor == null and self.selection.cursor >= self.bytes_seen and self.selection.cursor < self.bytes_seen + rtxt.len) {
-                        self.textrun_cursor = .{ .node_id = text_run_widget.data().id, .pos = self.selection.cursor - self.bytes_seen };
+                    if (self.textrun_cursor == null and self.selection.cursor >= f.bytes_seen and self.selection.cursor < f.bytes_seen + rtxt.len) {
+                        self.textrun_cursor = .{ .node_id = text_run_widget.data().id, .pos = self.selection.cursor - f.bytes_seen };
                     }
                     break :info .{
                         .node_id = text_run_widget.data().id,
                         .node_parent_id = cw.accesskit.text_run_parent.?,
                         .controlling_widget_id = if (self.data().options.role.? == .none) cw.accesskit.text_run_parent.? else self.data().id,
-                        .line = self.line,
-                        .char_offset = self.bytes_seen,
+                        .line = f.line,
+                        .char_offset = f.bytes_seen,
                     };
                 }
             }
@@ -1829,8 +1829,8 @@ fn emitFragment(self: *TextLayoutWidget, f: Fragment, ret: *?HoverMatch) void {
             .gradient = text_col.gradient,
             // TODO: Should this take `f.options.background` into account?
             .background_color = if (f.options.color_fill) |cog| cog.toColor() else null,
-            .sel_start = self.selection.start -| self.bytes_seen,
-            .sel_end = self.selection.end -| self.bytes_seen,
+            .sel_start = self.selection.start -| f.bytes_seen,
+            .sel_end = self.selection.end -| f.bytes_seen,
             .sel_color = (dvui.themeGet().text_select orelse dvui.themeGet().color(.highlight, .fill)).opacity(0.75),
             .ak_opts = textrun_info,
             .pre_shaped = pre_shaped,
@@ -1842,10 +1842,10 @@ fn emitFragment(self: *TextLayoutWidget, f: Fragment, ret: *?HoverMatch) void {
 
     if (self.copy_sel) |sel| {
         // we are copying to clipboard
-        if (sel.start < self.bytes_seen + f.text.len) {
+        if (sel.start < f.bytes_seen + f.text.len) {
             // need to copy some
-            const cstart = if (sel.start < self.bytes_seen) 0 else (sel.start - self.bytes_seen);
-            const cend = if (sel.end < self.bytes_seen + f.text.len) (sel.end - self.bytes_seen) else f.text.len;
+            const cstart = if (sel.start < f.bytes_seen) 0 else (sel.start - f.bytes_seen);
+            const cend = if (sel.end < f.bytes_seen + f.text.len) (sel.end - f.bytes_seen) else f.text.len;
 
             // initialize or realloc
             if (self.copy_slice) |slice| {
@@ -1864,13 +1864,27 @@ fn emitFragment(self: *TextLayoutWidget, f: Fragment, ret: *?HoverMatch) void {
             }
 
             // push to clipboard if done
-            if (sel.end <= self.bytes_seen + f.text.len) {
+            if (sel.end <= f.bytes_seen + f.text.len) {
                 dvui.clipboardTextSet(self.copy_slice.?);
                 self.copy_sel = null;
                 cw.arena().free(self.copy_slice.?);
                 self.copy_slice = null;
             }
         }
+    }
+
+    if (!self.cursor_seen) {
+        // until we see the cursor, record the last position it could be
+        // in, could be moving to a new line next iteration
+        self.cursor_rect = Rect{ .x = f.x + f.size.w, .y = f.y, .w = 1, .h = f.size.h };
+    }
+
+    if (f.newline and (self.selection.start == f.bytes_seen + f.text.len)) {
+        self.sel_start_r_new = .{ .x = f.newline_pt.x, .y = f.newline_pt.y, .w = 1, .h = f.size.h };
+    }
+
+    if (f.newline and (self.selection.end == f.bytes_seen + f.text.len)) {
+        self.sel_end_r_new = .{ .x = f.newline_pt.x, .y = f.newline_pt.y, .w = 1, .h = f.size.h };
     }
 }
 
