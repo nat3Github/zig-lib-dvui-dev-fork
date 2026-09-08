@@ -177,6 +177,15 @@ click_num: u8 = 0,
 click_num_pt: dvui.Point.Physical = .{},
 
 line: usize = 0,
+
+/// Fragments laid out but not yet drawn, all belonging to the visual line
+/// currently being built. UAX #9 cannot place any of them until the whole
+/// line's logical text is known, and a line can span several addText calls.
+/// Arena-backed, so nothing here needs freeing.
+line_frags: std.ArrayList(Fragment) = .empty,
+/// Set when any buffered fragment holds bytes that could resolve RTL; when
+/// false the line is placed left to right without running the bidi pass.
+line_maybe_rtl: bool = false,
 bytes_seen: usize = 0,
 first_byte_in_line: usize = 0,
 /// might point to `selection_store`
@@ -649,23 +658,23 @@ fn findPoint(p: Point, r: Rect, bytes_seen: usize, txt: []const u8, options: Opt
 // Called for each piece of text before searching for the cursor.
 // Place for selection movement to track points and move the cursor if needed,
 // also to track any state they need before the cursor (like word select).
-fn selMovePre(self: *TextLayoutWidget, txt: []const u8, end: usize, text_rect: Rect, options: Options, shaped: ?*Font.ShapedText, glyph_limit: ?usize) void {
+fn selMovePre(self: *TextLayoutWidget, txt: []const u8, end: usize, bytes_seen: usize, text_rect: Rect, options: Options, shaped: ?*Font.ShapedText, glyph_limit: ?usize) void {
     const text_line = txt[0..end];
     switch (self.sel_move) {
         .none => {},
         .mouse => |*m| {
             if (m.down_pt) |p| {
-                if (findPoint(p, text_rect, self.bytes_seen, text_line, options, shaped, glyph_limit)) |ba| {
+                if (findPoint(p, text_rect, bytes_seen, text_line, options, shaped, glyph_limit)) |ba| {
                     m.byte = ba.byte;
                     self.selection.moveCursor(ba.byte, false);
                     self.selection.affinity = ba.affinity;
                     m.down_pt = null;
                 } else {
                     // haven't found it yet, keep cursor at end to not trigger cursor_seen
-                    self.selection.moveCursor(self.bytes_seen + end, false);
+                    self.selection.moveCursor(bytes_seen + end, false);
                 }
             } else if (m.drag_pt) |p| {
-                if (findPoint(p, text_rect, self.bytes_seen, text_line, options, shaped, glyph_limit)) |ba| {
+                if (findPoint(p, text_rect, bytes_seen, text_line, options, shaped, glyph_limit)) |ba| {
                     self.selection.cursor = ba.byte;
                     self.selection.start = @min(m.byte.?, ba.byte);
                     self.selection.end = @max(m.byte.?, ba.byte);
@@ -673,7 +682,7 @@ fn selMovePre(self: *TextLayoutWidget, txt: []const u8, end: usize, text_rect: R
                     m.drag_pt = null;
                 } else {
                     // haven't found it yet, keep cursor at end to not trigger cursor_seen
-                    self.selection.cursor = self.bytes_seen + end;
+                    self.selection.cursor = bytes_seen + end;
                     self.selection.start = @min(m.byte.?, self.selection.cursor);
                     self.selection.end = @max(m.byte.?, self.selection.cursor);
                     self.selection.affinity = .after;
@@ -682,13 +691,13 @@ fn selMovePre(self: *TextLayoutWidget, txt: []const u8, end: usize, text_rect: R
         },
         .expand_pt => |*ep| {
             if (ep.pt) |p| {
-                if (findPoint(p, text_rect, self.bytes_seen, text_line, options, shaped, glyph_limit)) |ba| {
+                if (findPoint(p, text_rect, bytes_seen, text_line, options, shaped, glyph_limit)) |ba| {
                     self.selection.moveCursor(ba.byte, false);
                     self.selection.affinity = ba.affinity;
                     ep.pt = null;
                 } else {
                     // haven't found it yet, keep cursor at end to not trigger cursor_seen
-                    self.selection.moveCursor(self.bytes_seen + end, false);
+                    self.selection.moveCursor(bytes_seen + end, false);
                 }
 
                 if (ep.dragging) {
@@ -700,13 +709,13 @@ fn selMovePre(self: *TextLayoutWidget, txt: []const u8, end: usize, text_rect: R
         .char_left_right => {},
         .cursor_updown => |*cud| {
             if (cud.pt) |p| {
-                if (findPoint(p, text_rect, self.bytes_seen, text_line, options, shaped, glyph_limit)) |ba| {
+                if (findPoint(p, text_rect, bytes_seen, text_line, options, shaped, glyph_limit)) |ba| {
                     self.selection.moveCursor(ba.byte, cud.select);
                     self.selection.affinity = ba.affinity;
                     cud.pt = null;
                 } else {
                     // haven't found it yet, keep cursor at end to not trigger cursor_seen
-                    self.selection.moveCursor(self.bytes_seen + end, cud.select);
+                    self.selection.moveCursor(bytes_seen + end, cud.select);
                 }
             }
         },
@@ -1508,6 +1517,7 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
                 self.current_line_ascent = 0;
                 self.current_line_ascent_recorded = 0;
 
+                self.flushLine(&ret);
                 self.lineBreak();
 
                 self.first_byte_in_line = self.bytes_seen;
@@ -1516,8 +1526,8 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
             }
         }
 
-        self.emitFragment(.{
-            .text = txt[0..end],
+        self.line_frags.append(cw.arena(), .{
+            .text = cw.arena().dupe(u8, txt[0..end]) catch txt[0..end],
             .size = s,
             .ascent = ascent,
             .shaped = shaped,
@@ -1533,7 +1543,13 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
             // Where the pen lands if this fragment closes the line; the line
             // advance below hasn't run yet, but current_line_height is final.
             .newline_pt = .{ .x = 0, .y = self.insert_pt.y + self.current_line_height },
-        }, &ret);
+        }) catch {};
+        self.line_maybe_rtl = self.line_maybe_rtl or maybeRtl(txt[0..end]);
+
+        // The line closes right here, so place and draw it before the layout
+        // half moves on: lineBreak() below mutates the same selection state
+        // emitFragment does, and used to run after it.
+        if (self.newline or end < txt.len) self.flushLine(&ret);
 
         // Even if we don't actually render (might be outside clipping region),
         // need to update insert_pt and minSize like we did because our parent
@@ -1586,10 +1602,16 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
             const nextrs = self.screenRectScale(Rect{ .x = self.insert_pt.x, .y = self.insert_pt.y });
             if (nextrs.r.y > (dvui.clipGet().y + dvui.clipGet().h)) {
                 //std.debug.print("stopping after: {s}\n", .{rtxt});
+                self.flushLine(&ret);
                 break :text_loop;
             }
         }
     }
+
+    // addTextClick/addTextHover have to answer in the call that asked, and a
+    // buffered fragment's hit test hasn't run yet -- so a call that wants a
+    // return value gives up cross-chunk reordering for the rest of its line.
+    if (action != .none) self.flushLine(&ret);
 
     if (action == .click and (ret != null)) {
         // we can only click when not in touch editing, so that click must have
@@ -1599,6 +1621,157 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
     }
 
     return ret;
+}
+
+/// UTF-8 lead byte at the start of Hebrew (U+0590); every RTL codepoint, and
+/// every 3- and 4-byte sequence, encodes at or above it. A cheap pre-filter so
+/// pure-Latin layouts never run the bidi pass.
+/// ponytail: CJK and emoji pay for a bidi pass they don't need -- narrow the
+/// test if that ever shows up in a profile.
+fn maybeRtl(text: []const u8) bool {
+    for (text) |b| {
+        if (b >= 0xd6) return true;
+    }
+    return false;
+}
+
+/// One same-level slice of one buffered fragment: the unit UAX #9 rule L2
+/// actually reorders. A fragment straddling a level run (a highlight span
+/// holding the space between an RTL word and an LTR one, say) has to be cut
+/// here, because the two halves land in different places on screen.
+const BidiPiece = struct {
+    frag: u32,
+    /// Byte range within that fragment's text.
+    start: u32,
+    end: u32,
+    level: u8,
+};
+
+/// Runs UAX #9 over the concatenated logical text of `frags` and cuts it into
+/// level runs. Bidi sees the whole line, so neutrals and weak types resolve
+/// against neighbours in other fragments -- which is exactly what shaping one
+/// addText chunk at a time cannot do. Returns null when every level is even,
+/// i.e. the line is plain left-to-right and placement is unchanged.
+fn bidiPieces(arena: std.mem.Allocator, frags: []const Fragment) ?[]BidiPiece {
+    var total_bytes: usize = 0;
+    for (frags) |f| total_bytes += f.text.len;
+    if (total_bytes == 0) return null;
+
+    var codepoints: std.ArrayList(u21) = .empty;
+    var frag_of: std.ArrayList(u32) = .empty;
+    var offset_of: std.ArrayList(u32) = .empty;
+    codepoints.ensureTotalCapacityPrecise(arena, total_bytes) catch return null;
+    frag_of.ensureTotalCapacityPrecise(arena, total_bytes) catch return null;
+    offset_of.ensureTotalCapacityPrecise(arena, total_bytes + 1) catch return null;
+    for (frags, 0..) |f, fi| {
+        var it: std.unicode.Utf8Iterator = .{ .bytes = f.text, .i = 0 };
+        while (true) {
+            const at = it.i;
+            const cp = it.nextCodepoint() orelse break;
+            codepoints.appendAssumeCapacity(cp);
+            frag_of.appendAssumeCapacity(@intCast(fi));
+            offset_of.appendAssumeCapacity(@intCast(at));
+        }
+    }
+    if (codepoints.items.len == 0) return null;
+
+    const classes = arena.alloc(opentype.unicode.BidiClass, codepoints.items.len) catch return null;
+    for (codepoints.items, classes) |cp, *c| c.* = opentype.unicode.BidiClass.of(cp);
+
+    // ponytail: base direction is resolved per visual line, not per paragraph,
+    // so a wrapped paragraph whose first line holds no strong character can
+    // pick a different base than its later lines. Buffering the paragraph
+    // rather than the line is the fix if that ever bites.
+    const levels = opentype.unicode.Bidi.paragraphEmbeddingLevels(arena, classes, .auto, codepoints.items) catch return null;
+
+    var any_rtl = false;
+    for (levels) |l| {
+        if (l % 2 == 1) any_rtl = true;
+    }
+    if (!any_rtl) return null;
+
+    var pieces: std.ArrayList(BidiPiece) = .empty;
+    for (levels, frag_of.items, offset_of.items, 0..) |lvl, fi, off, i| {
+        const cp_end: u32 = if (i + 1 < levels.len and frag_of.items[i + 1] == fi)
+            offset_of.items[i + 1]
+        else
+            @intCast(frags[fi].text.len);
+        if (pieces.items.len > 0) {
+            const last = &pieces.items[pieces.items.len - 1];
+            if (last.frag == fi and last.level == lvl) {
+                last.end = cp_end;
+                continue;
+            }
+        }
+        pieces.append(arena, .{ .frag = fi, .start = off, .end = cp_end, .level = lvl }) catch return null;
+    }
+    return pieces.items;
+}
+
+/// Replaces the buffered line with its level-run pieces, each carrying the x
+/// UAX #9 rule L2 puts it at. Pieces stay in logical order so the emit half
+/// still walks the text the way the caller wrote it.
+fn reorderLineVisual(self: *TextLayoutWidget) void {
+    const arena = dvui.currentWindow().arena();
+    const frags = self.line_frags.items;
+    const pieces = bidiPieces(arena, frags) orelse return;
+
+    var out: std.ArrayList(Fragment) = .empty;
+    out.ensureTotalCapacityPrecise(arena, pieces.len) catch return;
+    for (pieces) |p| {
+        const src = frags[p.frag];
+        var f = src;
+        f.text = src.text[p.start..p.end];
+        f.bytes_seen = src.bytes_seen + p.start;
+        if (p.start != 0 or p.end != src.text.len) {
+            // The fragment's shape covers bytes this piece doesn't, and a
+            // visual-prefix slice of it isn't this piece -- let the emit half
+            // reshape the piece, which is a single direction and shapes right.
+            f.shaped = null;
+            f.size = src.font.textSizeEx(f.text, .{});
+            // Only the piece holding the fragment's tail closes the line.
+            f.newline = src.newline and p.end == src.text.len;
+        }
+        out.appendAssumeCapacity(f);
+    }
+
+    assignVisualX(arena, pieces, out.items, frags[0].x);
+    self.line_frags = out;
+}
+
+/// Rule L2: walk the pieces in visual order, laying them out left to right
+/// from the line's origin, and write back where each one lands. Reordering is
+/// a permutation, so the line's total width doesn't change.
+fn assignVisualX(arena: std.mem.Allocator, pieces: []const BidiPiece, out: []Fragment, origin: f32) void {
+    const levels = arena.alloc(u8, pieces.len) catch return;
+    for (pieces, levels) |p, *l| l.* = p.level;
+    const order = opentype.unicode.Bidi.reorderVisual(arena, levels) catch return;
+
+    var x = origin;
+    for (order) |pi| {
+        out[pi].x = x;
+        x += out[pi].size.w;
+    }
+}
+
+/// Places the buffered line in visual order, then draws it in logical order so
+/// selection, clipboard and accesskit still see the text the way the caller
+/// wrote it.
+fn flushLine(self: *TextLayoutWidget, ret: *?HoverMatch) void {
+    defer {
+        self.line_frags.clearRetainingCapacity();
+        self.line_maybe_rtl = false;
+    }
+    if (self.line_frags.items.len == 0) return;
+
+    // A flush can land in addTextDone/deinit/rectFor rather than in the
+    // addText call that produced the fragments, so re-establish the clip
+    // addTextEx set for them -- and put back whatever the caller had.
+    const saved_clip = dvui.clip(self.data().contentRectScale().r);
+    defer dvui.clipSet(saved_clip);
+
+    if (self.line_maybe_rtl) self.reorderLineVisual();
+    for (self.line_frags.items) |f| self.emitFragment(f, ret);
 }
 
 /// One laid-out fragment, ready to draw. Everything here is decided by the
@@ -1671,7 +1844,7 @@ fn emitFragment(self: *TextLayoutWidget, f: Fragment, ret: *?HoverMatch) void {
 
     // handle selection movement
     const text_rect = Rect{ .x = f.x, .y = f.y, .w = f.size.w, .h = f.size.h };
-    self.selMovePre(f.text, f.text.len, text_rect, f.options, if (shaped) |*st| st else null, shaped_glyph_limit);
+    self.selMovePre(f.text, f.text.len, f.bytes_seen, text_rect, f.options, if (shaped) |*st| st else null, shaped_glyph_limit);
 
     if (self.sel_pts[0] != null or self.sel_pts[1] != null) {
         var sel_bytes = [2]?usize{ null, null };
@@ -1889,6 +2062,9 @@ fn emitFragment(self: *TextLayoutWidget, f: Fragment, ret: *?HoverMatch) void {
 }
 
 pub fn addTextDone(self: *TextLayoutWidget, opts: Options) void {
+    var ret: ?HoverMatch = null;
+    self.flushLine(&ret);
+
     if (self.add_text_done) {
         dvui.log.debug("TextLayoutWidget {x} addTextDone() called multiple times", .{self.data().id});
     }
@@ -2179,6 +2355,12 @@ pub fn data(self: *TextLayoutWidget) *WidgetData {
 }
 
 pub fn rectFor(self: *TextLayoutWidget, id: dvui.Id, min_size: Size, e: Options.Expand, g: Options.Gravity) Rect {
+    // A child widget draws as soon as it is created, so text added before it
+    // has to be on screen first -- and its own geometry is not something the
+    // bidi pass can reorder around.
+    var flush_ret: ?HoverMatch = null;
+    self.flushLine(&flush_ret);
+
     _ = id;
 
     // For corner widgets, they might want to be closer to the border than the
@@ -2497,6 +2679,11 @@ pub fn copy(self: *TextLayoutWidget) void {
 }
 
 pub fn deinit(self: *TextLayoutWidget) void {
+    // addTextDone() normally drains this; a caller that skipped it must not
+    // lose the last line.
+    var flush_ret: ?HoverMatch = null;
+    self.flushLine(&flush_ret);
+
     defer if (dvui.widgetIsAllocated(self)) dvui.widgetFree(self);
     defer self.* = undefined;
     if (!self.add_text_done) {
@@ -2574,4 +2761,69 @@ fn textRunSrc() std.builtin.SourceLocation {
 
 test {
     @import("std").testing.refAllDecls(@This());
+}
+
+test "bidiPieces: level runs cross addText chunk boundaries" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Two styled chunks on one visual line, the way syntax highlighting emits
+    // them. Base direction resolves RTL off the first strong character.
+    var frags: [2]Fragment = undefined;
+    frags[0].text = "\u{05e9}\u{05dc}\u{05d5}\u{05dd}";
+    frags[1].text = " world";
+
+    const pieces = bidiPieces(arena, &frags) orelse return error.TestExpectedPieces;
+
+    // The second chunk is cut: its leading space is a neutral between an RTL
+    // and an LTR run, so it resolves to the paragraph level and travels with
+    // the Hebrew, not with "world".
+    try std.testing.expectEqual(@as(usize, 3), pieces.len);
+    try std.testing.expectEqual(@as(u8, 1), pieces[0].level);
+    try std.testing.expectEqual(@as(u32, 1), pieces[1].frag);
+    try std.testing.expectEqual(@as(u32, 0), pieces[1].start);
+    try std.testing.expectEqual(@as(u32, 1), pieces[1].end);
+    try std.testing.expectEqual(@as(u8, 1), pieces[1].level);
+    try std.testing.expectEqual(@as(u8, 2), pieces[2].level);
+
+    const levels = try arena.alloc(u8, pieces.len);
+    for (pieces, levels) |p, *l| l.* = p.level;
+    const order = try opentype.unicode.Bidi.reorderVisual(arena, levels);
+
+    // The logically-first chunk draws rightmost -- the whole point.
+    try std.testing.expectEqualSlices(usize, &.{ 2, 1, 0 }, order);
+}
+
+test "bidiPieces: left-to-right lines are left alone" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var frags: [2]Fragment = undefined;
+    frags[0].text = "const ";
+    frags[1].text = "x = 1;";
+    try std.testing.expect(bidiPieces(arena_state.allocator(), &frags) == null);
+}
+
+test "assignVisualX: the logically-first chunk lands rightmost" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var frags: [2]Fragment = undefined;
+    frags[0].text = "\u{05e9}\u{05dc}\u{05d5}\u{05dd}";
+    frags[1].text = " world";
+    const pieces = bidiPieces(arena, &frags) orelse return error.TestExpectedPieces;
+
+    // Stand-in widths: Hebrew 40, space 5, "world" 50.
+    var out: [3]Fragment = undefined;
+    const widths = [_]f32{ 40, 5, 50 };
+    for (&out, widths) |*o, w| o.size = .{ .w = w, .h = 10 };
+
+    assignVisualX(arena, pieces, &out, 0);
+
+    // "world" first, then the space, then the Hebrew: 0, 50, 55.
+    try std.testing.expectEqual(@as(f32, 55), out[0].x);
+    try std.testing.expectEqual(@as(f32, 50), out[1].x);
+    try std.testing.expectEqual(@as(f32, 0), out[2].x);
 }
