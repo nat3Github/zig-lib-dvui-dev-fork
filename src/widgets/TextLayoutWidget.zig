@@ -2827,3 +2827,33 @@ test "assignVisualX: the logically-first chunk lands rightmost" {
     try std.testing.expectEqual(@as(f32, 50), out[1].x);
     try std.testing.expectEqual(@as(f32, 0), out[2].x);
 }
+
+test "e2e: an RTL line built from two addText chunks stays one line" {
+    // Smoke cover for the buffer/reorder/emit path with real fonts and real
+    // shaping; the placement itself is asserted in the two tests above.
+    var t = try dvui.testing.init(.{ .window_size = .{ .w = 400, .h = 200 } });
+    defer t.deinit();
+
+    const fns = struct {
+        var width: f32 = 0;
+        var height: f32 = 0;
+
+        fn frame() !dvui.App.Result {
+            var tl = dvui.textLayout(@src(), .{}, .{ .tag = "tl" });
+            tl.addText("\u{05e9}\u{05dc}\u{05d5}\u{05dd}", .{});
+            tl.addText(" world", .{});
+            tl.addTextDone(.{});
+            width = tl.data().min_size.w;
+            height = tl.data().min_size.h;
+            tl.deinit();
+            return .ok;
+        }
+    };
+
+    try dvui.testing.settle(fns.frame);
+
+    // Reordering is a permutation, so the line is as wide as its content and
+    // never wrapped.
+    try std.testing.expect(fns.width > 60);
+    try std.testing.expect(fns.height < 40);
+}
