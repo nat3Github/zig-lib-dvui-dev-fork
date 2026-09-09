@@ -304,6 +304,86 @@ pub const CharPositionInfo = struct {
     x: f32, // x pos
 };
 
+/// Where one glyph landed, tagged with the byte offset of the cluster it
+/// came from. Glyphs are what rendering produces; AccessKit wants
+/// characters, so `buildCharacterInfo` converts.
+pub const GlyphPosition = struct {
+    cluster_byte: usize,
+    x: f32,
+    w: f32,
+};
+
+/// AccessKit indexes a text run by *character* -- here one codepoint --
+/// everywhere: `character_lengths` must sum to the run's byte length,
+/// `word_starts` and `TextPosition.character_index` count entries in it.
+/// Glyphs are not characters (a ligature merges several, a mark splits
+/// one), and in an RTL run they don't even arrive in logical order, so
+/// clusters are collected by byte offset and split evenly across the
+/// characters they cover.
+pub fn buildCharacterInfo(
+    arena: std.mem.Allocator,
+    text: []const u8,
+    glyphs: []GlyphPosition,
+    out: *std.MultiArrayList(CharPositionInfo),
+) void {
+    std.mem.sort(GlyphPosition, glyphs, {}, struct {
+        fn lessThan(_: void, a: GlyphPosition, b: GlyphPosition) bool {
+            return a.cluster_byte < b.cluster_byte;
+        }
+    }.lessThan);
+
+    var i: usize = 0;
+    var byte: usize = 0;
+    var x: f32 = if (glyphs.len > 0) glyphs[0].x else 0;
+    while (byte < text.len) {
+        var w: f32 = 0;
+        var cluster_end: usize = text.len;
+        if (i < glyphs.len and glyphs[i].cluster_byte <= byte) {
+            const cluster_byte = glyphs[i].cluster_byte;
+            x = glyphs[i].x;
+            while (i < glyphs.len and glyphs[i].cluster_byte == cluster_byte) : (i += 1) {
+                x = @min(x, glyphs[i].x);
+                w += glyphs[i].w;
+            }
+            cluster_end = if (i < glyphs.len) @min(glyphs[i].cluster_byte, text.len) else text.len;
+        } else if (i < glyphs.len) {
+            // Bytes before the first cluster: no glyph drew them.
+            cluster_end = @min(glyphs[i].cluster_byte, text.len);
+        }
+        if (cluster_end <= byte) cluster_end = text.len;
+
+        const chars = std.unicode.utf8CountCodepoints(text[byte..cluster_end]) catch cluster_end - byte;
+        const share = if (chars == 0) 0 else w / @as(f32, @floatFromInt(chars));
+        var k: usize = 0;
+        while (byte < cluster_end) : (k += 1) {
+            const len = std.unicode.utf8ByteSequenceLength(text[byte]) catch 1;
+            out.append(arena, .{
+                .l = len,
+                .w = share,
+                .x = x + share * @as(f32, @floatFromInt(k)),
+            }) catch return;
+            byte += @min(len, cluster_end - byte);
+        }
+        x += w;
+    }
+}
+
+/// Byte offset within `text` -> AccessKit character index.
+pub fn characterIndex(text: []const u8, byte_offset: usize) usize {
+    const end = @min(byte_offset, text.len);
+    return std.unicode.utf8CountCodepoints(text[0..end]) catch end;
+}
+
+/// AccessKit character index -> byte offset within `text`.
+pub fn byteOffset(text: []const u8, character_index: usize) usize {
+    var byte: usize = 0;
+    var n: usize = 0;
+    while (n < character_index and byte < text.len) : (n += 1) {
+        byte += std.unicode.utf8ByteSequenceLength(text[byte]) catch 1;
+    }
+    return @min(byte, text.len);
+}
+
 /// Created for each text run
 // AK TODO: node_parent_id is not actually required anymore (it can be replaced by controlling_widget_id).
 // However it seems a very useful id to have, even if just for debugging. So I've not removed it for now.
@@ -316,8 +396,9 @@ pub const TextRunOptions = struct {
     controlling_widget_id: dvui.Id,
     /// line number
     line: usize,
-    /// starting character offset
-    char_offset: usize,
+    /// byte offset of this run within the widget's text (dvui counts
+    /// bytes; AccessKit's own indices into the run count characters)
+    byte_offset: usize,
 };
 
 /// Populate the text_run node with character position and word length details.
@@ -337,11 +418,17 @@ pub fn textRunPopulate(
     defer word_starts.deinit(window.arena());
 
     var prev_char_wordbreak: bool = self.text_run_prev_wordbreak or opts.node_parent_id != self.text_run_prev_parent_id;
-    for (text, 0..) |ch, i| {
+    // Indices into `character_lengths`, not into the bytes: a word start
+    // past any multi-byte character would otherwise point at the wrong one.
+    var character: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) : (character += 1) {
+        const ch = text[i];
+        i += std.unicode.utf8ByteSequenceLength(ch) catch 1;
         if (std.mem.findScalar(u8, dvui.TextLayoutWidget.word_breaks, ch) == null) {
             if (prev_char_wordbreak) {
                 // AK TODO: If a line is more than 255 characters, then it needs to be broken up into 2 text runs.
-                word_starts.append(window.arena(), @min(i, std.math.maxInt(u8))) catch {};
+                word_starts.append(window.arena(), @min(character, std.math.maxInt(u8))) catch {};
                 prev_char_wordbreak = false;
             }
         } else {
@@ -379,9 +466,18 @@ pub fn textRunPopulate(
     self.text_runs.append(window.gpa, opts) catch {}; // If text run can't be added, selection actions will fail this frame.
 }
 
+/// The byte offset a character index names within `run`'s own text, which
+/// the node still holds as its value.
+fn runByteOffset(self: *AccessKit, run: TextRunOptions, character_index: usize) usize {
+    const ak_node = self.nodes.get(run.node_id) orelse return character_index;
+    const value = nodeValue(ak_node) orelse return character_index;
+    defer stringFree(value);
+    return byteOffset(std.mem.span(value), character_index);
+}
+
 /// Creates an empty text run
 /// make sure to set accesskit.text_run_parent before calling.
-pub fn textRunCreateEmpty(self: *AccessKit, node_id: dvui.Id, controlling_widget: dvui.Id, line: usize, r: dvui.Rect.Physical) void {
+pub fn textRunCreateEmpty(self: *AccessKit, node_id: dvui.Id, controlling_widget: dvui.Id, line: usize, byte_offset: usize, r: dvui.Rect.Physical) void {
     if (!dvui.accesskit_enabled) return; // Required to defeat @refAllDecls
 
     var text_info: std.MultiArrayList(AccessKit.CharPositionInfo) = .empty;
@@ -391,7 +487,7 @@ pub fn textRunCreateEmpty(self: *AccessKit, node_id: dvui.Id, controlling_widget
         .node_parent_id = self.text_run_parent.?,
         .controlling_widget_id = controlling_widget,
         .line = line,
-        .char_offset = 0,
+        .byte_offset = byte_offset,
     }, &text_info, r);
 }
 
@@ -496,9 +592,12 @@ fn processActions(self: *AccessKit) void {
                 }
 
                 if (anchor_run) |a_run| if (focus_run) |f_run| {
+                    // `byte_offset` is dvui's unit; `character_index` is
+                    // AccessKit's, so it only lands on the right byte
+                    // after converting through the run's own text.
                     _ = window.addEventTextSelect(.{
-                        .start = a_run.char_offset + anchor.character_index,
-                        .end = f_run.char_offset + focus.character_index,
+                        .start = a_run.byte_offset + self.runByteOffset(a_run, anchor.character_index),
+                        .end = f_run.byte_offset + self.runByteOffset(f_run, focus.character_index),
                         .target_id = a_run.controlling_widget_id,
                     }) catch |err| logEventAddError(@src(), err);
                 };
@@ -1796,3 +1895,40 @@ pub const RoleNoAccessKit = enum {
 
 const debug_node_tree = false;
 const debug_textruns = false;
+
+test "buildCharacterInfo: one entry per character, summing to the run's bytes" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // "aé" + a two-codepoint ligature drawn as one glyph, then a mark
+    // stacked on the last letter: three cases glyph counting gets wrong.
+    const text = "a\u{e9}fin\u{0301}";
+    var glyphs = [_]GlyphPosition{
+        .{ .cluster_byte = 0, .x = 0, .w = 10 }, // a
+        .{ .cluster_byte = 1, .x = 10, .w = 10 }, // é
+        .{ .cluster_byte = 3, .x = 20, .w = 20 }, // fi ligature, one glyph
+        .{ .cluster_byte = 5, .x = 40, .w = 10 }, // n
+        .{ .cluster_byte = 5, .x = 40, .w = 0 }, // combining acute
+    };
+
+    var info: std.MultiArrayList(CharPositionInfo) = .empty;
+    buildCharacterInfo(arena, text, &glyphs, &info);
+
+    var total: usize = 0;
+    for (info.items(.l)) |l| total += l;
+    try std.testing.expectEqual(text.len, total);
+    try std.testing.expectEqual(@as(usize, 6), info.len);
+
+    // The ligature's width is split between the two characters under it.
+    try std.testing.expectEqual(@as(f32, 10), info.items(.w)[2]);
+    try std.testing.expectEqual(@as(f32, 30), info.items(.x)[3]);
+
+    // Round-trip: character indices and byte offsets name the same places.
+    var byte: usize = 0;
+    for (info.items(.l), 0..) |l, ch| {
+        try std.testing.expectEqual(byte, byteOffset(text, ch));
+        try std.testing.expectEqual(ch, characterIndex(text, byte));
+        byte += l;
+    }
+}

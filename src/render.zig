@@ -146,6 +146,7 @@ pub fn renderText(opts: TextOptions) Backend.GenericError!void {
     var cw = dvui.currentWindow();
     // Record character heights and positions for AccessKit text_run role.
     var text_info: std.MultiArrayList(AccessKit.CharPositionInfo) = .empty;
+    var glyph_positions: std.ArrayList(AccessKit.GlyphPosition) = .empty;
     const clipped_rect = dvui.clipGet().intersect(opts.rs.r);
 
     // If accessibility is enabled, we still need create the associated text_run
@@ -312,11 +313,9 @@ pub fn renderText(opts: TextOptions) Backend.GenericError!void {
             }
             if (dvui.accesskit_enabled) {
                 if (opts.ak_opts) |_| {
-                    const cluster_start = line.byte_offsets[info.cluster];
-                    const cluster_end = line.byte_offsets[info.cluster + 1];
-                    text_info.append(cw.arena(), .{
-                        .l = @intCast(cluster_end - cluster_start),
-                        .w = if (gi.w == 0) nextx - x else gi.w,
+                    glyph_positions.append(cw.arena(), .{
+                        .cluster_byte = line.byte_offsets[info.cluster],
+                        .w = nextx - x,
                         .x = std.math.clamp(x - clipped_rect.x, 0, clipped_rect.w),
                     }) catch {};
                 }
@@ -431,6 +430,7 @@ pub fn renderText(opts: TextOptions) Backend.GenericError!void {
     }
 
     if (dvui.accesskit_enabled) if (opts.ak_opts) |ak_opts| {
+        AccessKit.buildCharacterInfo(cw.arena(), opts.text, glyph_positions.items, &text_info);
         cw.accesskit.textRunPopulate(opts.text, ak_opts, &text_info, clipped_rect);
     };
 }

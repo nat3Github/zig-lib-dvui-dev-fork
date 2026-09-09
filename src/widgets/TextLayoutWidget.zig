@@ -134,6 +134,7 @@ pub const Selection = struct {
 // Text selection information for accesskit.
 const TextRunSelectionInfo = struct {
     node_id: dvui.Id,
+    /// AccessKit character index within that run's text.
     pos: usize,
 };
 
@@ -2207,27 +2208,29 @@ fn emitFragment(self: *TextLayoutWidget, f: Fragment, index: usize) void {
                         .rect = r,
                     });
                     defer text_run_widget.deinit();
-                    self.textrun_last = .{ .node_id = text_run_widget.data().id, .pos = f.bytes_seen + f.text.len };
+                    // `pos` is an AccessKit character index into this run's
+                    // own text, not a byte offset into the widget's.
+                    self.textrun_last = .{ .node_id = text_run_widget.data().id, .pos = AccessKit.characterIndex(rtxt, rtxt.len) };
                     if (!self.selection.empty()) {
                         if (self.textrun_focus == null and self.selection.cursor >= f.bytes_seen and self.selection.cursor < f.bytes_seen + rtxt.len) {
-                            self.textrun_focus = .{ .node_id = text_run_widget.data().id, .pos = self.selection.cursor - f.bytes_seen };
+                            self.textrun_focus = .{ .node_id = text_run_widget.data().id, .pos = AccessKit.characterIndex(rtxt, self.selection.cursor - f.bytes_seen) };
                         }
                         if (self.textrun_anchor == null) {
                             const anchor = if (self.selection.cursor == self.selection.start) self.selection.end else self.selection.start;
                             if (anchor >= f.bytes_seen and anchor < f.bytes_seen + rtxt.len) {
-                                self.textrun_anchor = .{ .node_id = text_run_widget.data().id, .pos = anchor - f.bytes_seen };
+                                self.textrun_anchor = .{ .node_id = text_run_widget.data().id, .pos = AccessKit.characterIndex(rtxt, anchor - f.bytes_seen) };
                             }
                         }
                     }
                     if (self.textrun_cursor == null and self.selection.cursor >= f.bytes_seen and self.selection.cursor < f.bytes_seen + rtxt.len) {
-                        self.textrun_cursor = .{ .node_id = text_run_widget.data().id, .pos = self.selection.cursor - f.bytes_seen };
+                        self.textrun_cursor = .{ .node_id = text_run_widget.data().id, .pos = AccessKit.characterIndex(rtxt, self.selection.cursor - f.bytes_seen) };
                     }
                     break :info .{
                         .node_id = text_run_widget.data().id,
                         .node_parent_id = cw.accesskit.text_run_parent.?,
                         .controlling_widget_id = if (self.data().options.role.? == .none) cw.accesskit.text_run_parent.? else self.data().id,
                         .line = f.line,
-                        .char_offset = f.bytes_seen,
+                        .byte_offset = f.bytes_seen,
                     };
                 }
             }
@@ -2554,11 +2557,13 @@ pub fn textRunCreateEmpty(self: *TextLayoutWidget, controlling_widget: dvui.Id, 
     const empty_space: Rect = .{ .x = self.insert_pt.x, .y = self.insert_pt.y, .w = 1, .h = @max(0, @min(text_height, crect.h - self.insert_pt.y)) };
     var vp = dvui.overlay(if (first_line) textRunSrc() else @src(), .{ .name = "Text Run", .role = .text_run, .rect = empty_space });
     defer vp.deinit();
-    self.textrun_last = .{ .node_id = vp.data().id, .pos = if (self.newline) self.bytes_seen + 1 else self.bytes_seen };
+    // An empty run has one place to be: character 0.
+    self.textrun_last = .{ .node_id = vp.data().id, .pos = 0 };
     dvui.currentWindow().accesskit.textRunCreateEmpty(
         vp.data().id,
         controlling_widget,
         self.line,
+        self.bytes_seen,
         self.data().contentRectScale().rectToPhysical(empty_space),
     );
 }
