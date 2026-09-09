@@ -659,20 +659,17 @@ fn hitWithin(f: Fragment, p: Point) PointHit {
     const how_far = if (f.rtl) (f.x + f.size.w) - p.x else p.x - f.x;
     // Width-driven hit-test against the already-shaped line instead of
     // reshaping `f.text` from scratch just to find which byte a pixel
-    // offset lands on.
+    // offset lands on. `f.shaped` is the shape `f.size.w` was measured from,
+    // so `how_far` is in its coordinates; the reshape below is not, which is
+    // why it is only the last resort.
     var pt_end: usize = undefined;
     var found = false;
-    // An RTL run's glyphs are in visual order, so the shape's leading-glyph
-    // walk would answer for the wrong end of it.
-    if (!f.rtl) {
-        if (f.shaped) |shaped| {
-            var st = shaped;
-            const glyph_limit = st.line.glyphLimitForByteOffset(f.text.len);
-            if (st.byteOffsetForWidth(dvui.currentWindow().gpa, glyph_limit, how_far, .nearest)) |b| {
-                pt_end = b;
-                found = true;
-            } else |_| {}
-        }
+    if (f.shaped) |shaped| {
+        var st = shaped;
+        if (st.byteOffsetForWidth(dvui.currentWindow().gpa, how_far, .nearest)) |b| {
+            pt_end = b;
+            found = true;
+        } else |_| {}
     }
     if (!found) {
         _ = f.font.textSizeEx(f.text, .{ .max_width = how_far, .end_idx = &pt_end, .end_metric = .nearest });
@@ -1492,13 +1489,12 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
         // outlive this function (see there).
         var shaped: ?Font.ShapedText = null;
         var s: Size = undefined;
-        // Set when this fragment's shape was bidi-reordered: a visual-prefix
-        // slice of it (what the `shaped` fast path reuses for trim/measure/
-        // render/hit-test) is not a logical prefix, so we drop to the
-        // reshape-per-line path -- which shapes each final line byte-range on
-        // its own and is therefore visually correct -- and retreat over-wide
-        // lines to a fitting break below.
-        var line_is_bidi = false;
+        // Set when this fragment's shape holds both directions at once: no
+        // byte prefix of it is a contiguous stretch of the line, so we drop
+        // to the reshape-per-line path -- which shapes each final line
+        // byte-range on its own and is therefore visually correct -- and
+        // retreat over-wide lines to a fitting break below.
+        var line_is_mixed = false;
         if (font.textSizeExShaped(cw.gpa, txt, .{
             .max_width = if (self.break_lines) width else null,
             .end_idx = &end,
@@ -1507,11 +1503,11 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
             s = res.size;
             shaped = res.shaped;
             if (shaped) |*st| {
-                if (st.line.isBidi()) {
+                if (st.line.isMixedDirection()) {
                     // Leave the unused shape for the frame arena to bulk-free
                     // (matches the "never deinit here" convention above).
                     shaped = null;
-                    line_is_bidi = true;
+                    line_is_mixed = true;
                 }
             }
         } else {
@@ -1586,7 +1582,7 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
             // already at the line start (so dropping down wouldn't help),
             // retreat to the previous break opportunity until it fits (or no
             // earlier break exists -- an unbreakable run, left to overflow).
-            if (line_is_bidi) {
+            if (line_is_mixed) {
                 s = font.textSizeEx(txt[0..end], .{});
                 const at_line_start = !(linewidth < container_width or self.insert_pt.x > linestart);
                 while (at_line_start and s.w > width and end > 0) {
@@ -1642,6 +1638,13 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
             }
 
             self.current_line_ascent = ascent;
+        }
+
+        if (shaped) |*st| {
+            // A shape running past the fragment is drawn by leading-glyph
+            // limit, which is the wrong end of an RTL run -- and the glyphs
+            // it would keep aren't even the ones under `f.text`.
+            if (st.line.isRtl() and st.line.byte_offsets[st.line.codepoints.len] != end) shaped = null;
         }
 
         self.line_frags.append(cw.arena(), .{
@@ -1894,9 +1897,9 @@ fn reshapeWithNeighbourContext(frags: []Fragment) void {
         }) catch continue orelse continue;
         frags[i].render_shaped = res.shaped;
         frags[i].size.w = res.size.w;
-        // Same rule as the layout half: a reordered shape is only good for
-        // drawing, never for the emit half's leading-prefix slicing.
-        if (!res.shaped.line.isBidi()) frags[i].shaped = res.shaped;
+        // Same rule as the layout half: a shape holding both directions is
+        // only good for drawing, never for slicing by byte offset.
+        if (!res.shaped.line.isMixedDirection()) frags[i].shaped = res.shaped;
         any = true;
     }
     if (!any) return;
@@ -1930,32 +1933,21 @@ fn reorderLineVisual(self: *TextLayoutWidget) void {
         if (p.start != 0 or p.end != src.text.len) {
             // Only the piece holding the fragment's tail closes the line.
             f.newline = src.newline and p.end == src.text.len;
-            // The whole-fragment shape can't be sliced, so it goes either way.
+            // The fragment's own shape covers bytes this piece doesn't, so
+            // it is shaped again -- with the rest of the fragment as context,
+            // so cutting a level run out of the middle of a word doesn't undo
+            // its joining forms. The result is rebased onto the piece, so
+            // both halves can slice it by byte offset.
+            f.shaped = null;
             f.render_shaped = null;
-            if (p.start == 0) {
-                // A leading piece is a logical prefix of the fragment, and
-                // every shape that reaches here is in logical order (the
-                // layout half drops reordered ones), so the emit half can
-                // still slice this one by byte offset -- for free.
-                f.size = if (f.shaped) |*st|
-                    st.measureUpToByteOffset(cw.gpa, p.end) catch src.font.textSizeEx(f.text, .{})
-                else
-                    src.font.textSizeEx(f.text, .{});
+            if (src.font.textSizeExShaped(cw.gpa, src.text, .{
+                .item = .{ .start = p.start, .end = p.end },
+            }) catch null) |res| {
+                f.size = res.size;
+                f.render_shaped = res.shaped;
+                if (!res.shaped.line.isMixedDirection()) f.shaped = res.shaped;
             } else {
-                // Emit only knows how to reuse a shape's leading glyphs, so
-                // this one is shaped again -- but with the rest of the
-                // fragment as context, so cutting a level run out of the
-                // middle of a word doesn't undo its joining forms.
-                f.shaped = null;
-                if (src.font.textSizeExShaped(cw.gpa, src.text, .{
-                    .item = .{ .start = p.start, .end = p.end },
-                }) catch null) |res| {
-                    f.size = res.size;
-                    f.render_shaped = res.shaped;
-                    if (!res.shaped.line.isBidi()) f.shaped = res.shaped;
-                } else {
-                    f.size = src.font.textSizeEx(f.text, .{});
-                }
+                f.size = src.font.textSizeEx(f.text, .{});
             }
         }
         out.appendAssumeCapacity(f);
@@ -2040,9 +2032,10 @@ const Fragment = struct {
     text: []const u8,
     size: Size,
     ascent: f32,
-    /// Prefix-safe shape of `text` alone: only set when its glyphs are in
-    /// logical order, because everything the emit half does with it slices a
-    /// leading byte range.
+    /// Prefix-safe shape of `text`: set unless the shape mixes both
+    /// directions, in which case no byte prefix of it covers a contiguous
+    /// stretch of the line. A single RTL run is fine -- the emit half asks
+    /// for prefixes by cluster, not by leading glyph.
     shaped: ?Font.ShapedText,
     /// Whole-fragment shape taken with the neighbouring text as context, so
     /// Arabic joining forms and cross-boundary kerning are right. Valid for
@@ -2246,9 +2239,8 @@ fn emitFragment(self: *TextLayoutWidget, f: Fragment, index: usize) void {
         // `cw.arena()` rather than pointing at this stack frame.
         var render_glyph_limit = shaped_glyph_limit;
         const pre_shaped: ?*const Font.ShapedText = blk: {
-            // The context shape covers exactly `f.text`, so it needs no glyph
-            // limit -- and unlike `shaped` it is valid for an RTL fragment,
-            // whose glyphs are in visual order.
+            // The context shape covers exactly `f.text`, so it needs no
+            // glyph limit, where `shaped` can still run past the fragment.
             const st = f.render_shaped orelse shaped orelse break :blk null;
             if (f.render_shaped != null) render_glyph_limit = st.line.buffer.info.items.len;
             const p = cw.arena().create(Font.ShapedText) catch break :blk null;
@@ -3191,7 +3183,7 @@ test "reorderLineVisual: a piece cut mid-fragment is reshaped with the rest as c
 
     const fns = struct {
         var pieces: usize = 0;
-        var leading_kept_shape = false;
+        var leading_has_render_shape = false;
         var cut_has_render_shape = false;
         var cut_text: []const u8 = "";
 
@@ -3215,7 +3207,7 @@ test "reorderLineVisual: a piece cut mid-fragment is reshaped with the rest as c
 
             pieces = tl.line_frags.items.len;
             if (pieces == 3) {
-                leading_kept_shape = tl.line_frags.items[1].render_shaped == null;
+                leading_has_render_shape = tl.line_frags.items[1].render_shaped != null;
                 cut_has_render_shape = tl.line_frags.items[2].render_shaped != null;
                 cut_text = tl.line_frags.items[2].text;
             }
@@ -3230,9 +3222,10 @@ test "reorderLineVisual: a piece cut mid-fragment is reshaped with the rest as c
 
     try std.testing.expectEqual(@as(usize, 3), fns.pieces);
     try std.testing.expectEqualStrings("world", fns.cut_text);
-    // The leading piece stays free: it slices its parent's shape by byte
-    // offset instead of shaping again.
-    try std.testing.expect(fns.leading_kept_shape);
+    // Every cut piece is reshaped against the whole fragment, the leading
+    // one included: its parent's shape covers bytes it doesn't own, and in
+    // an RTL run those are the ones its own glyphs sit behind.
+    try std.testing.expect(fns.leading_has_render_shape);
     // The one that had to shape again did it with the whole fragment around
     // it, so it still has a drawable shape rather than falling back to a
     // context-free reshape at render time.
@@ -3353,6 +3346,7 @@ test "e2e: a clickable chunk is reordered, and answers one frame late" {
     const fns = struct {
         var clicks: usize = 0;
         var content: dvui.Rect.Physical = .{};
+        var scale: f32 = 1;
 
         fn frame() !dvui.App.Result {
             // No expand: the widget hugs the text, so the RTL line origin is
@@ -3361,7 +3355,9 @@ test "e2e: a clickable chunk is reordered, and answers one frame late" {
             tl.addText("\u{05e9}\u{05dc}\u{05d5}\u{05dd} ", .{});
             if (tl.addTextClick("world", .{})) |_| clicks += 1;
             tl.addTextDone(.{});
-            content = tl.data().contentRectScale().r;
+            const rs = tl.data().contentRectScale();
+            content = rs.r;
+            scale = rs.s;
             tl.deinit();
             return .ok;
         }
@@ -3455,6 +3451,7 @@ test "e2e: an RTL paragraph starts at the right edge" {
     const fns = struct {
         var clicks: usize = 0;
         var content: dvui.Rect.Physical = .{};
+        var scale: f32 = 1;
         var hit: ?Rect = null;
 
         fn frame() !dvui.App.Result {
@@ -3465,7 +3462,9 @@ test "e2e: an RTL paragraph starts at the right edge" {
             if (tl.addTextClick("world", .{})) |_| clicks += 1;
             tl.addText(" \u{05e9}\u{05dc}\u{05d5}\u{05dd}", .{});
             tl.addTextDone(.{});
-            content = tl.data().contentRectScale().r;
+            const rs = tl.data().contentRectScale();
+            content = rs.r;
+            scale = rs.s;
             hit = if (tl.deferred_click) |h| h.rect else null;
             tl.deinit();
             return .ok;
@@ -3614,26 +3613,48 @@ test "e2e: a click lands in the run under it, not the logically-first one" {
         const second = "\u{05e2}\u{05d5}\u{05dc}\u{05dd}";
         var sel: Selection = .{};
         var content: dvui.Rect.Physical = .{};
+        var scale: f32 = 1;
+        var w_first: f32 = 0;
+        var w_first_half: f32 = 0;
+        var w_second_half: f32 = 0;
+        var total: f32 = 0;
 
         fn frame() !dvui.App.Result {
             var tl = dvui.textLayout(@src(), .{ .selection = &sel }, .{});
+            const font = tl.data().options.fontGet();
+            w_first = font.textSizeEx(first, .{}).w;
+            w_first_half = font.textSizeEx(first[0..4], .{}).w;
+            w_second_half = font.textSizeEx(second[0..4], .{}).w;
+            total = w_first + font.textSizeEx(second, .{}).w;
             tl.addText(first, .{});
             tl.addText(second, .{});
             tl.addTextDone(.{});
-            content = tl.data().contentRectScale().r;
+            const rs = tl.data().contentRectScale();
+            content = rs.r;
+            scale = rs.s;
             tl.deinit();
             return .ok;
+        }
+
+        fn clickAt(x: f32) !void {
+            _ = try dvui.currentWindow().addEventMouseMotion(.{ .pt = .{ .x = content.x + x * scale, .y = content.y + 4 } });
+            try dvui.testing.click(.left);
+            try dvui.testing.settle(frame);
         }
     };
 
     try dvui.testing.settle(fns.frame);
 
     // Both chunks are level 1, so L2 puts the logically-second one on the
-    // left of the line.
-    _ = try dvui.currentWindow().addEventMouseMotion(.{ .pt = .{ .x = fns.content.x + fns.content.w * 0.4, .y = fns.content.y + 4 } });
-    try dvui.testing.click(.left);
-    try dvui.testing.settle(fns.frame);
+    // left of the line and the first one at the right edge. Two letters in
+    // from that edge is byte 4 of the first chunk -- the exact byte, not
+    // just the right run: the click is measured against the same shape the
+    // run was laid out with, walked by cluster from its logical start.
+    try fns.clickAt(fns.total - fns.w_first_half);
+    try std.testing.expectEqual(@as(usize, 4), fns.sel.cursor);
 
-    try std.testing.expect(fns.sel.cursor > fns.first.len);
-    try std.testing.expect(fns.sel.cursor <= fns.first.len + fns.second.len);
+    // The left run reads right to left too, so two letters into it means
+    // two letters left of *its* right edge, not of the line's.
+    try fns.clickAt(fns.total - fns.w_first - fns.w_second_half);
+    try std.testing.expectEqual(fns.first.len + 4, fns.sel.cursor);
 }

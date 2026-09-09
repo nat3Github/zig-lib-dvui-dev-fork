@@ -632,15 +632,16 @@ pub const ShapedText = struct {
 
     pub fn measureUpToByteOffset(self: *ShapedText, gpa: std.mem.Allocator, byte_offset: usize) std.mem.Allocator.Error!Size {
         const snap = if (dvui.current_window) |cw| cw.snap_to_pixels else true;
-        const glyph_limit = self.line.glyphLimitForByteOffset(byte_offset);
-        const s = try self.fallback.measureGlyphRange(gpa, &self.line, glyph_limit, snap);
+        const s = try self.fallback.measureLogicalPrefix(gpa, &self.line, byte_offset, snap);
         return s.scale(1.0 / self.ss, Size);
     }
 
-    pub fn byteOffsetForWidth(self: *ShapedText, gpa: std.mem.Allocator, glyph_limit: usize, width: f32, end_metric: Font.EndMetric) std.mem.Allocator.Error!usize {
+    /// Inverse of `measureUpToByteOffset`: which byte a caret dragged `width`
+    /// along the run's logical direction lands on.
+    pub fn byteOffsetForWidth(self: *ShapedText, gpa: std.mem.Allocator, width: f32, end_metric: Font.EndMetric) std.mem.Allocator.Error!usize {
         const snap = if (dvui.current_window) |cw| cw.snap_to_pixels else true;
-        const glyphs_used = try self.fallback.glyphsForWidth(gpa, &self.line, glyph_limit, width * self.ss, end_metric, snap);
-        return self.line.byteOffsetForGlyph(glyphs_used);
+        const fit = try self.fallback.logicalPrefixForWidth(gpa, &self.line, width * self.ss, end_metric, snap);
+        return fit.byte;
     }
 };
 
@@ -1509,6 +1510,16 @@ pub const Cache = struct {
 
             const found_break = glyphs_used < line.buffer.info.items.len;
             if (found_break or window >= newline_idx) {
+                // A break inside an RTL run cuts its logical prefix, which is
+                // the buffer's trailing glyphs -- the walk above measured in
+                // from the other end of the run.
+                if (found_break and line.buffer.isRtl()) {
+                    if (fallback_entry) |fe| {
+                        const fit = try fe.logicalPrefixForWidth(gpa, &line, mwidth, opts.end_metric, snap);
+                        if (opts.end_idx) |endout| endout.* = fit.byte;
+                        return .{ .size = .{ .w = fit.w, .h = th }, .line = line };
+                    }
+                }
                 if (opts.end_idx) |endout| {
                     endout.* = line.byteOffsetForGlyph(glyphs_used);
                     // consume the whole hard-break sequence (CRLF, LS, ...)
@@ -1928,14 +1939,31 @@ pub const Cache = struct {
                 return self.buffer.glyphLimitForByteOffset(self.byte_offsets, byte_offset);
             }
 
-            /// True if bidi reordering moved glyphs out of logical order.
-            pub fn isBidi(self: ShapedLine) bool {
-                var prev: u32 = 0;
+            /// Glyphs of the logical byte prefix [0, byte_offset); RTL-correct.
+            pub fn logicalPrefixGlyphs(self: ShapedLine, byte_offset: usize) Buffer.GlyphRange {
+                return self.buffer.logicalPrefixGlyphs(self.byte_offsets, byte_offset);
+            }
+
+            /// Reads right to left, so a logical prefix sits at its right edge.
+            pub fn isRtl(self: ShapedLine) bool {
+                return self.buffer.isRtl();
+            }
+
+            /// Both directions in one shape: no logical prefix of it covers a
+            /// contiguous stretch of the line, so measuring or slicing one by
+            /// byte offset is meaningless whichever end you count from.
+            pub fn isMixedDirection(self: ShapedLine) bool {
+                var saw_forward = false;
+                var saw_back = false;
+                var prev: ?u32 = null;
                 for (self.buffer.info.items) |info| {
-                    if (info.cluster < prev) return true;
+                    if (prev) |p| {
+                        if (info.cluster > p) saw_forward = true;
+                        if (info.cluster < p) saw_back = true;
+                    }
                     prev = info.cluster;
                 }
-                return false;
+                return saw_forward and saw_back;
             }
         };
 
@@ -1975,15 +2003,38 @@ pub const Cache = struct {
             line: ShapedLine,
         };
 
-        /// Size of glyphs up to glyph_limit; no reshaping.
-        pub fn measureGlyphRange(self: *Entry, gpa: std.mem.Allocator, line: *const ShapedLine, glyph_limit: usize, snap: bool) std.mem.Allocator.Error!Size {
-            const s = try opentype.measureGlyphRange(gpa, self, self.ascent, self.height, line.buffer.info.items, line.buffer.pos.items, glyph_limit, snap);
+        /// Size of the logical byte prefix [0, byte_offset) of an already
+        /// shaped line; no reshaping. In an RTL run that prefix is the
+        /// buffer's trailing glyphs, not its leading ones.
+        pub fn measureLogicalPrefix(self: *Entry, gpa: std.mem.Allocator, line: *const ShapedLine, byte_offset: usize, snap: bool) std.mem.Allocator.Error!Size {
+            const r = line.logicalPrefixGlyphs(byte_offset);
+            // ponytail: one entry's metrics for every glyph -- a prefix that
+            // fell back to a second font measures its ink against the
+            // primary; thread entryForGlyph through if that ever shows.
+            const s = try opentype.measureGlyphRange(gpa, self, self.ascent, self.height, line.buffer.info.items[r.start..r.end], line.buffer.pos.items[r.start..r.end], r.end - r.start, snap);
             return .{ .w = s.w, .h = s.h };
         }
 
-        /// Glyph count where cumulative advance crosses mwidth; used for hit-testing.
-        pub fn glyphsForWidth(self: *Entry, gpa: std.mem.Allocator, line: *const ShapedLine, glyph_limit: usize, mwidth: f32, end_metric: Font.EndMetric, snap: bool) std.mem.Allocator.Error!usize {
-            return opentype.glyphsForWidth(gpa, self, line.buffer.info.items, line.buffer.pos.items, glyph_limit, mwidth, end_metric, snap);
+        pub const PrefixFit = struct { byte: usize, w: f32 };
+
+        /// Longest logical byte prefix of `line` that fits `mwidth` (device
+        /// pixels), and its width: the inverse of `measureLogicalPrefix`, and
+        /// exact in both directions because it is found by measuring through
+        /// that same call at each cluster boundary.
+        pub fn logicalPrefixForWidth(self: *Entry, gpa: std.mem.Allocator, line: *const ShapedLine, mwidth: f32, end_metric: Font.EndMetric, snap: bool) std.mem.Allocator.Error!PrefixFit {
+            var best: PrefixFit = .{ .byte = 0, .w = 0 };
+            // ponytail: re-measures from the run's logical start per candidate
+            // (quadratic in glyphs), which a fragment-sized run never notices;
+            // make it incremental if whole-paragraph lines ever come through.
+            for (line.cluster_ends) |boundary| {
+                const w = (try self.measureLogicalPrefix(gpa, line, boundary, snap)).w;
+                if (w > mwidth) {
+                    if (end_metric == .nearest and w - mwidth < mwidth - best.w) return .{ .byte = boundary, .w = w };
+                    return best;
+                }
+                best = .{ .byte = boundary, .w = w };
+            }
+            return best;
         }
     };
 };
@@ -2091,16 +2142,50 @@ test "smoke: bidi/RTL text shapes without crashing" {
     var line = try cw.fonts.shapeLineText(gpa, gpa, resolved, "abc \u{0627}\u{0644}\u{0633}\u{0644}\u{0627}\u{0645} xyz", null);
     defer line.deinit();
     try std.testing.expect(line.buffer.info.items.len > 0);
-    // The Arabic run is RTL, so its glyphs are reordered out of logical
-    // order -- `isBidi` must catch this so `TextLayoutWidget` reshapes each
-    // wrapped line's own byte-range instead of slicing a visual prefix.
-    try std.testing.expect(line.isBidi());
+    // Latin around an Arabic run: the line holds both directions at once, so
+    // no byte prefix of it is a contiguous stretch of the line and
+    // `TextLayoutWidget` has to reshape each wrapped line's own byte-range.
+    try std.testing.expect(line.isMixedDirection());
 
-    // Pure-LTR text keeps clusters monotone, so the fast visual-prefix reuse
-    // path stays enabled (isBidi false).
+    // One direction, either one, keeps the shape sliceable by byte offset.
     var ltr = try cw.fonts.shapeLineText(gpa, gpa, resolved, "Hello, world!", null);
     defer ltr.deinit();
-    try std.testing.expect(!ltr.isBidi());
+    try std.testing.expect(!ltr.isMixedDirection());
+    try std.testing.expect(!ltr.isRtl());
+
+    var rtl = try cw.fonts.shapeLineText(gpa, gpa, resolved, "\u{05e9}\u{05dc}\u{05d5}\u{05dd}", null);
+    defer rtl.deinit();
+    try std.testing.expect(!rtl.isMixedDirection());
+}
+
+test "an RTL run's logical prefix measures monotonically, and width maps back to it" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    const gpa = std.testing.allocator;
+
+    const font: Font = .find(.{ .family = "Vera", .size = 16 });
+    // Four Hebrew letters, two bytes each. Their glyphs come out right to
+    // left, so the logical prefix a caret walks over is the *last* stretch
+    // of the shape -- what a leading-glyph walk gets backwards.
+    const txt = "\u{05e9}\u{05dc}\u{05d5}\u{05dd}";
+    var res = (try font.textSizeExShaped(gpa, txt, .{})).?;
+    defer res.shaped.deinit();
+    // Nothing in the stack covers Hebrew on this platform.
+    if (res.shaped.line.buffer.info.items[0].codepoint == 0) return;
+    try std.testing.expect(res.shaped.line.isRtl());
+
+    var prev: f32 = -1;
+    var off: usize = 0;
+    while (off <= txt.len) : (off += 2) {
+        const w = (try res.shaped.measureUpToByteOffset(gpa, off)).w;
+        try std.testing.expect(w > prev);
+        prev = w;
+
+        // And the inverse: the width of a prefix answers with that prefix.
+        var end: usize = undefined;
+        _ = font.textSizeEx(txt, .{ .max_width = w, .end_idx = &end, .end_metric = .nearest });
+        try std.testing.expectEqual(off, end);
+    }
 }
 
 test "Cache.buildCoverage: earlier stack entries win overlapping coverage" {
