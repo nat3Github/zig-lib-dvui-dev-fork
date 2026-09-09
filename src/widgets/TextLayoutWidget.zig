@@ -2086,7 +2086,10 @@ fn emitFragment(self: *TextLayoutWidget, f: Fragment, index: usize) void {
     var shaped = f.shaped;
     // How many leading glyphs of
     // `shaped` (if any) correspond to `f.text`, for reuse by
-    // cursor/selection tracking and the render call below.
+    // cursor/selection tracking and the render call below. Leading is the
+    // wrong end of an RTL run, so a shape that overruns the fragment must
+    // already have been dropped (see addTextEx).
+    if (shaped) |*st| std.debug.assert(!st.line.buffer.isRtl() or st.line.byte_offsets[st.line.codepoints.len] == f.text.len);
     const shaped_glyph_limit: ?usize = if (shaped) |*st| st.line.glyphLimitForByteOffset(f.text.len) else null;
     // see if selection needs to be updated
 
@@ -3657,4 +3660,61 @@ test "e2e: a click lands in the run under it, not the logically-first one" {
     // two letters left of *its* right edge, not of the line's.
     try fns.clickAt(fns.total - fns.w_first - fns.w_second_half);
     try std.testing.expectEqual(fns.first.len + 4, fns.sel.cursor);
+}
+
+test "e2e: a wrapping RTL fragment answers clicks by cluster, not by leading glyph" {
+    var t = try dvui.testing.init(.{ .window_size = .{ .w = 400, .h = 200 } });
+    defer t.deinit();
+
+    const fns = struct {
+        // No spaces, so the wrap is a character wrap in the middle of the
+        // fragment: the shape covers more bytes than the line keeps, which
+        // is the case addTextEx drops for RTL (slicing it by leading-glyph
+        // limit would take the wrong end of the run).
+        const text = "\u{05e9}\u{05dc}\u{05d5}\u{05dd}\u{05e2}\u{05d5}\u{05dc}\u{05dd}\u{05e9}\u{05dc}\u{05d5}\u{05dd}\u{05e2}\u{05d5}\u{05dc}\u{05dd}";
+        var sel: Selection = .{};
+        var content: dvui.Rect.Physical = .{};
+        var scale: f32 = 1;
+        var lines: usize = 0;
+        var line_h: f32 = 0;
+
+        fn frame() !dvui.App.Result {
+            var tl = dvui.textLayout(@src(), .{ .selection = &sel }, .{ .rect = .{ .w = 60, .h = 180 } });
+            line_h = tl.data().options.fontGet().lineHeight();
+            tl.addText(text, .{});
+            tl.addTextDone(.{});
+            const rs = tl.data().contentRectScale();
+            content = rs.r;
+            scale = rs.s;
+            lines = tl.line + 1;
+            tl.deinit();
+            return .ok;
+        }
+
+        fn clickAt(x: f32, y: f32) !void {
+            _ = try dvui.currentWindow().addEventMouseMotion(.{ .pt = .{ .x = content.x + x * scale, .y = content.y + y * scale } });
+            try dvui.testing.click(.left);
+            try dvui.testing.settle(frame);
+        }
+    };
+
+    try dvui.testing.settle(fns.frame);
+    try std.testing.expect(fns.lines > 1);
+
+    const right = fns.content.w / dvui.currentWindow().natural_scale - 1;
+
+    // An RTL line reads from its right edge, so the first line's right edge
+    // is byte 0 and the second line's is where the first one ended.
+    try fns.clickAt(right, fns.line_h * 0.5);
+    try std.testing.expectEqual(@as(usize, 0), fns.sel.cursor);
+
+    try fns.clickAt(right, fns.line_h * 1.5);
+    const wrap = fns.sel.cursor;
+    try std.testing.expect(wrap > 0);
+    try std.testing.expect(wrap < fns.text.len);
+
+    // Same byte reached from the other side: the first line's left edge is
+    // its logical end.
+    try fns.clickAt(1, fns.line_h * 0.5);
+    try std.testing.expectEqual(wrap, fns.sel.cursor);
 }
