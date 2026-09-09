@@ -197,6 +197,9 @@ line_frags: std.ArrayList(Fragment) = .empty,
 /// Set when any buffered fragment holds bytes that could resolve RTL; when
 /// false the line is placed left to right without running the bidi pass.
 line_maybe_rtl: bool = false,
+/// Byte a point past the far edge of the most recently placed line resolves
+/// to; null until a line with fragments has been placed.
+line_end_byte: ?usize = null,
 /// UAX #9 P2/P3 runs over the paragraph, not the visual line: once a strong
 /// character has fixed the base direction it holds until the next hard break,
 /// so a wrapped RTL paragraph whose second line starts with a Latin word
@@ -606,6 +609,10 @@ pub fn addLink(self: *TextLayoutWidget, init_opts: AddLinkOptions, opts: Options
 /// its line out before the bidi pass can place it. Keyed on the chunk's
 /// ordinal within the frame rather than its byte offset: offsets shift
 /// whenever earlier text changes, ordinals survive re-highlighting.
+/// ponytail: the counter is shared across click and hover chunks in draw
+/// order, so if the click itself changes how many actionable chunks the
+/// frame emits, the stored hit lands on the neighbouring chunk for one
+/// frame. Key on a caller-supplied id if that ever bites.
 const DeferredHit = struct {
     ordinal: usize,
     event: dvui.Event.EventTypes,
@@ -642,77 +649,113 @@ pub fn addTextTooltip(self: *TextLayoutWidget, src: std.builtin.SourceLocation, 
     tt.deinit();
 }
 
-// Helper to addTextEx
-// - returns byte position if p is before or within r
-fn findPoint(p: Point, r: Rect, bytes_seen: usize, txt: []const u8, options: Options, shaped: ?*Font.ShapedText, glyph_limit: ?usize, rtl: bool) ?struct { byte: usize, affinity: Selection.Affinity = .after } {
-    if (p.y < r.y or (p.y < (r.y + r.h) and p.x < r.x)) {
-        // found it - p is before this rect
-        return .{ .byte = if (rtl) bytes_seen + txt.len else bytes_seen };
-    }
+const PointHit = struct { byte: usize, affinity: Selection.Affinity = .after };
 
-    if (p.y < (r.y + r.h) and p.x < (r.x + r.w)) {
-        // found it - p is in this rect. In an RTL run the logical prefix
-        // grows leftwards from the right edge, so measure from there --
-        // otherwise clicking the visually-first letter of an Arabic or
-        // Hebrew word lands on the last byte of it.
-        const how_far = if (rtl) (r.x + r.w) - p.x else p.x - r.x;
-        // Width-driven hit-test against an already-shaped line (only
-        // mouse/touch text selection reaches here) instead of reshaping
-        // `txt` from scratch just to find which byte a pixel offset lands
-        // on.
-        var pt_end: usize = undefined;
-        var found = false;
-        // An RTL run's glyphs are in visual order, so the shape's
-        // leading-glyph walk would answer for the wrong end of it.
-        if (!rtl) {
-            if (shaped) |st| {
-                if (glyph_limit) |gl| {
-                    if (st.byteOffsetForWidth(dvui.currentWindow().gpa, gl, how_far, .nearest)) |b| {
-                        pt_end = b;
-                        found = true;
-                    } else |_| {}
-                }
-            }
+/// Byte a point inside `f` lands on. An RTL run's logical prefix grows
+/// leftwards from its right edge, so the width is measured from there --
+/// otherwise clicking the visually-first letter of an Arabic or Hebrew word
+/// lands on the last byte of it.
+fn hitWithin(f: Fragment, p: Point) PointHit {
+    const how_far = if (f.rtl) (f.x + f.size.w) - p.x else p.x - f.x;
+    // Width-driven hit-test against the already-shaped line instead of
+    // reshaping `f.text` from scratch just to find which byte a pixel
+    // offset lands on.
+    var pt_end: usize = undefined;
+    var found = false;
+    // An RTL run's glyphs are in visual order, so the shape's leading-glyph
+    // walk would answer for the wrong end of it.
+    if (!f.rtl) {
+        if (f.shaped) |shaped| {
+            var st = shaped;
+            const glyph_limit = st.line.glyphLimitForByteOffset(f.text.len);
+            if (st.byteOffsetForWidth(dvui.currentWindow().gpa, glyph_limit, how_far, .nearest)) |b| {
+                pt_end = b;
+                found = true;
+            } else |_| {}
         }
-        if (!found) {
-            _ = options.fontGet().textSizeEx(txt, .{ .max_width = how_far, .end_idx = &pt_end, .end_metric = .nearest });
+    }
+    if (!found) {
+        _ = f.font.textSizeEx(f.text, .{ .max_width = how_far, .end_idx = &pt_end, .end_metric = .nearest });
+    }
+    // Landing on the run's logical end is the far side of a level-run
+    // boundary: `.before` keeps the caret there instead of letting the
+    // logically-next run claim the byte and draw it elsewhere on the line.
+    return .{ .byte = f.bytes_seen + pt_end, .affinity = if (pt_end == f.text.len) .before else .after };
+}
+
+/// Which fragment of one buffered line answers a hit-test point, and where on
+/// it the point lands. `frags` is in logical order but rule L2 permutes the
+/// line on screen, so the scan runs across it by `x` -- the coordinate the
+/// reorder wrote -- rather than walking the text the way the caller supplied
+/// it. `line_end` answers a point past the far edge of the line: that is the
+/// logical end of an LTR line and the logical start of an RTL one.
+fn hitLine(frags: []const Fragment, p: Point, line_end: usize) ?struct { index: usize, hit: PointHit } {
+    if (frags.len == 0) return null;
+    // Above the line there is no x to read, so the answer is where the line
+    // starts in the text, not where it starts on screen.
+    if (p.y < frags[0].y) return .{ .index = 0, .hit = .{ .byte = frags[0].bytes_seen } };
+
+    var before: ?usize = null;
+    var past_end: ?usize = null;
+    for (frags, 0..) |f, i| {
+        if (p.y >= f.y + f.size.h) continue;
+        if (p.x < f.x) {
+            if (before == null or f.x < frags[before.?].x) before = i;
+        } else if (p.x < f.x + f.size.w) {
+            return .{ .index = i, .hit = hitWithin(f, p) };
+        } else if (f.newline) {
+            past_end = i;
         }
-        // Landing on the run's logical end is the far side of a level-run
-        // boundary: `.before` keeps the caret there instead of letting the
-        // logically-next run claim the byte and draw it elsewhere on the line.
-        return .{ .byte = bytes_seen + pt_end, .affinity = if (pt_end == txt.len) .before else .after };
     }
-
-    const break_len = Font.trailingHardBreakLen(txt);
-
-    if (break_len > 0 and p.y < (r.y + r.h)) {
-        // found it - p is after this rect on same horizontal line
-        return .{ .byte = bytes_seen + txt.len - break_len };
+    if (before) |i| {
+        const f = frags[i];
+        return .{ .index = i, .hit = .{ .byte = if (f.rtl) f.bytes_seen + f.text.len else f.bytes_seen } };
     }
-
+    // Without a hard break the line ends because it wrapped, and `lineBreak`
+    // answers that once the pen has moved on.
+    if (past_end) |i| return .{ .index = i, .hit = .{ .byte = line_end } };
     return null;
+}
+
+/// Far-right byte of the line: the logical end when it reads left to right,
+/// the logical start when it reads right to left.
+fn lineEndByte(frags: []const Fragment) usize {
+    var last = frags[0];
+    for (frags) |f| {
+        if (f.x + f.size.w > last.x + last.size.w) last = f;
+    }
+    if (last.rtl) return last.bytes_seen;
+    return last.bytes_seen + last.text.len - Font.trailingHardBreakLen(last.text);
+}
+
+/// The hit for `p` if the fragment at `index` is the one that owns it. The
+/// whole line is rescanned per point per fragment; a line holds a handful of
+/// fragments, so caching the answers is not worth the state.
+fn hitHere(self: *TextLayoutWidget, p: Point, index: usize) ?PointHit {
+    const found = hitLine(self.line_frags.items, p, self.line_end_byte orelse self.bytes_seen) orelse return null;
+    return if (found.index == index) found.hit else null;
 }
 
 // Called for each piece of text before searching for the cursor.
 // Place for selection movement to track points and move the cursor if needed,
 // also to track any state they need before the cursor (like word select).
-fn selMovePre(self: *TextLayoutWidget, txt: []const u8, end: usize, bytes_seen: usize, text_rect: Rect, options: Options, shaped: ?*Font.ShapedText, glyph_limit: ?usize, rtl: bool) void {
-    const text_line = txt[0..end];
+fn selMovePre(self: *TextLayoutWidget, f: Fragment, index: usize) void {
+    const past_text = f.bytes_seen + f.text.len;
     switch (self.sel_move) {
         .none => {},
         .mouse => |*m| {
             if (m.down_pt) |p| {
-                if (findPoint(p, text_rect, bytes_seen, text_line, options, shaped, glyph_limit, rtl)) |ba| {
+                if (self.hitHere(p, index)) |ba| {
                     m.byte = ba.byte;
                     self.selection.moveCursor(ba.byte, false);
                     self.selection.affinity = ba.affinity;
                     m.down_pt = null;
                 } else {
                     // haven't found it yet, keep cursor at end to not trigger cursor_seen
-                    self.selection.moveCursor(bytes_seen + end, false);
+                    self.selection.moveCursor(past_text, false);
                 }
             } else if (m.drag_pt) |p| {
-                if (findPoint(p, text_rect, bytes_seen, text_line, options, shaped, glyph_limit, rtl)) |ba| {
+                if (self.hitHere(p, index)) |ba| {
                     self.selection.cursor = ba.byte;
                     self.selection.start = @min(m.byte.?, ba.byte);
                     self.selection.end = @max(m.byte.?, ba.byte);
@@ -720,7 +763,7 @@ fn selMovePre(self: *TextLayoutWidget, txt: []const u8, end: usize, bytes_seen: 
                     m.drag_pt = null;
                 } else {
                     // haven't found it yet, keep cursor at end to not trigger cursor_seen
-                    self.selection.cursor = bytes_seen + end;
+                    self.selection.cursor = past_text;
                     self.selection.start = @min(m.byte.?, self.selection.cursor);
                     self.selection.end = @max(m.byte.?, self.selection.cursor);
                     self.selection.affinity = .after;
@@ -729,13 +772,13 @@ fn selMovePre(self: *TextLayoutWidget, txt: []const u8, end: usize, bytes_seen: 
         },
         .expand_pt => |*ep| {
             if (ep.pt) |p| {
-                if (findPoint(p, text_rect, bytes_seen, text_line, options, shaped, glyph_limit, rtl)) |ba| {
+                if (self.hitHere(p, index)) |ba| {
                     self.selection.moveCursor(ba.byte, false);
                     self.selection.affinity = ba.affinity;
                     ep.pt = null;
                 } else {
                     // haven't found it yet, keep cursor at end to not trigger cursor_seen
-                    self.selection.moveCursor(bytes_seen + end, false);
+                    self.selection.moveCursor(past_text, false);
                 }
 
                 if (ep.dragging) {
@@ -747,13 +790,13 @@ fn selMovePre(self: *TextLayoutWidget, txt: []const u8, end: usize, bytes_seen: 
         .char_left_right => {},
         .cursor_updown => |*cud| {
             if (cud.pt) |p| {
-                if (findPoint(p, text_rect, bytes_seen, text_line, options, shaped, glyph_limit, rtl)) |ba| {
+                if (self.hitHere(p, index)) |ba| {
                     self.selection.moveCursor(ba.byte, cud.select);
                     self.selection.affinity = ba.affinity;
                     cud.pt = null;
                 } else {
                     // haven't found it yet, keep cursor at end to not trigger cursor_seen
-                    self.selection.moveCursor(bytes_seen + end, cud.select);
+                    self.selection.moveCursor(past_text, cud.select);
                 }
             }
         },
@@ -765,13 +808,16 @@ fn selMovePre(self: *TextLayoutWidget, txt: []const u8, end: usize, bytes_seen: 
 // Place for selection movement that is tracking a point to say that the cursor
 // should be at the end of the previous line.
 fn lineBreak(self: *TextLayoutWidget) void {
+    // Right of the text is the logical start of an RTL line, so take the byte
+    // the line placement resolved rather than assuming the pen ended there.
+    const line_end = self.line_end_byte orelse self.bytes_seen;
     switch (self.sel_move) {
         .none => {},
         .mouse => |*m| {
             if (m.down_pt) |p| {
                 if (p.y < self.insert_pt.y) {
-                    // point was right of previous line, no newline
-                    m.byte = self.bytes_seen;
+                    // point was past the far edge of the previous line, no newline
+                    m.byte = line_end;
                     self.selection.affinity = .before;
                     m.down_pt = null;
 
@@ -779,8 +825,8 @@ fn lineBreak(self: *TextLayoutWidget) void {
                 }
             } else if (m.drag_pt) |p| {
                 if (p.y < self.insert_pt.y) {
-                    // point was right of previous line, no newline
-                    self.selection.cursor = self.bytes_seen;
+                    // point was past the far edge of the previous line, no newline
+                    self.selection.cursor = line_end;
                     self.selection.start = @min(m.byte.?, self.selection.cursor);
                     self.selection.end = @max(m.byte.?, self.selection.cursor);
                     self.selection.affinity = .before;
@@ -793,14 +839,14 @@ fn lineBreak(self: *TextLayoutWidget) void {
         .expand_pt => |*ep| {
             if (ep.pt) |p| {
                 if (p.y < self.insert_pt.y) {
-                    // point was right of previous line, no newline
-                    if (ep.last[0] == self.bytes_seen) {
+                    // point was past the far edge of the previous line, no newline
+                    if (ep.last[0] == line_end) {
                         // we are at the end of a line and the ending character
                         // was a space, so ignore it
                         ep.last[0] = ep.last[1];
-                        self.selection.moveCursor(self.bytes_seen -| 1, false);
+                        self.selection.moveCursor(line_end -| 1, false);
                     } else {
-                        self.selection.moveCursor(self.bytes_seen, false);
+                        self.selection.moveCursor(line_end, false);
                         self.selection.affinity = .before;
                     }
                     ep.pt = null;
@@ -829,8 +875,8 @@ fn lineBreak(self: *TextLayoutWidget) void {
         .cursor_updown => |*cud| {
             if (cud.pt) |p| {
                 if (p.y < self.insert_pt.y) {
-                    // point was right of previous line, no newline
-                    self.selection.moveCursor(self.bytes_seen, cud.select);
+                    // point was past the far edge of the previous line, no newline
+                    self.selection.moveCursor(line_end, cud.select);
                     self.selection.affinity = .before;
                     cud.pt = null;
 
@@ -1959,7 +2005,10 @@ fn flushLine(self: *TextLayoutWidget) void {
         self.line_frags.clearRetainingCapacity();
         self.line_maybe_rtl = false;
     }
-    if (self.line_frags.items.len == 0) return;
+    if (self.line_frags.items.len == 0) {
+        self.line_end_byte = null;
+        return;
+    }
 
     // A flush can land in addTextDone/deinit/rectFor rather than in the
     // addText call that produced the fragments, so re-establish the clip
@@ -1977,7 +2026,8 @@ fn flushLine(self: *TextLayoutWidget) void {
     reshapeWithNeighbourContext(self.line_frags.items);
     if (self.line_maybe_rtl) self.reorderLineVisual();
     self.alignLineToBaseDirection(self.line_frags.items);
-    for (self.line_frags.items) |f| self.emitFragment(f);
+    self.line_end_byte = lineEndByte(self.line_frags.items);
+    for (self.line_frags.items, 0..) |f, i| self.emitFragment(f, i);
     // A hard break ends the paragraph, so the next one resolves P2 afresh.
     if (self.line_frags.items[self.line_frags.items.len - 1].newline) self.paragraph_direction = null;
 }
@@ -2038,7 +2088,7 @@ fn recordHit(self: *TextLayoutWidget, action: AddTextExAction, hit: DeferredHit)
     if (!already_answered) dvui.refresh(null, @src(), self.data().id);
 }
 
-fn emitFragment(self: *TextLayoutWidget, f: Fragment) void {
+fn emitFragment(self: *TextLayoutWidget, f: Fragment, index: usize) void {
     const cw = dvui.currentWindow();
     var shaped = f.shaped;
     // How many leading glyphs of
@@ -2084,50 +2134,18 @@ fn emitFragment(self: *TextLayoutWidget, f: Fragment) void {
     }
 
     // handle selection movement
-    const text_rect = Rect{ .x = f.x, .y = f.y, .w = f.size.w, .h = f.size.h };
-    self.selMovePre(f.text, f.text.len, f.bytes_seen, text_rect, f.options, if (shaped) |*st| st else null, shaped_glyph_limit, f.rtl);
+    self.selMovePre(f, index);
 
     if (self.sel_pts[0] != null or self.sel_pts[1] != null) {
         var sel_bytes = [2]?usize{ null, null };
         for (self.sel_pts, 0..) |maybe_pt, i| {
             if (maybe_pt) |p| {
-                const rs = Rect{ .x = f.x, .y = f.y, .w = f.size.w, .h = f.size.h };
-                if (p.y < rs.y or (p.y < (rs.y + rs.h) and p.x < rs.x)) {
-                    // point is before this text
-                    sel_bytes[i] = f.bytes_seen;
-                    self.sel_pts[i] = null;
-                } else if (p.y < (rs.y + rs.h) and p.x < (rs.x + rs.w)) {
-                    // point is in this text (touch drag-selection hit
-                    // test -- reuse the already-shaped line instead of
-                    // reshaping `f.text` from scratch, same as findPoint,
-                    // including measuring from the right edge in an RTL run)
-                    const how_far = if (f.rtl) (rs.x + rs.w) - p.x else p.x - rs.x;
-                    var pt_end: usize = undefined;
-                    var found = false;
-                    if (!f.rtl) {
-                        if (shaped) |*st| {
-                            if (shaped_glyph_limit) |gl| {
-                                if (st.byteOffsetForWidth(cw.gpa, gl, how_far, .nearest)) |b| {
-                                    pt_end = b;
-                                    found = true;
-                                } else |_| {}
-                            }
-                        }
-                    }
-                    if (!found) {
-                        _ = f.font.textSizeEx(f.text, .{ .max_width = how_far, .end_idx = &pt_end, .end_metric = .nearest });
-                    }
-                    sel_bytes[i] = f.bytes_seen + pt_end;
+                if (self.hitHere(p, index)) |ba| {
+                    sel_bytes[i] = ba.byte;
                     self.sel_pts[i] = null;
                 } else {
-                    if (f.newline and p.y < (rs.y + rs.h)) {
-                        // point is after this text on this same horizontal line
-                        sel_bytes[i] = f.bytes_seen + f.text.len - 1;
-                        self.sel_pts[i] = null;
-                    } else {
-                        // point is after this text, but we might not get anymore
-                        sel_bytes[i] = f.bytes_seen + f.text.len;
-                    }
+                    // haven't found it yet, but we might not get anymore
+                    sel_bytes[i] = f.bytes_seen + f.text.len;
                 }
             }
         }
@@ -3127,7 +3145,7 @@ test "bidiPieces: left-to-right lines are left alone" {
     try std.testing.expect(bidiPieces(arena_state.allocator(), &frags, &dir) == null);
 }
 
-test "caretX/findPoint: the two sides of a level-run boundary are two places" {
+test "caretX/hitWithin: the two sides of a level-run boundary are two places" {
     var t = try dvui.testing.init(.{});
     defer t.deinit();
 
@@ -3146,25 +3164,25 @@ test "caretX/findPoint: the two sides of a level-run boundary are two places" {
 
     const txt = "\u{05e9}\u{05dc}\u{05d5}\u{05dd}";
     const opts: Options = .{};
-    const w = opts.fontGet().textSizeEx(txt, .{}).w;
-    const r: Rect = .{ .x = 0, .y = 0, .w = w, .h = 12 };
+    var g: Fragment = std.mem.zeroes(Fragment);
+    g.text = txt;
+    g.font = opts.fontGet();
+    g.options = opts;
+    g.size = .{ .w = opts.fontGet().textSizeEx(txt, .{}).w, .h = 12 };
+    g.rtl = true;
 
     // Just inside the right edge: the logically-first byte.
-    const first = findPoint(.{ .x = w - 1, .y = 1 }, r, 0, txt, opts, null, null, true) orelse
-        return error.TestExpectedHit;
-    try std.testing.expectEqual(@as(usize, 0), first.byte);
+    try std.testing.expectEqual(@as(usize, 0), hitWithin(g, .{ .x = g.size.w - 1, .y = 1 }).byte);
 
     // At the left edge: the logical end, and `.before` so the caret stays on
     // this run instead of the logically-next one claiming the byte.
-    const last = findPoint(.{ .x = 0.5, .y = 1 }, r, 0, txt, opts, null, null, true) orelse
-        return error.TestExpectedHit;
+    const last = hitWithin(g, .{ .x = 0.5, .y = 1 });
     try std.testing.expectEqual(txt.len, last.byte);
     try std.testing.expectEqual(Selection.Affinity.before, last.affinity);
 
     // Same click, read as LTR, lands on the opposite end -- what it used to do.
-    const ltr = findPoint(.{ .x = 0.5, .y = 1 }, r, 0, txt, opts, null, null, false) orelse
-        return error.TestExpectedHit;
-    try std.testing.expectEqual(@as(usize, 0), ltr.byte);
+    g.rtl = false;
+    try std.testing.expectEqual(@as(usize, 0), hitWithin(g, .{ .x = 0.5, .y = 1 }).byte);
 }
 
 test "reorderLineVisual: a piece cut mid-fragment is reshaped with the rest as context" {
@@ -3534,4 +3552,88 @@ test "line ascent: a buffered fragment carries the line's ascent" {
 
     try dvui.testing.settle(fns.frame);
     try std.testing.expect(fns.max_ascent > 0);
+}
+
+test "hitLine: a click resolves against the reordered line, not logical order" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const opts: Options = .{};
+    // Two Hebrew fragments (a style change mid-sentence): both level 1, so
+    // L2 swaps them and logical order stops matching visual order.
+    var frags: [2]Fragment = std.mem.zeroes([2]Fragment);
+    frags[0].text = "\u{05e9}\u{05dc}\u{05d5}\u{05dd}";
+    frags[1].text = "\u{05e2}\u{05d5}\u{05dc}\u{05dd}";
+    for (&frags, 0..) |*f, i| {
+        f.options = opts;
+        f.font = opts.fontGet();
+        f.size = opts.fontGet().textSizeEx(f.text, .{});
+        f.bytes_seen = if (i == 0) 0 else frags[0].text.len;
+    }
+
+    var dir: opentype.unicode.Bidi.ParagraphDirection = .auto;
+    const pieces = bidiPieces(arena, &frags, &dir) orelse return error.TestExpectedPieces;
+    try std.testing.expectEqual(@as(usize, 2), pieces.len);
+
+    var out: [2]Fragment = frags;
+    for (&out, pieces) |*f, p| f.rtl = p.level % 2 == 1;
+    assignVisualX(arena, pieces, &out, 0);
+
+    // L2 put the logically-first fragment on the right.
+    try std.testing.expect(out[0].x > out[1].x);
+
+    // A click in the middle of the visually-left run belongs to frags[1],
+    // even though a logical scan reaches frags[0] first.
+    const p: Point = .{ .x = out[1].x + out[1].size.w / 2, .y = 1 };
+    const found = hitLine(&out, p, lineEndByte(&out)) orelse return error.TestExpectedHit;
+    try std.testing.expectEqual(@as(usize, 1), found.index);
+    try std.testing.expect(found.hit.byte > frags[0].text.len);
+    try std.testing.expect(found.hit.byte < frags[0].text.len + frags[1].text.len);
+
+    // Right of an RTL line is where it starts reading, so the far edge is
+    // byte 0 -- not the end of the text.
+    try std.testing.expectEqual(@as(usize, 0), lineEndByte(&out));
+    const past: Point = .{ .x = out[0].x + out[0].size.w + 10, .y = 1 };
+    try std.testing.expect(hitLine(&out, past, lineEndByte(&out)) == null);
+
+    // Left of it is the logical end.
+    const left = hitLine(&out, .{ .x = -5, .y = 1 }, lineEndByte(&out)) orelse return error.TestExpectedHit;
+    try std.testing.expectEqual(frags[0].text.len + frags[1].text.len, left.hit.byte);
+}
+
+test "e2e: a click lands in the run under it, not the logically-first one" {
+    var t = try dvui.testing.init(.{ .window_size = .{ .w = 400, .h = 200 } });
+    defer t.deinit();
+
+    const fns = struct {
+        const first = "\u{05e9}\u{05dc}\u{05d5}\u{05dd}";
+        const second = "\u{05e2}\u{05d5}\u{05dc}\u{05dd}";
+        var sel: Selection = .{};
+        var content: dvui.Rect.Physical = .{};
+
+        fn frame() !dvui.App.Result {
+            var tl = dvui.textLayout(@src(), .{ .selection = &sel }, .{});
+            tl.addText(first, .{});
+            tl.addText(second, .{});
+            tl.addTextDone(.{});
+            content = tl.data().contentRectScale().r;
+            tl.deinit();
+            return .ok;
+        }
+    };
+
+    try dvui.testing.settle(fns.frame);
+
+    // Both chunks are level 1, so L2 puts the logically-second one on the
+    // left of the line.
+    _ = try dvui.currentWindow().addEventMouseMotion(.{ .pt = .{ .x = fns.content.x + fns.content.w * 0.4, .y = fns.content.y + 4 } });
+    try dvui.testing.click(.left);
+    try dvui.testing.settle(fns.frame);
+
+    try std.testing.expect(fns.sel.cursor > fns.first.len);
+    try std.testing.expect(fns.sel.cursor <= fns.first.len + fns.second.len);
 }
