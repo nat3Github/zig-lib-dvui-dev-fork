@@ -579,11 +579,21 @@ pub fn textSize(self: Font, text: []const u8) Size {
 
 pub const EndMetric = opentype.EndMetric;
 
+/// Byte range of the text to actually produce glyphs for. Bytes outside it
+/// still shape -- they are the context Arabic joining, ligatures and kerning
+/// resolve against -- but their glyphs are dropped, and the result is rebased
+/// so it reads exactly like a shape of `text[start..end]` on its own.
+pub const ShapeItem = struct { start: usize, end: usize };
+
 pub const TextSizeOptions = struct {
     max_width: ?f32 = null,
     end_idx: ?*usize = null,
     end_metric: EndMetric = .before,
     ascent_out: ?*f32 = null,
+    /// When set, `text` is context and only this range is measured/shaped.
+    /// Mutually exclusive with `max_width`: the break decision has to have
+    /// been made already for the caller to know the range.
+    item: ?ShapeItem = null,
 };
 
 /// textSizeEx always stops at a newline, use textSize to get multiline sizes
@@ -782,6 +792,18 @@ pub const Cache = struct {
         // referencing a font this `reset()` evicted (e.g. scrolled out of
         // view and not re-touched before the next reset) rather than
         // rendering it with segments silently missing.
+    }
+
+    /// Cap on `shaped_line_cache` entries before it is dropped wholesale.
+    const max_shaped_lines = 4096;
+
+    // ponytail: bulk clear rather than LRU -- eviction order only matters if
+    // the cap is hit routinely, and at 4096 lines it isn't. Swap in an LRU if
+    // a real workload starts thrashing this.
+    fn clearShapedLineCache(self: *Cache, gpa: std.mem.Allocator) void {
+        var it = self.shaped_line_cache.valueIterator();
+        while (it.next()) |v| v.deinit(gpa);
+        self.shaped_line_cache.clearRetainingCapacity();
     }
 
     const max_family_variants = 64;
@@ -1069,10 +1091,11 @@ pub const Cache = struct {
     /// `persist_gpa` backs only `resolved.logged_missing`, which outlives the
     /// frame (cached in `resolved_stacks`) -- passing a per-frame arena there
     /// corrupts the map once the arena resets on the next frame.
-    pub fn shapeLineText(self: *Cache, gpa: std.mem.Allocator, persist_gpa: std.mem.Allocator, resolved: *ResolvedStack, text: []const u8) std.mem.Allocator.Error!Entry.ShapedLine {
+    pub fn shapeLineText(self: *Cache, gpa: std.mem.Allocator, persist_gpa: std.mem.Allocator, resolved: *ResolvedStack, text: []const u8, item: ?Font.ShapeItem) std.mem.Allocator.Error!Entry.ShapedLine {
         var key_hash = dvui.fnv.init();
         key_hash.update(std.mem.asBytes(&resolved.font_hash));
         key_hash.update(text);
+        if (item) |it| key_hash.update(std.mem.asBytes(&it));
         const cache_key = key_hash.final();
         if (self.shaped_line_cache.get(cache_key)) |cached| {
             if (try self.materializeShapedLine(gpa, cached)) |line| return line;
@@ -1088,8 +1111,22 @@ pub const Cache = struct {
         }
 
         const decoded = try Entry.decodeLine(gpa, text);
-        errdefer gpa.free(decoded.codepoints);
-        errdefer gpa.free(decoded.byte_offsets);
+        var line_codepoints = decoded.codepoints;
+        var line_byte_offsets = decoded.byte_offsets;
+        errdefer gpa.free(line_codepoints);
+        errdefer gpa.free(line_byte_offsets);
+
+        // Codepoint range matching `item`'s byte range; the shaper works in
+        // codepoint indices. Clamped to what decodeLine produced, which stops
+        // at a hard break.
+        var item_cp: ?opentype.shaping.Item = null;
+        if (item) |it| {
+            var cp_start: usize = 0;
+            while (cp_start < decoded.codepoints.len and decoded.byte_offsets[cp_start] < it.start) cp_start += 1;
+            var cp_end: usize = cp_start;
+            while (cp_end < decoded.codepoints.len and decoded.byte_offsets[cp_end] < it.end) cp_end += 1;
+            item_cp = .{ .start = cp_start, .end = cp_end };
+        }
 
         // Fallback font stack in priority order, from the cheap parse-only
         // fonts `resolveStack` built -- no `cache` lookup/eviction concerns
@@ -1187,7 +1224,7 @@ pub const Cache = struct {
                 _ = self.entryIndexForLogged(resolved, persist_gpa, cp); // diagnostics
             }
             // Bidi outer, font fallback inner, so visual reordering crosses font boundaries.
-            const shaped = shapeBidiParagraphWithFallback(gpa, fonts_buf[0..nfonts], decoded.codepoints, .auto, &.{}, &.{}, &.{}) catch |err| switch (err) {
+            const shaped = shapeBidiParagraphWithFallback(gpa, fonts_buf[0..nfonts], decoded.codepoints, .auto, &.{}, &.{}, &.{}, item_cp) catch |err| switch (err) {
                 error.OutOfMemory => |e| return e,
                 else => BidiFallbackResult{ .buffer = Buffer.init(gpa), .font_indices = &.{} },
             };
@@ -1226,12 +1263,33 @@ pub const Cache = struct {
         }
         result.have_positions = true;
 
-        const cluster_tables = try result.buildClusterTables(gpa, decoded.byte_offsets);
+        // Rebase onto the item: from here on the line reads exactly like a
+        // shape of `text[item.start..item.end]` alone -- clusters and byte
+        // offsets relative to the item -- so every caller's byte-offset math
+        // (prefix measurement, hit testing, selection) is unchanged by the
+        // context having been there.
+        if (item_cp) |it_cp| {
+            const it = item.?;
+            const new_codepoints = try gpa.dupe(u21, line_codepoints[it_cp.start..it_cp.end]);
+            errdefer gpa.free(new_codepoints);
+            const new_offsets = try gpa.alloc(u32, it_cp.end - it_cp.start + 1);
+            for (new_offsets[0 .. it_cp.end - it_cp.start], line_byte_offsets[it_cp.start..it_cp.end]) |*dst, off| {
+                dst.* = off -| @as(u32, @intCast(it.start));
+            }
+            new_offsets[it_cp.end - it_cp.start] = line_byte_offsets[it_cp.end] -| @as(u32, @intCast(it.start));
+            for (result.info.items) |*info| info.cluster -= @intCast(it_cp.start);
+            gpa.free(line_codepoints);
+            gpa.free(line_byte_offsets);
+            line_codepoints = new_codepoints;
+            line_byte_offsets = new_offsets;
+        }
+
+        const cluster_tables = try result.buildClusterTables(gpa, line_byte_offsets);
 
         const line: Entry.ShapedLine = .{
             .allocator = gpa,
-            .codepoints = decoded.codepoints,
-            .byte_offsets = decoded.byte_offsets,
+            .codepoints = line_codepoints,
+            .byte_offsets = line_byte_offsets,
             .buffer = result,
             .cluster_starts = cluster_tables.starts,
             .cluster_ends = cluster_tables.ends,
@@ -1239,8 +1297,8 @@ pub const Cache = struct {
         };
 
         const to_cache: CachedShapedLine = .{
-            .codepoints = decoded.codepoints,
-            .byte_offsets = decoded.byte_offsets,
+            .codepoints = line_codepoints,
+            .byte_offsets = line_byte_offsets,
             .buffer = result,
             .cluster_starts = cluster_tables.starts,
             .cluster_ends = cluster_tables.ends,
@@ -1248,6 +1306,13 @@ pub const Cache = struct {
         };
         if (to_cache.clone(persist_gpa)) |persisted| {
             var to_store = persisted;
+            // Every distinct (stack, text) slice ever shaped lands here and
+            // reset() deliberately keeps it, so without a cap this grows
+            // unbounded: a reflowing TextLayout or the bidi break-retreat
+            // loop mints a fresh key per candidate prefix per width.
+            if (self.shaped_line_cache.count() >= max_shaped_lines) {
+                self.clearShapedLineCache(persist_gpa);
+            }
             self.shaped_line_cache.put(persist_gpa, cache_key, to_store) catch to_store.deinit(persist_gpa);
         } else |_| {} // OOM on the persistent copy just means this shape isn't cached
         cache_segments.deinit(gpa);
@@ -1381,10 +1446,14 @@ pub const Cache = struct {
 
         const hard_break = firstHardBreak(text);
         const newline_idx = if (hard_break) |hb| hb.start else text.len;
-        var window: usize = if (opts.max_width != null) @min(newline_idx, 64) else newline_idx;
+        // An item measures a known range of already-broken text, so the
+        // growing measurement window (and its max_width break search) is
+        // both unnecessary and wrong -- the context beyond the window is
+        // exactly what it was asked to shape against.
+        var window: usize = if (opts.max_width != null and opts.item == null) @min(newline_idx, 64) else newline_idx;
 
         while (true) {
-            var line = try self.shapeLineText(scratch, gpa, resolved, text[0..window]);
+            var line = try self.shapeLineText(scratch, gpa, resolved, text[0..window], opts.item);
             errdefer line.deinit();
 
             // Refetched after shapeLineText, not hoisted above the loop:
@@ -1495,7 +1564,7 @@ pub const Cache = struct {
             uploaded: bool,
         };
 
-        pub fn toPixels(self: Entry, font_units: i32) f32 {
+        pub fn toPixels(self: *const Entry, font_units: i32) f32 {
             return self.renderer.unitsToPixels(font_units);
         }
 
@@ -1960,7 +2029,7 @@ test "smoke: shape + measure + rasterize against embedded Vera.ttf" {
     try std.testing.expect(entry.em_height > 0);
     std.debug.print("ascent={d} height={d} em_height={d}\n", .{ entry.ascent, entry.height, entry.em_height });
 
-    var line = try cw.fonts.shapeLineText(gpa, gpa, resolved, "Hello, world! fi ffi");
+    var line = try cw.fonts.shapeLineText(gpa, gpa, resolved, "Hello, world! fi ffi", null);
     defer line.deinit();
 
     try std.testing.expect(line.buffer.info.items.len > 0);
@@ -2019,7 +2088,7 @@ test "smoke: bidi/RTL text shapes without crashing" {
     const cw = dvui.currentWindow();
     const resolved = try cw.fonts.resolveStack(cw.gpa, font);
 
-    var line = try cw.fonts.shapeLineText(gpa, gpa, resolved, "abc \u{0627}\u{0644}\u{0633}\u{0644}\u{0627}\u{0645} xyz");
+    var line = try cw.fonts.shapeLineText(gpa, gpa, resolved, "abc \u{0627}\u{0644}\u{0633}\u{0644}\u{0627}\u{0645} xyz", null);
     defer line.deinit();
     try std.testing.expect(line.buffer.info.items.len > 0);
     // The Arabic run is RTL, so its glyphs are reordered out of logical
@@ -2029,7 +2098,7 @@ test "smoke: bidi/RTL text shapes without crashing" {
 
     // Pure-LTR text keeps clusters monotone, so the fast visual-prefix reuse
     // path stays enabled (isBidi false).
-    var ltr = try cw.fonts.shapeLineText(gpa, gpa, resolved, "Hello, world!");
+    var ltr = try cw.fonts.shapeLineText(gpa, gpa, resolved, "Hello, world!", null);
     defer ltr.deinit();
     try std.testing.expect(!ltr.isBidi());
 }
@@ -2084,7 +2153,7 @@ test "Cache.shapeLineText: mixed-script text splits glyphs by stack entry" {
     // "AB" (Latin) + two Hangul syllables (Korean) + "CD" (Latin) -- Vera
     // has no Hangul glyphs and NotoSansKR-Regular has no use registering it
     // as the primary family, so coverage is naturally disjoint here.
-    var line = try cw.fonts.shapeLineText(std.testing.allocator, std.testing.allocator, resolved, "AB\u{AC00}\u{AC01}CD");
+    var line = try cw.fonts.shapeLineText(std.testing.allocator, std.testing.allocator, resolved, "AB\u{AC00}\u{AC01}CD", null);
     defer line.deinit();
 
     // TestKorean is a fallback family (stack index 1), materialized lazily
@@ -2139,10 +2208,30 @@ test "Cache.resolveStack: per-family entry overrides apply to the stack fonts" {
     const primary = try cw.fonts.getOrCreate(cw.gpa, resolved.family_fonts[0]);
     try std.testing.expectEqual(primary, cw.fonts.stackEntry(resolved, 0).?);
 
-    var line = try cw.fonts.shapeLineText(std.testing.allocator, std.testing.allocator, resolved, "A\u{AC00}");
+    var line = try cw.fonts.shapeLineText(std.testing.allocator, std.testing.allocator, resolved, "A\u{AC00}", null);
     defer line.deinit();
     const korean_entry = cw.fonts.stackEntry(resolved, 1).?;
     try std.testing.expect(korean_entry.height < primary.height);
+}
+
+test "Cache.shapeLineText: shaped_line_cache stays bounded under distinct-slice churn" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+
+    try dvui.addFont("TestLatin", Source.fallback.bytes, null);
+    const cw = dvui.currentWindow();
+    const resolved = try cw.fonts.resolveStack(cw.gpa, Font.init("TestLatin"));
+
+    // Every slice is a distinct cache key, the way a reflowing TextLayout or
+    // the bidi retreat loop mints one per candidate prefix.
+    var buf: [32]u8 = undefined;
+    for (0..Cache.max_shaped_lines + 64) |i| {
+        const text = try std.fmt.bufPrint(&buf, "slice-{d}", .{i});
+        var line = try cw.fonts.shapeLineText(std.testing.allocator, cw.gpa, resolved, text, null);
+        line.deinit();
+    }
+
+    try std.testing.expect(cw.fonts.shaped_line_cache.count() <= Cache.max_shaped_lines);
 }
 
 test "Cache.shapeLineText: a shaped_line_cache hit reshapes instead of dropping segments when a fallback font was evicted by reset()" {
@@ -2158,7 +2247,7 @@ test "Cache.shapeLineText: a shaped_line_cache hit reshapes instead of dropping 
     const resolved = try cw.fonts.resolveStack(cw.gpa, stack);
     const text = "AB\u{AC00}\u{AC01}CD";
 
-    var line = try cw.fonts.shapeLineText(std.testing.allocator, cw.gpa, resolved, text);
+    var line = try cw.fonts.shapeLineText(std.testing.allocator, cw.gpa, resolved, text, null);
     defer line.deinit();
     try std.testing.expectEqual(@as(usize, 3), line.segments.len);
 
@@ -2173,7 +2262,7 @@ test "Cache.shapeLineText: a shaped_line_cache hit reshapes instead of dropping 
     // still has the old line cached, but its Korean segment now points at
     // an evicted entry. Must reshape from scratch, not silently drop the
     // Korean segment and leave the caller thinking it's Latin-only.
-    var line2 = try cw.fonts.shapeLineText(std.testing.allocator, cw.gpa, resolved, text);
+    var line2 = try cw.fonts.shapeLineText(std.testing.allocator, cw.gpa, resolved, text, null);
     defer line2.deinit();
     try std.testing.expectEqual(@as(usize, 3), line2.segments.len);
 
@@ -2201,7 +2290,7 @@ test "Cache.loadDynamicFallback: rejects a discovered font with no rasterizable 
     // primary font's notdef) rather than registering a font that produces
     // zero-size glyphs for everything.
     const text = "这是一个中文测试句子。";
-    var line = try cw.fonts.shapeLineText(gpa, gpa, resolved, text);
+    var line = try cw.fonts.shapeLineText(gpa, gpa, resolved, text, null);
     defer line.deinit();
 
     for (line.segments) |seg| {
@@ -2235,7 +2324,7 @@ test "Cache.shapeLineText: emoji next to CJK gets its own dynamic-fallback font,
     // fallback font file read at 64MiB, silently failing to load Apple
     // Color Emoji.ttc (~180MiB on modern macOS) and returning null.
     const text = "\u{4E2D}\u{6587}\u{1F600}";
-    var line = try cw.fonts.shapeLineText(gpa, gpa, resolved, text);
+    var line = try cw.fonts.shapeLineText(gpa, gpa, resolved, text, null);
     defer line.deinit();
 
     if (line.segments.len < 2) return error.SkipZigTest; // no dynamic fallback available in this environment
@@ -2253,3 +2342,45 @@ test "Cache.shapeLineText: emoji next to CJK gets its own dynamic-fallback font,
     }
 }
 
+
+test "TextSizeOptions.item: shapes with context but reports only the item" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    const gpa = std.testing.allocator;
+    const font: Font = .find(.{ .family = "Vera", .size = 24 });
+
+    var res = (try font.textSizeExShaped(gpa, "Hello", .{ .item = .{ .start = 1, .end = 3 } })).?;
+    defer res.shaped.deinit();
+
+    // Only "el" produced glyphs, and the result is rebased so it reads like
+    // a standalone shape of "el": two clusters at byte 0 and 1, and the
+    // usual byte-offset math lands where a caller slicing "el" expects.
+    try std.testing.expectEqual(@as(usize, 2), res.shaped.line.buffer.info.items.len);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2 }, res.shaped.line.byte_offsets);
+    try std.testing.expectEqual(@as(u32, 0), res.shaped.line.buffer.info.items[0].cluster);
+    try std.testing.expectEqual(@as(u32, 1), res.shaped.line.buffer.info.items[1].cluster);
+    try std.testing.expectEqual(@as(usize, 1), res.shaped.line.glyphLimitForByteOffset(1));
+    try std.testing.expectEqual(@as(f32, font.textSizeEx("el", .{}).w), res.size.w);
+}
+
+test "TextSizeOptions.item: a joining neighbour changes the glyph chosen" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    const gpa = std.testing.allocator;
+    const font: Font = .find(.{ .family = "Vera", .size = 24 });
+
+    // seen + lam. Shaped alone, seen takes its isolated form; shaped with the
+    // lam as (discarded) context it must take its initial form -- a different
+    // glyph. This is what per-addText-chunk shaping used to get wrong.
+    const word = "\u{0633}\u{0644}";
+    var alone = (try font.textSizeExShaped(gpa, word[0..2], .{})).?;
+    defer alone.shaped.deinit();
+    // No Arabic anywhere in the font stack on this platform: nothing to test.
+    if (alone.shaped.line.buffer.info.items[0].codepoint == 0) return;
+
+    var joined = (try font.textSizeExShaped(gpa, word, .{ .item = .{ .start = 0, .end = 2 } })).?;
+    defer joined.shaped.deinit();
+    try std.testing.expectEqual(@as(usize, 1), joined.shaped.line.buffer.info.items.len);
+    try std.testing.expect(joined.shaped.line.buffer.info.items[0].codepoint !=
+        alone.shaped.line.buffer.info.items[0].codepoint);
+}
