@@ -399,6 +399,8 @@ pub const TextRunOptions = struct {
     /// byte offset of this run within the widget's text (dvui counts
     /// bytes; AccessKit's own indices into the run count characters)
     byte_offset: usize,
+    /// visual direction of this run, from the shaped bidi level
+    rtl: bool = false,
 };
 
 /// Populate the text_run node with character position and word length details.
@@ -450,7 +452,7 @@ pub fn textRunPopulate(
     nodeSetCharacterWidths(ak_node, text_info.len, text_info.items(.w).ptr);
     nodeSetCharacterPositions(ak_node, text_info.len, text_info.items(.x).ptr);
     nodeSetWordStarts(ak_node, word_starts.items.len, word_starts.items.ptr);
-    nodeSetTextDirection(ak_node, AccessKit.TextDirection.left_to_right);
+    nodeSetTextDirection(ak_node, if (opts.rtl) AccessKit.TextDirection.right_to_left else AccessKit.TextDirection.left_to_right);
     if (self.text_runs.items.len > 0) {
         const prev_run = self.text_runs.items[self.text_runs.items.len - 1];
         const prev_node = self.nodes.get(prev_run.node_id) orelse unreachable;
