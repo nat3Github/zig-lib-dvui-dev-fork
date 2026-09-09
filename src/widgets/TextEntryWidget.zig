@@ -1,6 +1,7 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const dvui = @import("../dvui.zig");
+const opentype = @import("opentype");
 
 const Event = dvui.Event;
 const Options = dvui.Options;
@@ -75,6 +76,12 @@ pub const InitOptions = struct {
     cache_layout: bool = false,
 
     break_lines: bool = false,
+
+    /// Paragraph base direction for the text; see
+    /// `TextLayoutWidget.InitOptions.base_direction`. `.rtl` puts an empty
+    /// entry's caret on the right.
+    base_direction: opentype.unicode.Bidi.ParagraphDirection = .auto,
+
     scroll_vertical: ?bool = null, // default is value of multiline
     scroll_vertical_bar: ?ScrollInfo.ScrollBarMode = null, // default .auto
     scroll_horizontal: ?bool = null, // default true
@@ -211,6 +218,7 @@ pub fn init(self: *TextEntryWidget, src: std.builtin.SourceLocation, init_opts: 
 
     self.textLayout.init(@src(), .{
         .break_lines = self.init_opts.break_lines,
+        .base_direction = self.init_opts.base_direction,
         .touch_edit_just_focused = false,
         .cache_layout = self.init_opts.cache_layout,
         .focused = self.data().id == dvui.focusedWidgetId(),
@@ -874,13 +882,13 @@ pub fn processEvent(self: *TextEntryWidget, e: *Event) void {
             if ((ke.action == .down or ke.action == .repeat) and ke.matchBind("word_left")) {
                 e.handle(@src(), self.data());
                 if (!self.textLayout.selection.empty()) {
-                    self.textLayout.selection.moveCursor(self.textLayout.selection.start, false);
+                    self.textLayout.collapseSelection(false);
                 } else {
                     if (self.textLayout.sel_move == .none) {
                         self.textLayout.sel_move = .{ .word_left_right = .{ .select = false } };
                     }
                     if (self.textLayout.sel_move == .word_left_right) {
-                        self.textLayout.sel_move.word_left_right.count -= 1;
+                        self.textLayout.sel_move.word_left_right.count += self.textLayout.logicalStep(false);
                     }
                 }
                 break :blk;
@@ -889,14 +897,13 @@ pub fn processEvent(self: *TextEntryWidget, e: *Event) void {
             if ((ke.action == .down or ke.action == .repeat) and ke.matchBind("word_right")) {
                 e.handle(@src(), self.data());
                 if (!self.textLayout.selection.empty()) {
-                    self.textLayout.selection.moveCursor(self.textLayout.selection.end, false);
-                    self.textLayout.selection.affinity = .before;
+                    self.textLayout.collapseSelection(true);
                 } else {
                     if (self.textLayout.sel_move == .none) {
                         self.textLayout.sel_move = .{ .word_left_right = .{ .select = false } };
                     }
                     if (self.textLayout.sel_move == .word_left_right) {
-                        self.textLayout.sel_move.word_left_right.count += 1;
+                        self.textLayout.sel_move.word_left_right.count += self.textLayout.logicalStep(true);
                     }
                 }
                 break :blk;
@@ -905,7 +912,7 @@ pub fn processEvent(self: *TextEntryWidget, e: *Event) void {
             if ((ke.action == .down or ke.action == .repeat) and ke.matchBind("char_left")) {
                 e.handle(@src(), self.data());
                 if (!self.textLayout.selection.empty()) {
-                    self.textLayout.selection.moveCursor(self.textLayout.selection.start, false);
+                    self.textLayout.collapseSelection(false);
                 } else {
                     if (self.textLayout.sel_move == .none) {
                         self.textLayout.sel_move = .{ .char_left_right = .{ .select = false } };
@@ -920,8 +927,7 @@ pub fn processEvent(self: *TextEntryWidget, e: *Event) void {
             if ((ke.action == .down or ke.action == .repeat) and ke.matchBind("char_right")) {
                 e.handle(@src(), self.data());
                 if (!self.textLayout.selection.empty()) {
-                    self.textLayout.selection.moveCursor(self.textLayout.selection.end, false);
-                    self.textLayout.selection.affinity = .before;
+                    self.textLayout.collapseSelection(true);
                 } else {
                     if (self.textLayout.sel_move == .none) {
                         self.textLayout.sel_move = .{ .char_left_right = .{ .select = false } };
@@ -1614,4 +1620,116 @@ test "text delete to line start and end multiline" {
     try dvui.testing.pressKey(.delete, ctrl_shift);
     try dvui.testing.settle(Local.frame);
     try std.testing.expectEqualStrings("abc\n\nghi", Local.text);
+}
+
+test "right-to-left text: Left moves the caret forward through the bytes" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+
+    const hebrew = "\u{05e9}\u{05dc}\u{05d5}\u{05dd}";
+
+    const Local = struct {
+        var cursor: usize = 0;
+        var reset: ?[]const u8 = null;
+
+        fn frame() !dvui.App.Result {
+            var entry: TextEntryWidget = undefined;
+            entry.init(@src(), .{}, .{ .tag = "entry" });
+            defer entry.deinit();
+
+            if (reset) |s| {
+                entry.textSet(s, false);
+                reset = null;
+            }
+
+            entry.processEvents();
+            entry.draw();
+            cursor = entry.textLayout.selection.cursor;
+            return .ok;
+        }
+    };
+
+    try dvui.testing.settle(Local.frame);
+    try dvui.testing.pressKey(.tab, .none);
+    try dvui.testing.settle(Local.frame);
+    try dvui.testing.expectFocused("entry");
+
+    Local.reset = hebrew;
+    try dvui.testing.settle(Local.frame);
+    try dvui.testing.pressKey(.home, .lcontrol);
+    try dvui.testing.settle(Local.frame);
+    try std.testing.expectEqual(@as(usize, 0), Local.cursor);
+
+    // Byte 0 of an RTL line sits at its right edge, so Left is the key that
+    // walks into the text and Right has nowhere to go.
+    try dvui.testing.pressKey(.right, .none);
+    try dvui.testing.settle(Local.frame);
+    try std.testing.expectEqual(@as(usize, 0), Local.cursor);
+
+    for (0..2) |_| {
+        try dvui.testing.pressKey(.left, .none);
+        try dvui.testing.settle(Local.frame);
+    }
+    try std.testing.expectEqual(@as(usize, 4), Local.cursor);
+
+    try dvui.testing.pressKey(.right, .none);
+    try dvui.testing.settle(Local.frame);
+    try std.testing.expectEqual(@as(usize, 2), Local.cursor);
+}
+
+test "mixed-direction text: the caret walks the line in visual order" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+
+    // "abc" | Hebrew | "xyz": bytes 0..3, 3..11, 11..14. The Hebrew run is
+    // drawn between them but reversed, so its logical end (byte 11) is its
+    // leftmost caret position and its start (byte 3) its rightmost.
+    const mixed = "abc\u{05e9}\u{05dc}\u{05d5}\u{05dd}xyz";
+
+    const Local = struct {
+        var cursor: usize = 0;
+        var reset: ?[]const u8 = null;
+
+        fn frame() !dvui.App.Result {
+            var entry: TextEntryWidget = undefined;
+            entry.init(@src(), .{}, .{ .tag = "entry" });
+            defer entry.deinit();
+
+            if (reset) |s| {
+                entry.textSet(s, false);
+                reset = null;
+            }
+
+            entry.processEvents();
+            entry.draw();
+            cursor = entry.textLayout.selection.cursor;
+            return .ok;
+        }
+    };
+
+    try dvui.testing.settle(Local.frame);
+    try dvui.testing.pressKey(.tab, .none);
+    try dvui.testing.settle(Local.frame);
+
+    Local.reset = mixed;
+    try dvui.testing.settle(Local.frame);
+    try dvui.testing.pressKey(.home, .lcontrol);
+    try dvui.testing.settle(Local.frame);
+
+    for (0..3) |_| {
+        try dvui.testing.pressKey(.right, .none);
+        try dvui.testing.settle(Local.frame);
+    }
+    try std.testing.expectEqual(@as(usize, 3), Local.cursor);
+
+    // Stepping right off the end of "abc" enters the Hebrew run at its left
+    // edge, which is the end of that run's text.
+    try dvui.testing.pressKey(.right, .none);
+    try dvui.testing.settle(Local.frame);
+    try std.testing.expectEqual(@as(usize, 11), Local.cursor);
+
+    // ...and keeps going right through it, backwards through the bytes.
+    try dvui.testing.pressKey(.right, .none);
+    try dvui.testing.settle(Local.frame);
+    try std.testing.expectEqual(@as(usize, 9), Local.cursor);
 }

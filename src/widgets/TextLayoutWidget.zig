@@ -72,6 +72,12 @@ pub const InitOptions = struct {
     show_touch_draggables: bool = true,
 
     process_events_in_deinit: bool = true,
+
+    /// Paragraph base direction (UAX #9 P2/P3). `.auto` resolves per
+    /// paragraph from its first strong character, so an empty line, a
+    /// neutral-only line or an LTR-leading line all read left to right --
+    /// wrong when the surrounding UI is RTL. Set it to pin the direction.
+    base_direction: opentype.unicode.Bidi.ParagraphDirection = .auto,
 };
 
 pub const Selection = struct {
@@ -166,6 +172,7 @@ break_lines: bool,
 line_break: LineBreakStrictness,
 word_break: WordBreakMode,
 overflow_wrap: OverflowWrap,
+base_direction: opentype.unicode.Bidi.ParagraphDirection,
 current_line_width: f32 = 0.0, // width of lines if break_lines was false
 touch_edit_just_focused: bool,
 process_events_in_deinit: bool,
@@ -201,6 +208,9 @@ line_maybe_rtl: bool = false,
 /// Byte a point past the far edge of the most recently placed line resolves
 /// to; null until a line with fragments has been placed.
 line_end_byte: ?usize = null,
+/// Left edge of the most recently placed line, which an RTL line's logical
+/// end sits at; null until a line with fragments has been placed.
+line_left_x: ?f32 = null,
 /// UAX #9 P2/P3 runs over the paragraph, not the visual line: once a strong
 /// character has fixed the base direction it holds until the next hard break,
 /// so a wrapped RTL paragraph whose second line starts with a Latin word
@@ -329,6 +339,7 @@ pub fn init(self: *TextLayoutWidget, src: std.builtin.SourceLocation, init_opts:
         .line_break = init_opts.line_break,
         .word_break = init_opts.word_break,
         .overflow_wrap = init_opts.overflow_wrap,
+        .base_direction = init_opts.base_direction,
         .cache_layout = init_opts.cache_layout,
         .touch_edit_just_focused = init_opts.touch_edit_just_focused,
         .process_events_in_deinit = init_opts.process_events_in_deinit,
@@ -739,6 +750,143 @@ fn lineEndByte(frags: []const Fragment) usize {
     return last.bytes_seen + last.text.len - Font.trailingHardBreakLen(last.text);
 }
 
+/// One place the caret can sit on the placed line, and where that is on
+/// screen. `rtl` is the direction of the run it belongs to, which is what
+/// decides where the caret goes when a step runs off the end of the line.
+const CaretStop = struct {
+    x: f32,
+    byte: usize,
+    affinity: Selection.Affinity,
+    rtl: bool,
+};
+
+/// Every caret position on the placed line, ordered left to right on screen.
+/// Built from the same reordered fragments `hitLine` walks, so a keyboard
+/// step and a mouse click agree about which byte lives where.
+/// ponytail: quadratic -- every stop re-measures its fragment's prefix from
+/// the start. One line, one keypress; measure before caching anything.
+fn visualStops(self: *TextLayoutWidget, arena: std.mem.Allocator) []const CaretStop {
+    var stops: std.ArrayList(CaretStop) = .empty;
+    const gpa = dvui.currentWindow().gpa;
+    for (self.line_frags.items) |f| {
+        // A trailing hard break is not a caret position of its own: the
+        // caret past it belongs to the next line, which this walk can't see.
+        const text = f.text[0 .. f.text.len - Font.trailingHardBreakLen(f.text)];
+        var shaped = f.shaped;
+        var off: usize = 0;
+        while (true) {
+            const w = if (shaped) |*st|
+                (st.measureUpToByteOffset(gpa, off) catch f.font.textSize(text[0..off])).w
+            else
+                f.font.textSize(text[0..off]).w;
+            stops.append(arena, .{
+                .x = caretX(f, w),
+                .byte = f.bytes_seen + off,
+                .affinity = if (off == text.len) .before else .after,
+                .rtl = f.rtl,
+            }) catch break;
+            if (off >= text.len) break;
+            off = @min(text.len, off + (std.unicode.utf8ByteSequenceLength(text[off]) catch 1));
+        }
+    }
+    std.mem.sort(CaretStop, stops.items, {}, struct {
+        fn lessThan(_: void, a: CaretStop, b: CaretStop) bool {
+            return a.x < b.x;
+        }
+    }.lessThan);
+
+    // Two fragments meeting inside one level run (an addText chunk boundary,
+    // a highlight span) both name that byte at the same x. That is one caret
+    // position, and leaving both in would eat a keypress moving nowhere --
+    // unlike a level-run boundary, where the same byte has two real homes at
+    // two different x.
+    var kept: usize = 0;
+    for (stops.items) |st| {
+        if (kept > 0) {
+            const prev = &stops.items[kept - 1];
+            if (prev.byte == st.byte and @abs(prev.x - st.x) < 0.01) {
+                if (st.affinity == .after) prev.* = st;
+                continue;
+            }
+        }
+        stops.items[kept] = st;
+        kept += 1;
+    }
+    return stops.items[0..kept];
+}
+
+/// Which stop the caret is at. A level-run boundary is two stops sharing a
+/// byte at two different x, so affinity picks between them; a stale affinity
+/// still finds the byte.
+fn stopIndex(stops: []const CaretStop, byte: usize, affinity: Selection.Affinity) ?usize {
+    var by_byte: ?usize = null;
+    for (stops, 0..) |st, i| {
+        if (st.byte != byte) continue;
+        if (st.affinity == affinity) return i;
+        by_byte = by_byte orelse i;
+    }
+    return by_byte;
+}
+
+/// Steps the caret across the placed line in visual order, consuming `clr`'s
+/// count. What is left when the caret reaches the edge of the line is handed
+/// back as a *logical* count -- flipped when that edge belongs to an RTL run,
+/// since there one step further right is one step earlier in the text.
+fn charVisualMove(self: *TextLayoutWidget, clr: *@FieldType(@TypeOf(self.sel_move), "char_left_right")) void {
+    if (clr.count == 0 or self.line_frags.items.len == 0) return;
+    const stops = self.visualStops(dvui.currentWindow().arena());
+    var idx = stopIndex(stops, self.selection.cursor, self.selection.affinity) orelse return;
+
+    var moved = false;
+    while (clr.count != 0) {
+        const right = clr.count > 0;
+        if (right and idx + 1 >= stops.len) break;
+        if (!right and idx == 0) break;
+        idx = if (right) idx + 1 else idx - 1;
+        self.selection.moveCursor(stops[idx].byte, clr.select);
+        self.selection.affinity = stops[idx].affinity;
+        clr.count -= if (right) 1 else -1;
+        moved = true;
+    }
+
+    if (moved) {
+        // ponytail: a count that outran the line after a step that landed is
+        // dropped rather than resumed on the neighbouring line -- it takes
+        // two steps in one frame to reach, and key repeat brings the rest.
+        clr.count = 0;
+        self.scroll_to_cursor_next_frame = true;
+        dvui.refresh(null, @src(), self.data().id);
+    } else if (stops[idx].rtl) {
+        clr.count = -clr.count;
+    }
+}
+
+/// Reading direction of the run the caret sat in last frame. A key arrives
+/// before this frame has laid anything out, so a move that has to be decided
+/// up front (word steps, which collect their targets during the pass) has
+/// only the previous frame to ask.
+pub fn caretRtl(self: *TextLayoutWidget) bool {
+    return if (self.selection.cursor == self.selection.start) self.sel_start_rtl else self.sel_end_rtl;
+}
+
+/// Which way a Left/Right key moves the caret through the *text*. Word steps
+/// collect their targets during the layout pass, so unlike char steps they
+/// cannot be resolved against the placed line afterwards: they go by the
+/// direction of the run the caret sat in last frame.
+pub fn logicalStep(self: *TextLayoutWidget, right: bool) i8 {
+    return if (right != self.caretRtl()) 1 else -1;
+}
+
+/// Collapses a selection to the edge a Left/Right key points at on screen.
+pub fn collapseSelection(self: *TextLayoutWidget, right: bool) void {
+    if (right != self.caretRtl()) {
+        self.selection.moveCursor(self.selection.end, false);
+        self.selection.affinity = .before;
+    } else {
+        self.selection.moveCursor(self.selection.start, false);
+    }
+}
+
 /// The hit for `p` if the fragment at `index` is the one that owns it. The
 /// whole line is rescanned per point per fragment; a line holds a handful of
 /// fragments, so caching the answers is not worth the state.
@@ -1125,6 +1273,10 @@ fn cursorSeen(self: *TextLayoutWidget) void {
             }
         },
         .char_left_right => |*clr| {
+            // Visual first: on the placed line the caret walks the screen,
+            // not the byte stream. Only what runs off the end of the line is
+            // left for the logical paths here and in `selMoveText`.
+            self.charVisualMove(clr);
             if (clr.count < 0) {
                 const oldcur = self.selection.cursor;
                 var cur = self.selection.cursor;
@@ -1513,6 +1665,7 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
             .max_width = if (self.break_lines) width else null,
             .end_idx = &end,
             .ascent_out = &ascent,
+            .base_direction = self.baseDir(),
         }) catch null) |res| {
             s = res.size;
             shaped = res.shaped;
@@ -1780,6 +1933,28 @@ fn maybeRtl(text: []const u8) bool {
     return false;
 }
 
+/// Where a caret with no text to sit against goes: the pen, except that an
+/// RTL paragraph starts at the right edge, so an empty line's caret belongs
+/// there rather than at x=0.
+fn penX(self: *TextLayoutWidget) f32 {
+    if (self.baseDir() != .rtl) return self.insert_pt.x;
+    if (self.insert_pt.x == 0) {
+        const avail = self.data().contentRect().w;
+        return if (avail == 0) 0 else avail - 1;
+    }
+    // The line was right-aligned after the pen moved, so `insert_pt.x` is a
+    // width rather than a position.
+    // ponytail: the left edge, not the logical end, on a mixed line -- this
+    // is the fallback for a caret no fragment claimed.
+    return self.line_left_x orelse self.insert_pt.x;
+}
+
+/// Base direction in force right now: what this paragraph's first strong
+/// character resolved to, or the app-set default until one appears.
+fn baseDir(self: *const TextLayoutWidget) opentype.unicode.Bidi.ParagraphDirection {
+    return self.paragraph_direction orelse self.base_direction;
+}
+
 /// One same-level slice of one buffered fragment: the unit UAX #9 rule L2
 /// actually reorders. A fragment straddling a level run (a highlight span
 /// holding the space between an RTL word and an LTR one, say) has to be cut
@@ -1889,7 +2064,7 @@ fn stickyBoundary(before: []const u8, after: []const u8) bool {
 /// as context -- their glyphs are discarded, they only get to influence this
 /// fragment's -- and re-place the line, since joined forms are narrower than
 /// the isolated ones the layout half measured.
-fn reshapeWithNeighbourContext(frags: []Fragment) void {
+fn reshapeWithNeighbourContext(frags: []Fragment, base_direction: opentype.unicode.Bidi.ParagraphDirection) void {
     if (frags.len < 2) return;
     const cw = dvui.currentWindow();
     const arena = cw.arena();
@@ -1908,6 +2083,7 @@ fn reshapeWithNeighbourContext(frags: []Fragment) void {
         const ctx = std.mem.concat(arena, u8, &.{ lead, f.text, trail }) catch continue;
         const res = f.font.textSizeExShaped(cw.gpa, ctx, .{
             .item = .{ .start = lead.len, .end = lead.len + f.text.len },
+            .base_direction = base_direction,
         }) catch continue orelse continue;
         frags[i].render_shaped = res.shaped;
         frags[i].size.w = res.size.w;
@@ -1932,8 +2108,9 @@ fn reorderLineVisual(self: *TextLayoutWidget) void {
     const cw = dvui.currentWindow();
     const arena = cw.arena();
     const frags = self.line_frags.items;
-    var base_direction = self.paragraph_direction orelse .auto;
+    var base_direction = self.paragraph_direction orelse self.base_direction;
     defer self.paragraph_direction = if (base_direction == .auto) null else base_direction;
+
     const pieces = bidiPieces(arena, frags, &base_direction) orelse return;
 
     var out: std.ArrayList(Fragment) = .empty;
@@ -1956,6 +2133,7 @@ fn reorderLineVisual(self: *TextLayoutWidget) void {
             f.render_shaped = null;
             if (src.font.textSizeExShaped(cw.gpa, src.text, .{
                 .item = .{ .start = p.start, .end = p.end },
+                .base_direction = base_direction,
             }) catch null) |res| {
                 f.size = res.size;
                 f.render_shaped = res.shaped;
@@ -1992,7 +2170,7 @@ fn assignVisualX(arena: std.mem.Allocator, pieces: []const BidiPiece, out: []Fra
 /// starts where the reader starts. `TextLayoutWidget` has no general
 /// text-align option -- this is base direction only, not a style knob.
 fn alignLineToBaseDirection(self: *TextLayoutWidget, frags: []Fragment) void {
-    if (self.paragraph_direction != .rtl or frags.len == 0) return;
+    if (self.baseDir() != .rtl or frags.len == 0) return;
     var right = frags[0].x;
     for (frags) |f| right = @max(right, f.x + f.size.w);
     // Same fallback the layout half uses: a widget that hasn't been shown yet
@@ -2013,6 +2191,7 @@ fn flushLine(self: *TextLayoutWidget) void {
     }
     if (self.line_frags.items.len == 0) {
         self.line_end_byte = null;
+        self.line_left_x = null;
         return;
     }
 
@@ -2029,10 +2208,16 @@ fn flushLine(self: *TextLayoutWidget) void {
     for (self.line_frags.items) |f| line_max_ascent = @max(line_max_ascent, @max(f.max_ascent, f.ascent));
     for (self.line_frags.items) |*f| f.max_ascent = line_max_ascent;
 
-    reshapeWithNeighbourContext(self.line_frags.items);
-    if (self.line_maybe_rtl) self.reorderLineVisual();
+    reshapeWithNeighbourContext(self.line_frags.items, self.baseDir());
+    // An RTL base direction reorders lines holding no RTL character at all:
+    // digits take an even level above it and the neutrals between them the
+    // odd base level, so `line_maybe_rtl` alone is not the whole gate.
+    if (self.line_maybe_rtl or self.baseDir() == .rtl) self.reorderLineVisual();
     self.alignLineToBaseDirection(self.line_frags.items);
     self.line_end_byte = lineEndByte(self.line_frags.items);
+    var left = self.line_frags.items[0].x;
+    for (self.line_frags.items) |f| left = @min(left, f.x);
+    self.line_left_x = left;
     for (self.line_frags.items, 0..) |f, i| self.emitFragment(f, i);
     // A hard break ends the paragraph, so the next one resolves P2 afresh.
     if (self.line_frags.items[self.line_frags.items.len - 1].newline) self.paragraph_direction = null;
@@ -2457,7 +2642,7 @@ pub fn addTextDone(self: *TextLayoutWidget, opts: Options) void {
     const text_height = options.fontGet().textHeight();
 
     if (!self.cursor_seen) {
-        self.cursor_rect = Rect{ .x = self.insert_pt.x, .y = self.insert_pt.y, .w = 1, .h = text_height };
+        self.cursor_rect = Rect{ .x = self.penX(), .y = self.insert_pt.y, .w = 1, .h = text_height };
         self.cursorSeen();
     }
 
@@ -2514,8 +2699,8 @@ pub fn addTextDone(self: *TextLayoutWidget, opts: Options) void {
     }
 
     if (self.selection.start > self.bytes_seen or self.bytes_seen == 0) {
-        self.sel_start_r = .{ .x = self.insert_pt.x, .y = self.insert_pt.y, .w = 1, .h = text_height };
-        self.sel_start_rtl = false;
+        self.sel_start_r = .{ .x = self.penX(), .y = self.insert_pt.y, .w = 1, .h = text_height };
+        self.sel_start_rtl = self.baseDir() == .rtl;
         if (self.selection.start > self.bytes_seen) {
             dvui.refresh(null, @src(), self.data().id);
         }
@@ -2530,8 +2715,8 @@ pub fn addTextDone(self: *TextLayoutWidget, opts: Options) void {
     }
 
     if (self.selection.end > self.bytes_seen or self.bytes_seen == 0) {
-        self.sel_end_r = .{ .x = self.insert_pt.x, .y = self.insert_pt.y, .w = 1, .h = text_height };
-        self.sel_end_rtl = false;
+        self.sel_end_r = .{ .x = self.penX(), .y = self.insert_pt.y, .w = 1, .h = text_height };
+        self.sel_end_rtl = self.baseDir() == .rtl;
         if (self.selection.end > self.bytes_seen) {
             dvui.refresh(null, @src(), self.data().id);
         }
@@ -2874,7 +3059,7 @@ pub fn processEvent(self: *TextLayoutWidget, e: *Event) void {
                     self.sel_move = .{ .word_left_right = .{} };
                 }
                 if (self.sel_move == .word_left_right) {
-                    self.sel_move.word_left_right.count -= 1;
+                    self.sel_move.word_left_right.count += self.logicalStep(false);
                 }
                 break :blk;
             }
@@ -2885,7 +3070,7 @@ pub fn processEvent(self: *TextLayoutWidget, e: *Event) void {
                     self.sel_move = .{ .word_left_right = .{} };
                 }
                 if (self.sel_move == .word_left_right) {
-                    self.sel_move.word_left_right.count += 1;
+                    self.sel_move.word_left_right.count += self.logicalStep(true);
                 }
                 break :blk;
             }
@@ -3115,7 +3300,7 @@ test "reshapeWithNeighbourContext: a word split across chunks joins across the s
     frags[0].x = 7;
     const before_width = frags[0].size.w + frags[1].size.w;
 
-    reshapeWithNeighbourContext(&frags);
+    reshapeWithNeighbourContext(&frags, .auto);
 
     try std.testing.expect(frags[0].render_shaped != null);
     try std.testing.expect(frags[1].render_shaped != null);
@@ -3746,4 +3931,105 @@ test "e2e: a wrapping RTL fragment answers clicks by cluster, not by leading gly
     // its logical end.
     try fns.clickAt(1, fns.line_h * 0.5);
     try std.testing.expectEqual(wrap, fns.sel.cursor);
+}
+
+test "base_direction: an RTL base right-aligns a line holding no RTL character" {
+    var t = try dvui.testing.init(.{ .window_size = .{ .w = 400, .h = 200 } });
+    defer t.deinit();
+
+    const fns = struct {
+        var dir: opentype.unicode.Bidi.ParagraphDirection = .auto;
+        var caret_x: f32 = 0;
+        var avail: f32 = 0;
+
+        fn frame() !dvui.App.Result {
+            var tl = dvui.textLayout(@src(), .{ .base_direction = dir }, .{ .expand = .horizontal });
+            tl.addText("abc", .{});
+            avail = tl.data().contentRect().w;
+            tl.addTextDone(.{});
+            // The cursor starts at byte 0, so its rect is the line's left
+            // edge when the line is left-aligned.
+            caret_x = tl.cursor_rect.x;
+            tl.deinit();
+            return .ok;
+        }
+    };
+
+    fns.dir = .auto;
+    try dvui.testing.settle(fns.frame);
+    try std.testing.expect(@abs(fns.caret_x) < 0.01);
+
+    fns.dir = .rtl;
+    try dvui.testing.settle(fns.frame);
+    try std.testing.expect(fns.caret_x > 0);
+    try std.testing.expect(fns.caret_x < fns.avail);
+}
+
+test "base_direction: an empty RTL paragraph puts its caret on the right" {
+    var t = try dvui.testing.init(.{ .window_size = .{ .w = 400, .h = 200 } });
+    defer t.deinit();
+
+    const fns = struct {
+        var dir: opentype.unicode.Bidi.ParagraphDirection = .auto;
+        var caret_x: f32 = 0;
+        var avail: f32 = 0;
+
+        fn frame() !dvui.App.Result {
+            var tl = dvui.textLayout(@src(), .{ .base_direction = dir }, .{ .expand = .horizontal });
+            avail = tl.data().contentRect().w;
+            tl.addTextDone(.{});
+            caret_x = tl.cursor_rect.x;
+            tl.deinit();
+            return .ok;
+        }
+    };
+
+    fns.dir = .auto;
+    try dvui.testing.settle(fns.frame);
+    try std.testing.expect(@abs(fns.caret_x) < 0.01);
+
+    fns.dir = .rtl;
+    try dvui.testing.settle(fns.frame);
+    try std.testing.expectEqual(fns.avail - 1, fns.caret_x);
+}
+
+test "visualStops: fragments meeting inside one run share a caret position" {
+    var t = try dvui.testing.init(.{ .window_size = .{ .w = 400, .h = 200 } });
+    defer t.deinit();
+
+    const fns = struct {
+        var bytes: []usize = &.{};
+
+        fn frame() !dvui.App.Result {
+            var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal });
+            const arena = dvui.currentWindow().arena();
+            const font: Font = .find(.{ .family = "Vera", .size = 16 });
+
+            var frags: [2]Fragment = std.mem.zeroes([2]Fragment);
+            frags[0].text = "hel";
+            frags[1].text = "lo";
+            frags[1].bytes_seen = 3;
+            var x: f32 = 0;
+            for (&frags) |*f| {
+                f.font = font;
+                f.size = font.textSizeEx(f.text, .{});
+                f.x = x;
+                x += f.size.w;
+            }
+            tl.line_frags.appendSlice(arena, &frags) catch {};
+
+            const stops = tl.visualStops(arena);
+            const out = arena.alloc(usize, stops.len) catch return .ok;
+            for (stops, out) |st, *b| b.* = st.byte;
+            bytes = out;
+
+            tl.line_frags.clearRetainingCapacity();
+            tl.addTextDone(.{});
+            tl.deinit();
+            return .ok;
+        }
+    };
+
+    try dvui.testing.settle(fns.frame);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 2, 3, 4, 5 }, fns.bytes);
 }

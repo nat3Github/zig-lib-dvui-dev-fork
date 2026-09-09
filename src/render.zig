@@ -193,7 +193,7 @@ pub fn renderText(opts: TextOptions) Backend.GenericError!void {
         line = shaped.line;
     } else {
         const resolved = try cw.fonts.resolveStack(cw.gpa, sized_font);
-        line = cw.fonts.shapeLineText(cw.arena(), cw.gpa, resolved, utf8_text, null) catch return error.OutOfMemory;
+        line = cw.fonts.shapeLineText(cw.arena(), cw.gpa, resolved, utf8_text, null, .auto) catch return error.OutOfMemory;
         owns_line = true;
         // Fetched after shapeLineText, not before: shapeLineText can insert
         // into self.cache while lazily materializing fallback-family
