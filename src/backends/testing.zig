@@ -10,6 +10,14 @@ size_pixels: dvui.Size.Physical,
 time: i128 = 0,
 clipboard: ?[]const u8 = null,
 
+/// Counts of `textureCreate`/`textureDestroy` calls, for tests/benchmarks
+/// that want to detect e.g. font-atlas rebuild churn. `Font.zig` calls
+/// `Backend.textureCreate` directly (not through `dvui.Texture.create`), so
+/// `Window.renderStats().textures_created` does not see atlas textures --
+/// this counter does.
+texture_creates: u32 = 0,
+texture_destroys: u32 = 0,
+
 pub const kind: dvui.enums.Backend = .testing;
 
 pub const TestingBackend = @This();
@@ -86,6 +94,7 @@ pub fn drawClippedTriangles(_: *TestingBackend, _: ?dvui.Texture, _: []const dvu
 /// Create a texture from the given pixels in RGBA.  The returned
 /// pointer is what will later be passed to drawClippedTriangles.
 pub fn textureCreate(self: *TestingBackend, pixels: [*]const u8, options: dvui.Texture.CreateOptions) !dvui.Texture {
+    self.texture_creates += 1;
     const new_pixels = self.allocator.dupe(u8, pixels[0 .. options.width * options.height * 4]) catch @panic("Couldn't create texture: OOM");
     return .{
         .width = options.width,
@@ -116,6 +125,7 @@ pub fn textureReadTarget(_: *TestingBackend, texture: dvui.TextureTarget, pixels
 /// textureFromTarget().  After this call, this texture pointer will not
 /// be used by dvui.
 pub fn textureDestroy(self: *TestingBackend, texture: dvui.Texture) void {
+    self.texture_destroys += 1;
     const ptr: [*]const u8 = @ptrCast(texture.ptr);
     self.allocator.free(ptr[0..(texture.width * texture.height * 4)]);
 }
