@@ -647,6 +647,20 @@ pub const ShapedText = struct {
         const fit = try self.fallback.logicalPrefixForWidth(gpa, &self.line, width * self.ss, end_metric, snap);
         return fit.byte;
     }
+
+    /// Where a caret after `byte_offset` logical bytes sits, measured from
+    /// the run's left edge. Not `measureUpToByteOffset`: that is an ink
+    /// width, and ink is not where the pen is.
+    pub fn caretOffset(self: *ShapedText, byte_offset: usize) f32 {
+        const snap = if (dvui.current_window) |cw| cw.snap_to_pixels else true;
+        return self.fallback.caretPenOffset(&self.line, byte_offset, snap) / self.ss;
+    }
+
+    /// Inverse of `caretOffset`.
+    pub fn byteAtOffset(self: *ShapedText, x: f32) usize {
+        const snap = if (dvui.current_window) |cw| cw.snap_to_pixels else true;
+        return self.fallback.byteAtPenOffset(&self.line, x * self.ss, snap);
+    }
 };
 
 pub fn textSizeExShaped(self: Font, gpa: std.mem.Allocator, text: []const u8, opts: TextSizeOptions) std.mem.Allocator.Error!?struct { size: Size, shaped: ShapedText } {
@@ -2041,6 +2055,44 @@ pub const Cache = struct {
             }
             return best;
         }
+
+        /// Pen x, in device pixels from the run's left edge, of a caret
+        /// sitting after `byte_offset` logical bytes -- advances only.
+        /// `measureLogicalPrefix` answers an ink bounding box, whose
+        /// per-glyph side bearings and overhang make it non-additive: a
+        /// caret placed from it drifts off the pen positions `renderText`
+        /// actually draws the glyphs at, by a different amount per prefix.
+        pub fn caretPenOffset(self: *Entry, line: *const ShapedLine, byte_offset: usize, snap: bool) f32 {
+            const r = line.logicalPrefixGlyphs(byte_offset);
+            // An RTL run's logical prefix is the buffer's *trailing* glyphs,
+            // so its caret is at the prefix's left edge -- and an empty
+            // prefix sits at the run's right edge, past every glyph.
+            const limit = if (!line.isRtl()) r.end else if (r.end == 0) line.buffer.info.items.len else r.start;
+            var x: f32 = 0;
+            for (line.buffer.pos.items[0..limit], 0..) |pos, gidx| {
+                const adv = line.entryForGlyph(self, gidx).toPixels(pos.x_advance);
+                x += if (snap) @round(adv) else adv;
+            }
+            return x;
+        }
+
+        /// Inverse of `caretPenOffset`: the caret stop nearest pen x. Pen
+        /// offsets run backwards through an RTL run's text, so this picks by
+        /// distance rather than walking until a width is exceeded.
+        /// ponytail: quadratic in glyphs, same as `logicalPrefixForWidth`;
+        /// one click, one fragment-sized run.
+        pub fn byteAtPenOffset(self: *Entry, line: *const ShapedLine, x: f32, snap: bool) usize {
+            var best: usize = 0;
+            var best_d: f32 = @abs(self.caretPenOffset(line, 0, snap) - x);
+            for (line.cluster_ends) |boundary| {
+                const d = @abs(self.caretPenOffset(line, boundary, snap) - x);
+                if (d < best_d) {
+                    best_d = d;
+                    best = boundary;
+                }
+            }
+            return best;
+        }
     };
 };
 
@@ -2473,4 +2525,39 @@ test "TextSizeOptions.item: a joining neighbour changes the glyph chosen" {
     try std.testing.expectEqual(@as(usize, 1), joined.shaped.line.buffer.info.items.len);
     try std.testing.expect(joined.shaped.line.buffer.info.items[0].codepoint !=
         alone.shaped.line.buffer.info.items[0].codepoint);
+}
+
+test "caret pen offsets step one glyph at a time through an RTL run" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    const gpa = std.testing.allocator;
+
+    const font: Font = .find(.{ .family = "Vera", .size = 16 });
+    // Four Hebrew letters, two bytes each. Coverage does not matter here:
+    // bidi reorders the clusters whether or not the stack has the glyphs.
+    const txt = "\u{05e9}\u{05dc}\u{05d5}\u{05dd}";
+    var res = (try font.textSizeExShaped(gpa, txt, .{})).?;
+    defer res.shaped.deinit();
+    try std.testing.expect(res.shaped.line.isRtl());
+
+    const advance = res.shaped.caretOffset(0);
+    try std.testing.expect(advance > 0);
+
+    // The caret walks leftwards as the logical prefix grows, by one whole
+    // glyph each step, and the full prefix lands on the run's left edge.
+    var prev = advance;
+    var off: usize = 2;
+    while (off <= txt.len) : (off += 2) {
+        const x = res.shaped.caretOffset(off);
+        try std.testing.expect(x < prev);
+        // Each step gives back exactly one glyph's advance -- the run's
+        // rightmost, since an RTL prefix grows leftwards from there.
+        const g = res.shaped.line.buffer.info.items.len - off / 2;
+        const entry = res.shaped.line.entryForGlyph(res.shaped.fallback, g);
+        const step = @round(entry.toPixels(res.shaped.line.buffer.pos.items[g].x_advance)) / res.shaped.ss;
+        try std.testing.expectApproxEqAbs(step, prev - x, 0.01);
+        try std.testing.expectEqual(off, res.shaped.byteAtOffset(x));
+        prev = x;
+    }
+    try std.testing.expectApproxEqAbs(@as(f32, 0), prev, 0.01);
 }

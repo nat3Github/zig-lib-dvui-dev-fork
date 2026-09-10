@@ -77,6 +77,12 @@ pub const InitOptions = struct {
 
     break_lines: bool = false,
 
+    /// CSS `line-break`/`word-break`/`overflow-wrap`; see the matching
+    /// `TextLayoutWidget.InitOptions` fields. Only matter with `break_lines`.
+    line_break: opentype.LineBreakStrictness = .strict,
+    word_break: opentype.WordBreakMode = .normal,
+    overflow_wrap: TextLayoutWidget.OverflowWrap = .anywhere,
+
     /// Paragraph base direction for the text; see
     /// `TextLayoutWidget.InitOptions.base_direction`. `.rtl` puts an empty
     /// entry's caret on the right.
@@ -218,6 +224,9 @@ pub fn init(self: *TextEntryWidget, src: std.builtin.SourceLocation, init_opts: 
 
     self.textLayout.init(@src(), .{
         .break_lines = self.init_opts.break_lines,
+        .line_break = self.init_opts.line_break,
+        .word_break = self.init_opts.word_break,
+        .overflow_wrap = self.init_opts.overflow_wrap,
         .base_direction = self.init_opts.base_direction,
         .touch_edit_just_focused = false,
         .cache_layout = self.init_opts.cache_layout,
@@ -1732,4 +1741,98 @@ test "mixed-direction text: the caret walks the line in visual order" {
     try dvui.testing.pressKey(.right, .none);
     try dvui.testing.settle(Local.frame);
     try std.testing.expectEqual(@as(usize, 9), Local.cursor);
+}
+
+test "right-to-left text: Left at the end of the text stays put" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+
+    const hebrew = "\u{05e9}\u{05dc}\u{05d5}\u{05dd}.";
+
+    const Local = struct {
+        var cursor: usize = 0;
+        var reset: ?[]const u8 = null;
+
+        fn frame() !dvui.App.Result {
+            var entry: TextEntryWidget = undefined;
+            entry.init(@src(), .{ .multiline = true }, .{ .tag = "entry" });
+            defer entry.deinit();
+
+            if (reset) |s| {
+                entry.textSet(s, false);
+                reset = null;
+            }
+
+            entry.processEvents();
+            entry.draw();
+            cursor = entry.textLayout.selection.cursor;
+            return .ok;
+        }
+    };
+
+    try dvui.testing.settle(Local.frame);
+    try dvui.testing.pressKey(.tab, .none);
+    try dvui.testing.settle(Local.frame);
+
+    Local.reset = hebrew;
+    try dvui.testing.settle(Local.frame);
+    try dvui.testing.pressKey(.end, .lcontrol);
+    try dvui.testing.settle(Local.frame);
+    try std.testing.expectEqual(@as(usize, 9), Local.cursor);
+
+    // The end of the text is the left edge of an RTL line: Left has nowhere
+    // to go and Right walks back into the text.
+    for (0..2) |_| {
+        try dvui.testing.pressKey(.left, .none);
+        try dvui.testing.settle(Local.frame);
+        try std.testing.expectEqual(@as(usize, 9), Local.cursor);
+    }
+
+    try dvui.testing.pressKey(.right, .none);
+    try dvui.testing.settle(Local.frame);
+    try std.testing.expectEqual(@as(usize, 8), Local.cursor);
+}
+
+test "overflow_wrap reaches the inner TextLayout" {
+    var t = try dvui.testing.init(.{ .window_size = .{ .w = 700, .h = 300 } });
+    defer t.deinit();
+
+    const Local = struct {
+        var wrap: TextLayoutWidget.OverflowWrap = .anywhere;
+        var lines: usize = 0;
+
+        fn frame() !dvui.App.Result {
+            var entry: TextEntryWidget = undefined;
+            entry.init(@src(), .{
+                .multiline = true,
+                .break_lines = true,
+                .overflow_wrap = wrap,
+                .text = .{ .buffer = &buf },
+                .scroll_horizontal = false,
+            }, .{ .rect = .{ .w = 280, .h = 200 } });
+            defer entry.deinit();
+            entry.processEvents();
+            entry.draw();
+            lines = entry.textLayout.line + 1;
+            return .ok;
+        }
+
+        var buf = blk: {
+            var b: [64]u8 = @splat(0);
+            const s = "a" ** 48;
+            @memcpy(b[0..s.len], s);
+            break :blk b;
+        };
+    };
+
+    Local.wrap = .anywhere;
+    try dvui.testing.settle(Local.frame);
+    const broken = Local.lines;
+
+    Local.wrap = .normal;
+    try dvui.testing.settle(Local.frame);
+    const whole = Local.lines;
+
+    try std.testing.expect(broken > 1);
+    try std.testing.expectEqual(@as(usize, 1), whole);
 }

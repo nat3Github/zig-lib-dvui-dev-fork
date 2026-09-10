@@ -197,6 +197,7 @@ pub fn textEntryWidgets() void {
         if (Sfont.dropdown > 0) {
             font = dvui.currentWindow().fonts.database.items[font_entries[Sfont.dropdown].idx - 1].font();
         }
+        font = font.withSize(20);
 
         var te_opts: dvui.TextEntryWidget.InitOptions = .{ .multiline = true, .text = .{ .buffer_dynamic = .{
             .backing = &text_entry_multiline_buf,

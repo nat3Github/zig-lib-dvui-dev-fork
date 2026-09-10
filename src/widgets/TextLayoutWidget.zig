@@ -681,22 +681,19 @@ const PointHit = struct { byte: usize, affinity: Selection.Affinity = .after };
 /// otherwise clicking the visually-first letter of an Arabic or Hebrew word
 /// lands on the last byte of it.
 fn hitWithin(f: Fragment, p: Point) PointHit {
-    const how_far = if (f.rtl) (f.x + f.size.w) - p.x else p.x - f.x;
-    // Width-driven hit-test against the already-shaped line instead of
-    // reshaping `f.text` from scratch just to find which byte a pixel
-    // offset lands on. `f.shaped` is the shape `f.size.w` was measured from,
-    // so `how_far` is in its coordinates; the reshape below is not, which is
-    // why it is only the last resort.
+    // Hit-tested against the already-shaped line's pen positions, the same
+    // places `fragCaretX` puts the caret, so a click and the caret it leaves
+    // behind agree. The reshape below is the last resort for a fragment that
+    // never got shaped, and can only measure widths.
     var pt_end: usize = undefined;
-    var found = false;
     if (f.shaped) |shaped| {
         var st = shaped;
-        if (st.byteOffsetForWidth(dvui.currentWindow().gpa, how_far, .nearest)) |b| {
-            pt_end = b;
-            found = true;
-        } else |_| {}
-    }
-    if (!found) {
+        // A shape can cover more text than the fragment does (an LTR one is
+        // only required to *start* with it), so its far stops are not this
+        // fragment's to hand out.
+        pt_end = @min(st.byteAtOffset(p.x - f.x), f.text.len);
+    } else {
+        const how_far = if (f.rtl) (f.x + f.size.w) - p.x else p.x - f.x;
         _ = f.font.textSizeEx(f.text, .{ .max_width = how_far, .end_idx = &pt_end, .end_metric = .nearest });
     }
     // Landing on the run's logical end is the far side of a level-run
@@ -767,20 +764,14 @@ const CaretStop = struct {
 /// the start. One line, one keypress; measure before caching anything.
 fn visualStops(self: *TextLayoutWidget, arena: std.mem.Allocator) []const CaretStop {
     var stops: std.ArrayList(CaretStop) = .empty;
-    const gpa = dvui.currentWindow().gpa;
     for (self.line_frags.items) |f| {
         // A trailing hard break is not a caret position of its own: the
         // caret past it belongs to the next line, which this walk can't see.
         const text = f.text[0 .. f.text.len - Font.trailingHardBreakLen(f.text)];
-        var shaped = f.shaped;
         var off: usize = 0;
         while (true) {
-            const w = if (shaped) |*st|
-                (st.measureUpToByteOffset(gpa, off) catch f.font.textSize(text[0..off])).w
-            else
-                f.font.textSize(text[0..off]).w;
             stops.append(arena, .{
-                .x = caretX(f, w),
+                .x = fragCaretX(f, off),
                 .byte = f.bytes_seen + off,
                 .affinity = if (off == text.len) .before else .after,
                 .rtl = f.rtl,
@@ -1808,10 +1799,25 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
         }
 
         if (shaped) |*st| {
-            // A shape running past the fragment is drawn by leading-glyph
-            // limit, which is the wrong end of an RTL run -- and the glyphs
-            // it would keep aren't even the ones under `f.text`.
-            if (st.line.isRtl() and st.line.byte_offsets[st.line.codepoints.len] != end) shaped = null;
+            // A shape running past the fragment can't be sliced from the
+            // leading end of an RTL run -- that is the wrong end, and the
+            // glyphs it would keep aren't even the ones under `f.text`. So
+            // reshape the fragment's own bytes, with the rest of `txt` as
+            // context so the break doesn't undo any joining forms. Dropping
+            // the shape instead would leave the caret to be placed from ink
+            // widths, which is not where the pen is (see `fragCaretX`).
+            if (st.line.isRtl() and st.line.byte_offsets[st.line.codepoints.len] != shapeableLen(txt[0..end])) {
+                shaped = null;
+                if (font.textSizeExShaped(cw.gpa, txt, .{
+                    .item = .{ .start = 0, .end = end },
+                    .base_direction = self.baseDir(),
+                }) catch null) |res| {
+                    if (!res.shaped.line.isMixedDirection()) {
+                        shaped = res.shaped;
+                        s = res.size;
+                    }
+                }
+            }
         }
 
         self.line_frags.append(cw.arena(), .{
@@ -2219,6 +2225,18 @@ fn flushLine(self: *TextLayoutWidget) void {
     for (self.line_frags.items) |f| left = @min(left, f.x);
     self.line_left_x = left;
     for (self.line_frags.items, 0..) |f, i| self.emitFragment(f, i);
+
+    // A caret at the end of the text with `.after` affinity -- what Ctrl+End
+    // leaves -- points at the start of a line that never comes, so no
+    // fragment claims it. Take it here, while the line it actually sits on is
+    // still placed, or a visual key step finds no stops to walk and falls
+    // back to a logical one: on an RTL line, a step the wrong way.
+    if (self.add_text_done and !self.cursor_seen) {
+        const last = self.line_frags.items[self.line_frags.items.len - 1];
+        self.cursor_rect = .{ .x = self.penX(), .y = last.y, .w = 1, .h = last.size.h };
+        self.cursorSeen();
+    }
+
     // A hard break ends the paragraph, so the next one resolves P2 afresh.
     if (self.line_frags.items[self.line_frags.items.len - 1].newline) self.paragraph_direction = null;
 }
@@ -2267,6 +2285,18 @@ fn caretX(f: Fragment, prefix_w: f32) f32 {
     return if (f.rtl) f.x + f.size.w - prefix_w else f.x + prefix_w;
 }
 
+/// Where the caret sits after `off` logical bytes of the fragment. Reads the
+/// shape's pen positions, so it lands exactly on a glyph boundary
+/// `renderText` drew at; a width-derived x drifts into the glyphs, because
+/// `f.size.w` and a prefix width are both ink boxes and neither is additive.
+fn fragCaretX(f: Fragment, off: usize) f32 {
+    if (f.shaped) |shaped| {
+        var st = shaped;
+        return f.x + st.caretOffset(off);
+    }
+    return caretX(f, f.font.textSize(f.text[0..off]).w);
+}
+
 /// A hit found while emitting is answered next frame; refresh so a still
 /// mouse over static text gets that frame.
 fn recordHit(self: *TextLayoutWidget, action: AddTextExAction, hit: DeferredHit) void {
@@ -2280,6 +2310,12 @@ fn recordHit(self: *TextLayoutWidget, action: AddTextExAction, hit: DeferredHit)
     if (!already_answered) dvui.refresh(null, @src(), self.data().id);
 }
 
+/// Bytes of `text` a shape can cover: shaping stops at the first hard break,
+/// so a fragment ending in a newline is shaped that newline short.
+fn shapeableLen(text: []const u8) usize {
+    return if (Font.firstHardBreak(text)) |hb| hb.start else text.len;
+}
+
 fn emitFragment(self: *TextLayoutWidget, f: Fragment, index: usize) void {
     const cw = dvui.currentWindow();
     var shaped = f.shaped;
@@ -2288,7 +2324,7 @@ fn emitFragment(self: *TextLayoutWidget, f: Fragment, index: usize) void {
     // cursor/selection tracking and the render call below. Leading is the
     // wrong end of an RTL run, so a shape that overruns the fragment must
     // already have been dropped (see addTextEx).
-    if (shaped) |*st| std.debug.assert(!st.line.buffer.isRtl() or st.line.byte_offsets[st.line.codepoints.len] == f.text.len);
+    if (shaped) |*st| std.debug.assert(!st.line.buffer.isRtl() or st.line.byte_offsets[st.line.codepoints.len] == shapeableLen(f.text));
     const shaped_glyph_limit: ?usize = if (shaped) |*st| st.line.glyphLimitForByteOffset(f.text.len) else null;
     // see if selection needs to be updated
 
@@ -2364,15 +2400,13 @@ fn emitFragment(self: *TextLayoutWidget, f: Fragment, index: usize) void {
     // height in case we are calling textSize with an empty slice)
     if (self.selection.start >= f.bytes_seen and self.selection.start <= f.bytes_seen + f.text.len) {
         const off = self.selection.start -| f.bytes_seen;
-        const start_off = if (shaped) |*st| st.measureUpToByteOffset(cw.gpa, off) catch f.font.textSize(f.text[0..off]) else f.font.textSize(f.text[0..off]);
-        self.sel_start_r_new = .{ .x = caretX(f, start_off.w), .y = f.y, .w = 1, .h = f.size.h };
+        self.sel_start_r_new = .{ .x = fragCaretX(f, off), .y = f.y, .w = 1, .h = f.size.h };
         self.sel_start_rtl_new = f.rtl;
     }
 
     if (self.selection.end >= f.bytes_seen and self.selection.end <= f.bytes_seen + f.text.len) {
         const off = self.selection.end -| f.bytes_seen;
-        const end_off = if (shaped) |*st| st.measureUpToByteOffset(cw.gpa, off) catch f.font.textSize(f.text[0..off]) else f.font.textSize(f.text[0..off]);
-        self.sel_end_r_new = .{ .x = caretX(f, end_off.w), .y = f.y, .w = 1, .h = f.size.h };
+        self.sel_end_r_new = .{ .x = fragCaretX(f, off), .y = f.y, .w = 1, .h = f.size.h };
         self.sel_end_rtl_new = f.rtl;
     }
 
@@ -2380,8 +2414,7 @@ fn emitFragment(self: *TextLayoutWidget, f: Fragment, index: usize) void {
         std.debug.assert(self.selection.cursor >= f.bytes_seen);
         const cursor_offset = self.selection.cursor - f.bytes_seen;
         const text_to_cursor = f.text[0..cursor_offset];
-        const size = if (shaped) |*st| st.measureUpToByteOffset(cw.gpa, cursor_offset) catch f.font.textSize(text_to_cursor) else f.font.textSize(text_to_cursor);
-        self.cursor_rect = Rect{ .x = caretX(f, size.w), .y = f.y, .w = 1, .h = f.size.h };
+        self.cursor_rect = Rect{ .x = fragCaretX(f, cursor_offset), .y = f.y, .w = 1, .h = f.size.h };
 
         self.selMoveText(text_to_cursor, f.bytes_seen);
         self.cursorSeen(); // might alter selection
@@ -2515,7 +2548,7 @@ fn emitFragment(self: *TextLayoutWidget, f: Fragment, index: usize) void {
     if (!self.cursor_seen) {
         // until we see the cursor, record the last position it could be
         // in, could be moving to a new line next iteration
-        self.cursor_rect = Rect{ .x = caretX(f, f.size.w), .y = f.y, .w = 1, .h = f.size.h };
+        self.cursor_rect = Rect{ .x = fragCaretX(f, f.text.len), .y = f.y, .w = 1, .h = f.size.h };
     }
 
     if (f.newline and (self.selection.start == f.bytes_seen + f.text.len)) {
@@ -2530,13 +2563,15 @@ fn emitFragment(self: *TextLayoutWidget, f: Fragment, index: usize) void {
 }
 
 pub fn addTextDone(self: *TextLayoutWidget, opts: Options) void {
-    self.flushLine();
-
     if (self.add_text_done) {
         dvui.log.debug("TextLayoutWidget {x} addTextDone() called multiple times", .{self.data().id});
     }
 
+    // Set before the flush: it tells the last line that no fragment is coming
+    // to claim a caret sitting past its end.
     self.add_text_done = true;
+
+    self.flushLine();
 
     self.checkAscent();
 
@@ -3933,6 +3968,69 @@ test "e2e: a wrapping RTL fragment answers clicks by cluster, not by leading gly
     try std.testing.expectEqual(wrap, fns.sel.cursor);
 }
 
+test "e2e: a wrapped RTL line places its caret on the pen, not on an ink width" {
+    var t = try dvui.testing.init(.{ .window_size = .{ .w = 400, .h = 200 } });
+    defer t.deinit();
+
+    const fns = struct {
+        // Same character-wrapped fragment as above: its shape covers more
+        // bytes than the first line keeps, so that line only has a shape to
+        // place a caret from because addTextEx reshapes its own byte range.
+        const text = "\u{05e9}\u{05dc}\u{05d5}\u{05dd}\u{05e2}\u{05d5}\u{05dc}\u{05dd}\u{05e9}\u{05dc}\u{05d5}\u{05dd}\u{05e2}\u{05d5}\u{05dc}\u{05dd}";
+        var sel: Selection = .{};
+        var caret: Rect = .{};
+        var font: Font = undefined;
+
+        fn frame() !dvui.App.Result {
+            var tl = dvui.textLayout(@src(), .{ .selection = &sel }, .{ .rect = .{ .w = 60, .h = 180 } });
+            font = tl.data().options.fontGet();
+            tl.addText(text, .{});
+            tl.addTextDone(.{});
+            caret = tl.cursor_rect;
+            tl.deinit();
+            return .ok;
+        }
+
+        fn caretAt(byte: usize, affinity: Selection.Affinity) !Rect {
+            sel.cursor = byte;
+            sel.start = byte;
+            sel.end = byte;
+            sel.affinity = affinity;
+            try dvui.testing.settle(frame);
+            return caret;
+        }
+    };
+
+    // Walk the first line a codepoint at a time; the caret leaving its y is
+    // where the line wrapped.
+    var xs: [32]f32 = undefined;
+    var stops: usize = 0;
+    const first = try fns.caretAt(0, .after);
+    var off: usize = 0;
+    while (off < fns.text.len) : (off += 2) {
+        const c = try fns.caretAt(off, .after);
+        if (c.y != first.y) break;
+        xs[stops] = c.x;
+        stops += 1;
+    }
+    const wrap = off;
+    try std.testing.expect(wrap > 0);
+    try std.testing.expect(wrap < fns.text.len);
+
+    // The line's left pen edge: every other caret on it is measured against
+    // this, so the line's origin never enters the comparison.
+    const left = (try fns.caretAt(wrap, .before)).x;
+
+    var ref = (try fns.font.textSizeExShaped(std.testing.allocator, fns.text[0..wrap], .{})).?;
+    defer ref.shaped.deinit();
+
+    for (xs[0..stops], 0..) |x, k| {
+        // An ink-width caret drifts by a different amount at every stop; a
+        // pen one lands on the glyph boundary the renderer drew.
+        try std.testing.expectApproxEqAbs(ref.shaped.caretOffset(k * 2), x - left, 0.5);
+    }
+}
+
 test "base_direction: an RTL base right-aligns a line holding no RTL character" {
     var t = try dvui.testing.init(.{ .window_size = .{ .w = 400, .h = 200 } });
     defer t.deinit();
@@ -4032,4 +4130,24 @@ test "visualStops: fragments meeting inside one run share a caret position" {
 
     try dvui.testing.settle(fns.frame);
     try std.testing.expectEqualSlices(usize, &.{ 0, 1, 2, 3, 4, 5 }, fns.bytes);
+}
+
+
+test "e2e: an RTL line ending in a newline keeps its shape" {
+    var t = try dvui.testing.init(.{ .window_size = .{ .w = 400, .h = 200 } });
+    defer t.deinit();
+
+    const fns = struct {
+        fn frame() !dvui.App.Result {
+            var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal });
+            defer tl.deinit();
+            // Shaping stops at the hard break, so the shape is one byte
+            // shorter than the fragment -- which used to trip emitFragment.
+            tl.addText("\u{05e9}\u{05dc}\u{05d5}\u{05dd}\n\n", .{});
+            tl.addTextDone(.{});
+            return .ok;
+        }
+    };
+
+    try dvui.testing.settle(fns.frame);
 }
