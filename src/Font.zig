@@ -312,6 +312,24 @@ pub const Source = struct {
         .family = array("Vera"),
         .bytes = @embedFile("fonts/bitstream-vera/Vera.ttf"),
     };
+    pub const fallback_serif = Source{
+        .family = array("Vera Serif"),
+        .bytes = @embedFile("fonts/bitstream-vera/VeraSe.ttf"),
+    };
+    pub const fallback_monospace = Source{
+        .family = array("Vera Sans Mono"),
+        .bytes = @embedFile("fonts/bitstream-vera/VeraMono.ttf"),
+    };
+
+    /// Embedded last resort for `family`: a generic keeps its style (serif,
+    /// monospace) even when no system font resolved it.
+    pub fn fallbackFor(family: []const u8) Source {
+        return switch (DiscoveryFamilyName.fromString(family)) {
+            .serif => fallback_serif,
+            .monospace => fallback_monospace,
+            .title, .sans_serif => fallback,
+        };
+    }
 };
 
 const system_font_backend: ?type = blk: {
@@ -324,9 +342,24 @@ const system_font_backend: ?type = blk: {
 
 const system_font_size_limit = 256 * 1024 * 1024; // needed for big emoji fonts (Apple Color Emoji.ttc is ~180MB)
 
-/// The CSS Fonts Level 3 generic family keywords ("serif", "monospace",
-/// ...), usable as a `Font` family anywhere a real family name is -- the
-/// OS backend resolves each to whatever it means on this machine.
+/// The CSS generic family keywords "serif", "sans-serif" and "monospace",
+/// usable as a `Font` family anywhere a real family name is. Each resolves to
+/// the first installed font of a metric-compatible chain
+/// (`opentype.discovery.generic_family_chains`), so text measures and breaks
+/// lines the same on every OS:
+///
+/// | generic    | macOS                 | Windows         | Linux              | Android         |
+/// |------------|-----------------------|-----------------|--------------------|-----------------|
+/// | sans-serif | Arial                 | Arial           | Liberation Sans    | Roboto          |
+/// | serif      | Times New Roman       | Times New Roman | Liberation Serif   | Noto Serif      |
+/// | monospace  | Menlo (iOS: Courier New) | Consolas     | DejaVu Sans Mono   | Droid Sans Mono |
+///
+/// On Linux a missing chain font falls to fontconfig's own alias (Fedora
+/// ships no DejaVu, so monospace there is Noto Sans Mono); with no system
+/// font at all, the embedded Vera Sans / Vera Serif / Vera Sans Mono stand
+/// in. Characters the font lacks fall back per codepoint to the OS's pick
+/// (Linux prefers the Noto families Android ships); `Cache.fallback_language`
+/// decides Chinese vs. Japanese vs. Korean Han glyph shapes.
 pub const generic_families = DiscoveryFamilyName.generic_keywords;
 
 /// Every font family installed on this machine, alphabetically, as reported
@@ -729,6 +762,14 @@ pub const Cache = struct {
     /// missing from every registered family only ever triggers one OS query,
     /// not one per shaped line/frame that contains it.
     dynamic_fallback: std.AutoHashMapUnmanaged(u21, ?Font) = .empty,
+    /// BCP 47 language (e.g. "ja", "zh-Hant") handed to the OS when
+    /// `discoverDynamicFallback` picks a font for a codepoint -- it decides
+    /// whether Han characters get Japanese, Korean, Simplified or
+    /// Traditional Chinese glyph shapes. `null` leaves it to the OS locale
+    /// (Android: the first CJK family in fonts.xml, Simplified Chinese). Set
+    /// it before text is shaped: codepoints already looked up stay memoized
+    /// in `dynamic_fallback`. Not copied; must outlive the `Cache`.
+    fallback_language: ?[]const u8 = null,
     /// Family aliases from `dvui.addFontFamily`: alias -> ordered family
     /// names, most-preferred first. Unbounded in length, unlike the family
     /// name a `Font` itself carries.
@@ -879,7 +920,7 @@ pub const Cache = struct {
             return sys_source;
         } else {
             dvui.log.warn("Font {s} not loaded in dvui, using fallback", .{fname});
-            return Source.fallback;
+            return Source.fallbackFor(font.familyName());
         }
     }
 
@@ -1065,6 +1106,7 @@ pub const Cache = struct {
 
         var backend = SysBackend.init() catch return null;
         defer backend.deinit();
+        if (@hasField(SysBackend, "language")) backend.language = self.fallback_language;
 
         var path_storage: [4096]u8 = undefined;
         const needs_allocator = @typeInfo(@TypeOf(SysBackend.selectFallbackForCodepoint)).@"fn".params.len == 4;
