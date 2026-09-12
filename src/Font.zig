@@ -1607,7 +1607,10 @@ pub const Cache = struct {
             }
             const collection = try opentype.parsing.Collection.parse(gpa, ttf_bytes);
             defer gpa.free(collection.fonts);
-            if (collection_index >= collection.fonts.len) return error.InvalidCollection;
+            if (collection_index >= collection.fonts.len) {
+                for (collection.fonts) |f| f.deinit(gpa);
+                return error.InvalidCollection;
+            }
             for (collection.fonts, 0..) |f, i| {
                 if (i != collection_index) f.deinit(gpa);
             }
