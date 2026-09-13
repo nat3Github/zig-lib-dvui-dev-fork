@@ -755,6 +755,7 @@ const CaretStop = struct {
     byte: usize,
     affinity: Selection.Affinity,
     rtl: bool,
+    frag: usize,
 };
 
 /// Every caret position on the placed line, ordered left to right on screen.
@@ -764,7 +765,7 @@ const CaretStop = struct {
 /// the start. One line, one keypress; measure before caching anything.
 fn visualStops(self: *TextLayoutWidget, arena: std.mem.Allocator) []const CaretStop {
     var stops: std.ArrayList(CaretStop) = .empty;
-    for (self.line_frags.items) |f| {
+    for (self.line_frags.items, 0..) |f, frag| {
         // A trailing hard break is not a caret position of its own: the
         // caret past it belongs to the next line, which this walk can't see.
         const text = f.text[0 .. f.text.len - Font.trailingHardBreakLen(f.text)];
@@ -775,6 +776,7 @@ fn visualStops(self: *TextLayoutWidget, arena: std.mem.Allocator) []const CaretS
                 .byte = f.bytes_seen + off,
                 .affinity = if (off == text.len) .before else .after,
                 .rtl = f.rtl,
+                .frag = frag,
             }) catch break;
             if (off >= text.len) break;
             off = opentype.unicode.nextGraphemeBoundary(text, off);
@@ -819,6 +821,33 @@ fn stopIndex(stops: []const CaretStop, byte: usize, affinity: Selection.Affinity
     return by_byte;
 }
 
+/// The neighbouring stop that sits somewhere else on screen. Where two level
+/// runs meet, two different bytes are drawn at one x (the end of "abc" and
+/// the logical end of the RTL run after it); stepping between them would eat
+/// a keypress that moves nothing. Of the bytes sharing the x it lands on, it
+/// keeps to the fragment it is leaving, so a selection grows by exactly the
+/// text the caret passed over.
+fn nextVisualStop(stops: []const CaretStop, from: usize, right: bool) ?usize {
+    var found: ?usize = null;
+    var i = from;
+    while (true) {
+        if (right) {
+            if (i + 1 >= stops.len) return found;
+            i += 1;
+        } else {
+            if (i == 0) return found;
+            i -= 1;
+        }
+        if (found) |f| {
+            if (@abs(stops[i].x - stops[f].x) >= 0.01) return f;
+            if (stops[i].frag == stops[from].frag) return i;
+        } else if (@abs(stops[i].x - stops[from].x) >= 0.01) {
+            if (stops[i].frag == stops[from].frag) return i;
+            found = i;
+        }
+    }
+}
+
 /// Steps the caret across the placed line in visual order, consuming `clr`'s
 /// count. What is left when the caret reaches the edge of the line is handed
 /// back as a *logical* count -- flipped when that edge belongs to an RTL run,
@@ -831,9 +860,7 @@ fn charVisualMove(self: *TextLayoutWidget, clr: *@FieldType(@TypeOf(self.sel_mov
     var moved = false;
     while (clr.count != 0) {
         const right = clr.count > 0;
-        if (right and idx + 1 >= stops.len) break;
-        if (!right and idx == 0) break;
-        idx = if (right) idx + 1 else idx - 1;
+        idx = nextVisualStop(stops, idx, right) orelse break;
         self.selection.moveCursor(stops[idx].byte, clr.select);
         self.selection.affinity = stops[idx].affinity;
         clr.count -= if (right) 1 else -1;
@@ -847,8 +874,23 @@ fn charVisualMove(self: *TextLayoutWidget, clr: *@FieldType(@TypeOf(self.sel_mov
         clr.count = 0;
         self.scroll_to_cursor_next_frame = true;
         dvui.refresh(null, @src(), self.data().id);
-    } else if (stops[idx].rtl) {
-        clr.count = -clr.count;
+    } else {
+        var line_first: usize = std.math.maxInt(usize);
+        var line_last: usize = 0;
+        for (self.line_frags.items) |f| {
+            line_first = @min(line_first, f.bytes_seen);
+            line_last = @max(line_last, f.bytes_seen + f.text.len - Font.trailingHardBreakLen(f.text));
+        }
+        const edge = stops[idx].byte;
+        if (edge != line_first and edge != line_last) {
+            // ponytail: the edge of a mixed-direction line can sit mid-text
+            // ("abc مرحبا" ends visually at the Arabic's first byte), where
+            // a logical step would jump back into this line; stop instead.
+            // Continuing onto the next line from there needs the next line.
+            clr.count = 0;
+        } else if (stops[idx].rtl) {
+            clr.count = -clr.count;
+        }
     }
 }
 
@@ -1653,7 +1695,7 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
         // byte-range on its own and is therefore visually correct -- and
         // retreat over-wide lines to a fitting break below.
         var line_is_mixed = false;
-        if (font.textSizeExShaped(cw.gpa, txt, .{
+        if (font.textSizeExShaped(cw.gpa, cw.arena(), txt, .{
             .max_width = if (self.break_lines) width else null,
             .end_idx = &end,
             .ascent_out = &ascent,
@@ -1821,7 +1863,7 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
             // widths, which is not where the pen is (see `fragCaretX`).
             if (st.line.isRtl() and st.line.byte_offsets[st.line.codepoints.len] != shapeableLen(txt[0..end])) {
                 shaped = null;
-                if (font.textSizeExShaped(cw.gpa, txt, .{
+                if (font.textSizeExShaped(cw.gpa, cw.arena(), txt, .{
                     .item = .{ .start = 0, .end = end },
                     .base_direction = self.baseDir(),
                 }) catch null) |res| {
@@ -2011,7 +2053,7 @@ fn reshapeWithNeighbourContext(frags: []Fragment, base_direction: opentype.unico
         if (lead.len == 0 and trail.len == 0) continue;
 
         const ctx = std.mem.concat(arena, u8, &.{ lead, f.text, trail }) catch continue;
-        const res = f.font.textSizeExShaped(cw.gpa, ctx, .{
+        const res = f.font.textSizeExShaped(cw.gpa, cw.arena(), ctx, .{
             .item = .{ .start = lead.len, .end = lead.len + f.text.len },
             .base_direction = base_direction,
         }) catch continue orelse continue;
@@ -2061,7 +2103,7 @@ fn reorderLineVisual(self: *TextLayoutWidget) void {
             // both halves can slice it by byte offset.
             f.shaped = null;
             f.render_shaped = null;
-            if (src.font.textSizeExShaped(cw.gpa, src.text, .{
+            if (src.font.textSizeExShaped(cw.gpa, cw.arena(), src.text, .{
                 .item = .{ .start = p.start, .end = p.end },
                 .base_direction = base_direction,
             }) catch null) |res| {
@@ -3235,7 +3277,7 @@ test "reshapeWithNeighbourContext: a word split across chunks joins across the s
     try std.testing.expectEqual(@as(f32, 7), frags[0].x);
     try std.testing.expectEqual(frags[0].x + frags[0].size.w, frags[1].x);
 
-    var alone = (try font.textSizeExShaped(gpa, frags[0].text, .{})).?;
+    var alone = (try font.textSizeExShaped(dvui.currentWindow().gpa, gpa, frags[0].text, .{})).?;
     defer alone.shaped.deinit();
     // Nothing in the stack covers Arabic on this platform (every glyph is
     // .notdef): the plumbing above is all there is to check here.
@@ -3876,7 +3918,7 @@ test "e2e: a wrapped RTL line places its caret on the pen, not on an ink width" 
     // this, so the line's origin never enters the comparison.
     const left = (try fns.caretAt(wrap, .before)).x;
 
-    var ref = (try fns.font.textSizeExShaped(std.testing.allocator, fns.text[0..wrap], .{})).?;
+    var ref = (try fns.font.textSizeExShaped(dvui.currentWindow().gpa, std.testing.allocator, fns.text[0..wrap], .{})).?;
     defer ref.shaped.deinit();
 
     for (xs[0..stops], 0..) |x, k| {

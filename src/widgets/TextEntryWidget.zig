@@ -1644,14 +1644,41 @@ test "mixed-direction text: the caret walks the line in visual order" {
     try TestEntry.focus();
 
     // "abc" | Hebrew | "xyz": bytes 0..3, 3..11, 11..14; the Hebrew run is
-    // drawn reversed, so its logical end (11) is its leftmost caret stop.
+    // drawn reversed, so its logical end (11) is its leftmost caret stop --
+    // at the same x as byte 3, which a step must skip rather than stall on.
     try TestEntry.load("abc\u{05e9}\u{05dc}\u{05d5}\u{05dd}xyz");
     for (0..3) |_| try TestEntry.press(.right);
     try std.testing.expectEqual(@as(usize, 3), TestEntry.cursor);
     try TestEntry.press(.right);
-    try std.testing.expectEqual(@as(usize, 11), TestEntry.cursor);
-    try TestEntry.press(.right);
     try std.testing.expectEqual(@as(usize, 9), TestEntry.cursor);
+    try TestEntry.press(.left);
+    try std.testing.expectEqual(@as(usize, 11), TestEntry.cursor);
+    try TestEntry.press(.left);
+    try std.testing.expectEqual(@as(usize, 2), TestEntry.cursor);
+}
+
+test "mixed-direction text: digits inside an RTL run" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    try TestEntry.focus();
+
+    // "a" | Hebrew+space | "12": bytes 0..1, 1..6, 6..8, drawn "a 12 ␣לש".
+    // The x between "2" and the space is byte 8 of the digits and byte 6,
+    // the logical end of the RTL run.
+    try TestEntry.load("a\u{05e9}\u{05dc} 12");
+    const expected_right = [_]usize{ 1, 7, 8, 5, 3, 1, 1 };
+    for (expected_right) |byte| {
+        try TestEntry.press(.right);
+        try std.testing.expectEqual(byte, TestEntry.cursor);
+    }
+    for (0..2) |_| try TestEntry.press(.left);
+    try std.testing.expectEqual(@as(usize, 5), TestEntry.cursor);
+    // Leaving the RTL run over the space lands on the RTL run's byte 6,
+    // not the digits' byte 8 drawn at the same x.
+    try TestEntry.press(.left);
+    try std.testing.expectEqual(@as(usize, 6), TestEntry.cursor);
+    try TestEntry.press(.left);
+    try std.testing.expectEqual(@as(usize, 7), TestEntry.cursor);
 }
 
 test "right-to-left text: Left at the end of the text stays put" {

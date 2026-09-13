@@ -265,11 +265,13 @@ pub fn fetchFallbackFont(font: u16, url: []const u8) void {
 fn dvui_font_fallback_loaded(font: u32, ptr: [*]u8, len: usize) callconv(.c) void {
     const bytes = ptr[0..len];
     if (!win_ok) return gpa.free(bytes);
-    win.fonts.webFallbackLoaded(gpa, @intCast(font), bytes);
+    const index = std.math.cast(u16, font) orelse return gpa.free(bytes);
+    win.fonts.webFallbackLoaded(gpa, index, bytes);
 }
 
 fn dvui_font_fallback_failed(font: u32) callconv(.c) void {
-    if (win_ok) win.fonts.webFallbackFailed(gpa, @intCast(font));
+    const index = std.math.cast(u16, font) orelse return;
+    if (win_ok) win.fonts.webFallbackFailed(gpa, index);
 }
 
 comptime {

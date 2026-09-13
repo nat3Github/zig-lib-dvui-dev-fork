@@ -590,7 +590,9 @@ pub fn frameTimeNS() i128 {
 /// If ttf_bytes_allocator is not null, it will be used to free `ttf_bytes` in
 /// `Window.deinit`.
 ///
-/// Only valid between `Window.begin`and `Window.end`.
+/// Only valid between `Window.begin`and `Window.end`: the font is validated by
+/// rendering a probe glyph, which needs the current window. Calling it before
+/// the first `begin` panics.
 pub fn addFont(name: []const u8, ttf_bytes: []const u8, ttf_bytes_allocator: ?std.mem.Allocator) (std.mem.Allocator.Error || FontError)!void {
     try currentWindow().addFont(name, ttf_bytes, ttf_bytes_allocator);
 }
@@ -599,6 +601,10 @@ pub fn addFont(name: []const u8, ttf_bytes: []const u8, ttf_bytes_allocator: ?st
 /// a `Font` family anywhere a real family name is: the first family covering
 /// a codepoint renders it. Name one family per script you care about (Latin,
 /// Arabic, CJK, ...) instead of relying on OS fallback.
+///
+/// A family in the list may itself be an alias, registered before or after
+/// this one; nested aliases expand in place, up to `Font.Cache.max_alias_depth`
+/// levels deep (deeper nesting, e.g. a cycle, is cut off with a warning).
 ///
 /// Only affects text shaped after this call, so register at startup.
 ///

@@ -437,20 +437,27 @@ pub fn stateSet(self: *Self, state: dvui.enums.WindowState) void {
     self.backend.windowStateSet(self, state);
 }
 
+/// Only valid between `Window.begin` and `Window.end`: validating the font
+/// renders a probe glyph with the current window's scratch allocator.
 pub fn addFont(self: *Self, name: []const u8, ttf_bytes: []const u8, ttf_bytes_allocator: ?std.mem.Allocator) (std.mem.Allocator.Error || dvui.Font.Error)!void {
     try self.fonts.database.ensureUnusedCapacity(self.gpa, 1);
     // TODO: try to get this info from the ttf file, and also add override options
     const font: dvui.Font = .find(.{ .family = name });
     // Test if we can successfully open this font
     // TODO: Find some more elegant way of validating ttf files
-    const entry = try dvui.Font.Cache.Entry.init(self.gpa, ttf_bytes, 0, font);
-    // Try and cache the entry since the work is already done
-    const boxed = try self.gpa.create(dvui.Font.Cache.Entry);
-    boxed.* = entry;
-    self.fonts.cache.put(self.gpa, font.hash(), boxed) catch {
-        boxed.deinit(self.gpa, self.backend);
-        self.gpa.destroy(boxed);
-    };
+    var entry = try dvui.Font.Cache.Entry.init(self.gpa, ttf_bytes, 0, font);
+    // Try and cache the entry since the work is already done. An already
+    // cached entry is kept: text shaped earlier this frame may still point at it.
+    const slot = self.fonts.cache.getOrPut(self.gpa, font.hash()) catch null;
+    if (slot == null or slot.?.found_existing) {
+        entry.deinit(self.gpa, self.backend);
+    } else if (self.gpa.create(dvui.Font.Cache.Entry)) |boxed| {
+        boxed.* = entry;
+        slot.?.value_ptr.* = boxed;
+    } else |_| {
+        self.fonts.cache.map.removeByPtr(slot.?.key_ptr);
+        entry.deinit(self.gpa, self.backend);
+    }
     self.fonts.database.appendAssumeCapacity(.{
         .family = dvui.Font.array(name),
         .bytes = ttf_bytes,

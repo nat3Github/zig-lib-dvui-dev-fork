@@ -557,7 +557,7 @@ pub fn textSizeEx(self: Font, text: []const u8, opts: TextSizeOptions) Size {
     }
 
     const cw = dvui.currentWindow();
-    var result = self.textSizeExShaped(cw.gpa, text, opts) catch return .{ .w = 10, .h = 10 };
+    var result = self.textSizeExShaped(cw.gpa, cw.arena(), text, opts) catch return .{ .w = 10, .h = 10 };
     if (result) |*r| {
         defer r.shaped.deinit();
         return r.size;
@@ -578,17 +578,17 @@ pub const ShapedText = struct {
         self.line.deinit();
     }
 
-    pub fn measureUpToByteOffset(self: *ShapedText, gpa: std.mem.Allocator, byte_offset: usize) std.mem.Allocator.Error!Size {
+    pub fn measureUpToByteOffset(self: *ShapedText, state_gpa: std.mem.Allocator, byte_offset: usize) std.mem.Allocator.Error!Size {
         const snap = if (dvui.current_window) |cw| cw.snap_to_pixels else true;
-        const s = try self.fallback.measureLogicalPrefix(gpa, &self.line, byte_offset, snap);
+        const s = try self.fallback.measureLogicalPrefix(state_gpa, &self.line, byte_offset, snap);
         return s.scale(1.0 / self.ss, Size);
     }
 
     /// Inverse of `measureUpToByteOffset`: which byte a caret dragged `width`
     /// along the run's logical direction lands on.
-    pub fn byteOffsetForWidth(self: *ShapedText, gpa: std.mem.Allocator, width: f32, end_metric: Font.EndMetric) std.mem.Allocator.Error!usize {
+    pub fn byteOffsetForWidth(self: *ShapedText, state_gpa: std.mem.Allocator, width: f32, end_metric: Font.EndMetric) std.mem.Allocator.Error!usize {
         const snap = if (dvui.current_window) |cw| cw.snap_to_pixels else true;
-        const fit = try self.fallback.logicalPrefixForWidth(gpa, &self.line, width * self.ss, end_metric, snap);
+        const fit = try self.fallback.logicalPrefixForWidth(state_gpa, &self.line, width * self.ss, end_metric, snap);
         return fit.byte;
     }
 
@@ -607,7 +607,7 @@ pub const ShapedText = struct {
     }
 };
 
-pub fn textSizeExShaped(self: Font, gpa: std.mem.Allocator, text: []const u8, opts: TextSizeOptions) std.mem.Allocator.Error!?struct { size: Size, shaped: ShapedText } {
+pub fn textSizeExShaped(self: Font, state_gpa: std.mem.Allocator, output: std.mem.Allocator, text: []const u8, opts: TextSizeOptions) std.mem.Allocator.Error!?struct { size: Size, shaped: ShapedText } {
     const ss = dvui.parentGet().screenRectScale(Rect{}).s;
     const ask_size = self.size * ss;
 
@@ -620,20 +620,23 @@ pub fn textSizeExShaped(self: Font, gpa: std.mem.Allocator, text: []const u8, op
 
     const sized_font = self.withSize(ask_size);
     const cw = dvui.currentWindow();
-    const resolved = cw.fonts.resolveStack(cw.gpa, sized_font) catch return null;
+    const resolved = cw.fonts.resolveStack(state_gpa, sized_font) catch return null;
 
     var options = opts;
     if (opts.max_width) |mwidth| {
         options.max_width = mwidth * ss;
     }
 
-    const result = try cw.fonts.textSizeRawShaped(cw.arena(), gpa, resolved, text, options);
+    var result = try cw.fonts.textSizeRawShaped(output, state_gpa, resolved, text, options);
 
     // Fetched after textSizeRawShaped, not before: it shapes text via
     // shapeLineText, which can insert into self.cache while lazily
     // materializing fallback-family entries -- that can grow/rehash the map
     // and invalidate any *Entry captured beforehand.
-    const fallback_entry = cw.fonts.stackEntry(resolved, 0) orelse return null;
+    const fallback_entry = cw.fonts.stackEntry(resolved, 0) orelse {
+        result.line.deinit();
+        return null;
+    };
 
     var ascent = fallback_entry.ascent;
     if (self.line_height_factor < 1.0) {
@@ -658,7 +661,9 @@ pub const Cache = struct {
     /// frame.
     cache: dvui.TrackingAutoHashMap(u64, *Entry, .get_and_put, void) = .empty,
     /// Stack-level coverage cache; separate from per-entry cache so reset doesn't evict it.
-    resolved_stacks: dvui.TrackingAutoHashMap(u64, ResolvedStack, .get_and_put, void) = .empty,
+    /// Boxed for the same reason as `cache`: a `*ResolvedStack` stays valid
+    /// across later inserts (e.g. resolving a nested alias mid-build).
+    resolved_stacks: dvui.TrackingAutoHashMap(u64, *ResolvedStack, .get_and_put, void) = .empty,
     /// Full-pipeline shape results, keyed by fnv(ResolvedStack.font_hash, text) --
     /// otherwise every unchanged widget (grid cells, static labels) reruns bidi +
     /// GSUB/GPOS from scratch every single frame. Segments hold `*Entry` pointers
@@ -700,7 +705,8 @@ pub const Cache = struct {
 
         var sit = self.resolved_stacks.iterator();
         while (sit.next()) |item| {
-            item.value_ptr.deinit(gpa);
+            item.value_ptr.*.deinit(gpa);
+            gpa.destroy(item.value_ptr.*);
         }
         self.resolved_stacks.deinit(gpa);
 
@@ -728,6 +734,10 @@ pub const Cache = struct {
     }
 
     /// Register `alias` as an ordered fallback stack of family names.
+    /// A name in the list may itself be an alias; nesting is expanded when a
+    /// stack is resolved, so registration order doesn't matter. Nesting
+    /// deeper than `max_alias_depth` is cut off with a warning (so cycles
+    /// terminate), and a family reached twice keeps its first position.
     /// Re-registering an alias replaces its list; only stacks resolved after
     /// this call see the change, so register up front.
     pub fn addFamily(self: *Cache, gpa: std.mem.Allocator, alias: []const u8, names: []const []const u8) std.mem.Allocator.Error!void {
@@ -816,24 +826,32 @@ pub const Cache = struct {
     /// variant match, OS discovery, or the embedded fallback -- in that
     /// order. Shared by `getOrCreate` (full calibrated `Entry`) and
     /// `resolveStack` (cheap parse-only probe for fallback-stack coverage).
-    fn resolveSource(self: *Cache, gpa: std.mem.Allocator, raw_font: Font) std.mem.Allocator.Error!Source {
+    fn resolveSource(self: *Cache, state_gpa: std.mem.Allocator, raw_font: Font) std.mem.Allocator.Error!Source {
         // An alias names no font of its own; on its own (outside resolveStack)
         // it resolves to its first family.
-        const font = if (self.family_aliases.get(raw_font.familyName())) |list| list[0].apply(raw_font) else raw_font;
+        var font = raw_font;
+        var depth: u8 = 0;
+        while (depth < max_alias_depth) : (depth += 1) {
+            const list = self.family_aliases.get(font.familyName()) orelse break;
+            font = list[0].apply(font);
+        }
         const exact, const second = self.findSource(font);
         if (exact) |s| return s;
 
-        const fname = font.name(gpa);
-        defer gpa.free(fname);
+        const fname = font.name(state_gpa);
+        defer state_gpa.free(fname);
 
         if (second) |s| {
-            const sname = s.name(gpa);
-            defer gpa.free(sname);
+            const sname = s.name(state_gpa);
+            defer state_gpa.free(sname);
             dvui.log.warn("Font {s} not loaded in dvui, using second best {s}", .{ fname, sname });
             return s;
-        } else if (discoverSystemFont(gpa, font)) |sys_source| {
+        } else if (discoverSystemFont(state_gpa, font)) |sys_source| {
             dvui.log.debug("Font {s} resolved via OS font discovery", .{fname});
-            try self.database.append(gpa, sys_source);
+            self.database.append(state_gpa, sys_source) catch |err| {
+                state_gpa.free(sys_source.bytes);
+                return err;
+            };
             return sys_source;
         } else {
             dvui.log.warn("Font {s} not loaded in dvui, using fallback", .{fname});
@@ -841,29 +859,26 @@ pub const Cache = struct {
         }
     }
 
-    pub fn getOrCreate(self: *Cache, gpa: std.mem.Allocator, font: Font) std.mem.Allocator.Error!*Entry {
-        const entry = try self.cache.getOrPut(gpa, font.hash());
+    pub fn getOrCreate(self: *Cache, state_gpa: std.mem.Allocator, font: Font) std.mem.Allocator.Error!*Entry {
+        const entry = try self.cache.getOrPut(state_gpa, font.hash());
         if (entry.found_existing) return entry.value_ptr.*;
+        errdefer self.cache.map.removeByPtr(entry.key_ptr);
 
-        const fname = font.name(gpa);
-        defer gpa.free(fname);
+        const fname = font.name(state_gpa);
+        defer state_gpa.free(fname);
 
-        const source = try self.resolveSource(gpa, font);
+        const source = try self.resolveSource(state_gpa, font);
 
         //log.debug("FontCacheGet creating font hash {x} ptr {*} size {d} name \"{s}\"", .{ fontHash, bytes.ptr, font.size, font.name });
 
-        const boxed = try gpa.create(Entry);
-        errdefer gpa.destroy(boxed);
-        boxed.* = Entry.init(gpa, source.bytes, source.collection_index, font) catch |err| blk: {
+        const boxed = try state_gpa.create(Entry);
+        errdefer state_gpa.destroy(boxed);
+        boxed.* = Entry.init(state_gpa, source.bytes, source.collection_index, font) catch |err| blk: {
             dvui.log.err("Font {s} init got {any}, using fallback", .{ fname, err });
             // Fallback bytes under the *requested* hash, not the fallback
             // font's: callers (resolveStack/stackEntry) look this entry up by
             // the hash they asked for, and would find nothing otherwise.
-            break :blk Entry.init(gpa, Source.fallback.bytes, Source.fallback.collection_index, font) catch {
-                self.cache.map.removeByPtr(entry.key_ptr);
-                gpa.destroy(boxed);
-                return error.OutOfMemory;
-            };
+            break :blk Entry.init(state_gpa, Source.fallback.bytes, Source.fallback.collection_index, font) catch return error.OutOfMemory;
         };
         entry.value_ptr.* = boxed;
         //log.debug("- size {d} ascent {d} height {d}", .{ font.size, entry.ascent, entry.height });
@@ -911,65 +926,106 @@ pub const Cache = struct {
         }
     };
 
+    pub const max_alias_depth = 8;
+    /// `Cmap.FallbackStack` indexes stack entries with a u8.
+    pub const max_stack_families = 64;
+
+    const FlattenedAliasStack = struct {
+        fonts: [max_stack_families]Font = undefined,
+        len: u8 = 0,
+        hit_depth_limit: bool = false,
+
+        fn slice(self: *const FlattenedAliasStack) []const Font {
+            return self.fonts[0..self.len];
+        }
+    };
+
+    fn flattenAliasStack(self: *const Cache, flattened: *FlattenedAliasStack, font: Font, depth: u8) void {
+        const list = self.family_aliases.get(font.familyName()) orelse {
+            if (flattened.len == max_stack_families) return;
+            const font_hash = font.hash();
+            for (flattened.slice()) |existing| if (existing.hash() == font_hash) return;
+            flattened.fonts[flattened.len] = font;
+            flattened.len += 1;
+            return;
+        };
+        if (depth == max_alias_depth) {
+            if (!flattened.hit_depth_limit) dvui.log.warn("Font family alias {s} nested deeper than {d} (cycle?), ignoring the rest", .{ font.familyName(), max_alias_depth });
+            flattened.hit_depth_limit = true;
+            return;
+        }
+        for (list) |entry| self.flattenAliasStack(flattened, entry.apply(font), depth + 1);
+    }
+
     /// Load families and cache merged coverage per stack. Only the primary
     /// family (index 0) gets a full calibrated `Entry` here -- fallback
     /// families are parsed just enough to read their cmap coverage; a full
     /// `Entry` (Renderer + ppem calibration) for them is only built lazily
     /// in `shapeLineText`, the first time some shaped text actually needs
     /// glyphs from that family.
-    pub fn resolveStack(self: *Cache, gpa: std.mem.Allocator, font: Font) std.mem.Allocator.Error!*ResolvedStack {
+    pub fn resolveStack(self: *Cache, state_gpa: std.mem.Allocator, font: Font) std.mem.Allocator.Error!*ResolvedStack {
         const h = font.hash();
-        const found = try self.resolved_stacks.getOrPut(gpa, h);
-        if (found.found_existing) {
+        if (self.resolved_stacks.get(h)) |existing| {
             // Re-touch the primary family to recreate it if evicted by reset;
             // fallback families re-materialize lazily on next use.
-            _ = try self.getOrCreate(gpa, found.value_ptr.family_fonts[0]);
-            return found.value_ptr;
+            _ = try self.getOrCreate(state_gpa, existing.family_fonts[0]);
+            return existing;
         }
 
-        const single: [1]FamilyEntry = .{.{ .family = font.family }};
-        const names: []const FamilyEntry = self.family_aliases.get(font.familyName()) orelse &single;
+        var flattened: FlattenedAliasStack = .{};
+        self.flattenAliasStack(&flattened, font, 0);
+        // A pure cycle yields no concrete family; resolveSource then falls back.
+        if (flattened.len == 0) {
+            flattened.fonts[0] = font;
+            flattened.len = 1;
+        }
+        const names = flattened.slice();
 
-        const entry_hashes = try gpa.alloc(u64, names.len);
-        errdefer gpa.free(entry_hashes);
-        const family_fonts = try gpa.alloc(Font, names.len);
-        errdefer gpa.free(family_fonts);
-        const raw_fonts = try gpa.alloc(OtFont, names.len);
-        errdefer gpa.free(raw_fonts);
-        const per_entry_ranges = try gpa.alloc([]Cmap.Range, names.len);
-        defer gpa.free(per_entry_ranges);
+        const entry_hashes = try state_gpa.alloc(u64, names.len);
+        errdefer state_gpa.free(entry_hashes);
+        const family_fonts = try state_gpa.alloc(Font, names.len);
+        errdefer state_gpa.free(family_fonts);
+        const raw_fonts = try state_gpa.alloc(OtFont, names.len);
+        errdefer state_gpa.free(raw_fonts);
+        const per_entry_ranges = try state_gpa.alloc([]Cmap.Range, names.len);
+        defer state_gpa.free(per_entry_ranges);
 
+        var ranges_count: usize = 0;
+        defer for (per_entry_ranges[0..ranges_count]) |r| state_gpa.free(r);
         var count: usize = 0;
-        errdefer {
-            for (per_entry_ranges[0..count]) |r| gpa.free(r);
-            for (raw_fonts[0..count]) |*rf| rf.deinit(gpa);
-        }
+        errdefer for (raw_fonts[0..count]) |*rf| rf.deinit(state_gpa);
 
-        for (names) |family| {
-            const family_font = family.apply(font);
+        for (names) |family_font| {
             family_fonts[count] = family_font;
             entry_hashes[count] = family_font.hash();
 
-            const source = try self.resolveSource(gpa, family_font);
-            raw_fonts[count] = Entry.parseFontOrCollection(gpa, source.bytes, source.collection_index) catch |err| switch (err) {
+            const source = try self.resolveSource(state_gpa, family_font);
+            raw_fonts[count] = Entry.parseFontOrCollection(state_gpa, source.bytes, source.collection_index) catch |err| switch (err) {
                 error.OutOfMemory => |e| return e,
-                else => Entry.parseFontOrCollection(gpa, Source.fallback.bytes, Source.fallback.collection_index) catch |e2| switch (e2) {
+                else => Entry.parseFontOrCollection(state_gpa, Source.fallback.bytes, Source.fallback.collection_index) catch |e2| switch (e2) {
                     error.OutOfMemory => |e| return e,
                     else => unreachable, // embedded Vera.ttf is a known-good sfnt
                 },
             };
 
-            if (count == 0) _ = try self.getOrCreate(gpa, family_font); // primary family is virtually always needed
-
-            const cmap_data = raw_fonts[count].tableData(.{ 'c', 'm', 'a', 'p' }) orelse &.{};
-            per_entry_ranges[count] = try Cmap.coverageRanges(cmap_data, gpa);
             count += 1;
-        }
-        defer for (per_entry_ranges) |r| gpa.free(r);
 
-        const fallback = try Cmap.FallbackStack.build(gpa, per_entry_ranges);
-        found.value_ptr.* = .{ .font_hash = h, .entry_hashes = entry_hashes, .family_fonts = family_fonts, .raw_fonts = raw_fonts, .fallback = fallback };
-        return found.value_ptr;
+            if (count == 1) _ = try self.getOrCreate(state_gpa, family_font); // primary family is virtually always needed
+
+            const cmap_data = raw_fonts[count - 1].tableData(.{ 'c', 'm', 'a', 'p' }) orelse &.{};
+            per_entry_ranges[ranges_count] = try Cmap.coverageRanges(cmap_data, state_gpa);
+            ranges_count += 1;
+        }
+
+        var fallback = try Cmap.FallbackStack.build(state_gpa, per_entry_ranges);
+        errdefer fallback.deinit(state_gpa);
+        const boxed = try state_gpa.create(ResolvedStack);
+        errdefer state_gpa.destroy(boxed);
+        boxed.* = .{ .font_hash = h, .entry_hashes = entry_hashes, .family_fonts = family_fonts, .raw_fonts = raw_fonts, .fallback = fallback };
+        // Inserted only now, so a nested resolveStack during the build above
+        // can't leave a half-built or stale slot behind.
+        try self.resolved_stacks.put(state_gpa, h, boxed);
+        return boxed;
     }
 
     /// Entry at stack index; null if evicted by reset.
@@ -991,18 +1047,18 @@ pub const Cache = struct {
     /// Backends without a `selectFallbackForCodepoint` (e.g. the manifest
     /// source) just return null here, same as "OS discovery found nothing".
     ///
-    /// `persist_gpa` (not a frame arena): both `dynamic_fallback` (this
+    /// `state_gpa` (not a frame arena): both `dynamic_fallback` (this
     /// function's own memo) and `database`/the loaded font bytes (inside
     /// `loadDynamicFallback`) live in `Cache`, which outlives the frame --
     /// growing them with an arena that resets after this frame leaves their
     /// backing storage dangling, corrupting the heap the next time anything
     /// touches them (a later frame's `dynamic_fallback.get`, or the byte
     /// buffer's owning-allocator free in `Cache.deinit`).
-    pub fn discoverDynamicFallback(self: *Cache, persist_gpa: std.mem.Allocator, codepoint: u21) ?Font {
+    pub fn discoverDynamicFallback(self: *Cache, state_gpa: std.mem.Allocator, codepoint: u21) ?Font {
         if (system_font_backend == null) return null;
         if (self.dynamic_fallback.get(codepoint)) |cached| return cached;
-        const found = self.loadDynamicFallback(persist_gpa, codepoint);
-        self.dynamic_fallback.put(persist_gpa, codepoint, found) catch {};
+        const found = self.loadDynamicFallback(state_gpa, codepoint);
+        self.dynamic_fallback.put(state_gpa, codepoint, found) catch {};
         return found;
     }
 
@@ -1018,7 +1074,7 @@ pub const Cache = struct {
         return array(found);
     }
 
-    fn loadDynamicFallback(self: *Cache, persist_gpa: std.mem.Allocator, codepoint: u21) ?Font {
+    fn loadDynamicFallback(self: *Cache, state_gpa: std.mem.Allocator, codepoint: u21) ?Font {
         const SysBackend = system_font_backend orelse return null;
         if (!@hasDecl(SysBackend, "selectFallbackForCodepoint")) return null;
 
@@ -1029,7 +1085,7 @@ pub const Cache = struct {
         var path_storage: [4096]u8 = undefined;
         const needs_allocator = @typeInfo(@TypeOf(SysBackend.selectFallbackForCodepoint)).@"fn".params.len == 4;
         const handle: DiscoveryHandle = if (needs_allocator)
-            backend.selectFallbackForCodepoint(codepoint, &path_storage, persist_gpa) catch return null
+            backend.selectFallbackForCodepoint(codepoint, &path_storage, state_gpa) catch return null
         else
             backend.selectFallbackForCodepoint(codepoint, &path_storage) catch return null;
 
@@ -1052,15 +1108,15 @@ pub const Cache = struct {
 
         if (self.findSource(synthetic).@"0" != null) return synthetic; // already loaded
 
-        const bytes = std.Io.Dir.cwd().readFileAlloc(dvui.io, p.path, persist_gpa, .limited(system_font_size_limit)) catch return null;
-        self.database.append(persist_gpa, .{
+        const bytes = std.Io.Dir.cwd().readFileAlloc(dvui.io, p.path, state_gpa, .limited(system_font_size_limit)) catch return null;
+        self.database.append(state_gpa, .{
             .family = array(family_name),
             .bytes = bytes,
-            .allocator = persist_gpa,
+            .allocator = state_gpa,
             .collection_index = p.font_index,
-            .display_family = readDisplayFamilyName(persist_gpa, bytes, p.font_index),
+            .display_family = readDisplayFamilyName(state_gpa, bytes, p.font_index),
         }) catch {
-            persist_gpa.free(bytes);
+            state_gpa.free(bytes);
             return null;
         };
         return synthetic;
@@ -1069,11 +1125,11 @@ pub const Cache = struct {
     /// Web counterpart to `discoverDynamicFallback`: a registered web fallback
     /// font covering `codepoint`, else queues it for `processWebFallback` and
     /// returns null (tofu until the font arrives).
-    fn webFallbackFont(self: *Cache, persist_gpa: std.mem.Allocator, codepoint: u21) ?Font {
+    fn webFallbackFont(self: *Cache, state_gpa: std.mem.Allocator, codepoint: u21) ?Font {
         if (!web_fallback_enabled) return null;
         const service = if (self.web_fallback) |*s| s else return null;
         if (service.registeredFontFor(codepoint)) |font| return webFallbackFamily(font);
-        service.addMissingCodepoint(persist_gpa, codepoint) catch {};
+        service.addMissingCodepoint(state_gpa, codepoint) catch {};
         return null;
     }
 
@@ -1108,6 +1164,7 @@ pub const Cache = struct {
     pub fn webFallbackLoaded(self: *Cache, gpa: std.mem.Allocator, font: u16, bytes: []u8) void {
         if (!web_fallback_enabled) return gpa.free(bytes);
         const service = if (self.web_fallback) |*s| s else return gpa.free(bytes);
+        if (!isKnownWebFallbackFont(service, font)) return gpa.free(bytes);
         const parsed = Entry.parseFontOrCollection(gpa, bytes, 0) catch {
             gpa.free(bytes);
             return service.fontFailed(gpa, font);
@@ -1137,14 +1194,20 @@ pub const Cache = struct {
 
     pub fn webFallbackFailed(self: *Cache, gpa: std.mem.Allocator, font: u16) void {
         if (!web_fallback_enabled) return;
-        if (self.web_fallback) |*service| service.fontFailed(gpa, font);
+        const service = if (self.web_fallback) |*s| s else return;
+        if (isKnownWebFallbackFont(service, font)) service.fontFailed(gpa, font);
+    }
+
+    // The index round-trips through JS; a stray reply must not index out of bounds.
+    fn isKnownWebFallbackFont(service: *const WebFallback, font: u16) bool {
+        return service.tables != null and font < service.set.fonts.len;
     }
 
     /// Shape text up to first newline, splitting runs by font stack coverage.
-    /// `persist_gpa` backs only `resolved.logged_missing`, which outlives the
-    /// frame (cached in `resolved_stacks`) -- passing a per-frame arena there
-    /// corrupts the map once the arena resets on the next frame.
-    pub fn shapeLineText(self: *Cache, gpa: std.mem.Allocator, persist_gpa: std.mem.Allocator, resolved: *ResolvedStack, text: []const u8, item: ?Font.ShapeItem, base_direction: opentype.unicode.Bidi.ParagraphDirection) std.mem.Allocator.Error!Entry.ShapedLine {
+    /// The returned line (and per-call temporaries) come from `output`;
+    /// `state_gpa` backs everything the cache keeps, so it must be the
+    /// allocator later passed to `Cache.deinit`, never a frame arena.
+    pub fn shapeLineText(self: *Cache, output: std.mem.Allocator, state_gpa: std.mem.Allocator, resolved: *ResolvedStack, text: []const u8, item: ?Font.ShapeItem, base_direction: opentype.unicode.Bidi.ParagraphDirection) std.mem.Allocator.Error!Entry.ShapedLine {
         var key_hash = dvui.fnv.init();
         key_hash.update(std.mem.asBytes(&resolved.font_hash));
         key_hash.update(text);
@@ -1152,7 +1215,7 @@ pub const Cache = struct {
         key_hash.update(std.mem.asBytes(&base_direction));
         const cache_key = key_hash.final();
         if (self.shaped_line_cache.get(cache_key)) |cached| {
-            if (try self.materializeShapedLine(gpa, cached)) |line| return line;
+            if (try self.materializeShapedLine(output, cached)) |line| return line;
             // A segment's font was evicted from `cache` (unused since the
             // last reset -- e.g. scrolled out of view) since this line was
             // cached: the cached line is now unrenderable as-is, so drop it
@@ -1160,15 +1223,15 @@ pub const Cache = struct {
             // rendering with missing segments.
             if (self.shaped_line_cache.fetchRemove(cache_key)) |kv| {
                 var v = kv.value;
-                v.deinit(persist_gpa);
+                v.deinit(state_gpa);
             }
         }
 
-        const decoded = try Entry.decodeLine(gpa, text);
+        const decoded = try Entry.decodeLine(output, text);
         var line_codepoints = decoded.codepoints;
         var line_byte_offsets = decoded.byte_offsets;
-        errdefer gpa.free(line_codepoints);
-        errdefer gpa.free(line_byte_offsets);
+        errdefer output.free(line_codepoints);
+        errdefer output.free(line_byte_offsets);
 
         // Codepoint range matching `item`'s byte range; the shaper works in
         // codepoint indices. Clamped to what decodeLine produced, which stops
@@ -1189,14 +1252,14 @@ pub const Cache = struct {
         // registered family covers.
         const static_fonts = resolved.entry_hashes.len;
         var fonts_list: std.ArrayList(OtFont) = .empty;
-        defer fonts_list.deinit(gpa);
+        defer fonts_list.deinit(output);
         var hashes_list: std.ArrayList(u64) = .empty;
-        defer hashes_list.deinit(gpa);
+        defer hashes_list.deinit(output);
         var family_fonts_list: std.ArrayList(Font) = .empty;
-        defer family_fonts_list.deinit(gpa);
-        try fonts_list.appendSlice(gpa, resolved.raw_fonts[0..static_fonts]);
-        try hashes_list.appendSlice(gpa, resolved.entry_hashes);
-        try family_fonts_list.appendSlice(gpa, resolved.family_fonts[0..static_fonts]);
+        defer family_fonts_list.deinit(output);
+        try fonts_list.appendSlice(output, resolved.raw_fonts[0..static_fonts]);
+        try hashes_list.appendSlice(output, resolved.entry_hashes);
+        try family_fonts_list.appendSlice(output, resolved.family_fonts[0..static_fonts]);
 
         // Query the OS (or the web fallback service) for each newly-uncovered
         // codepoint, skipping any already covered by a font discovered
@@ -1204,7 +1267,7 @@ pub const Cache = struct {
         // split into ~100 slices, so a long CJK line can need dozens, and
         // every missing codepoint must reach `webFallbackFont` to be fetched.
         var dynamic_cmaps: std.ArrayList([]const u8) = .empty;
-        defer dynamic_cmaps.deinit(gpa);
+        defer dynamic_cmaps.deinit(output);
         if (static_fonts > 0) {
             for (decoded.codepoints) |cp| {
                 if (resolved.entryIndexFor(cp) != null) continue;
@@ -1220,7 +1283,7 @@ pub const Cache = struct {
                 // (which family covers it, independent of size), so its
                 // result carries Font.DefaultSize -- rescale to the size the
                 // primary font was actually requested at.
-                if (self.discoverDynamicFallback(persist_gpa, cp) orelse self.webFallbackFont(persist_gpa, cp)) |raw_dyn_font| {
+                if (self.discoverDynamicFallback(state_gpa, cp) orelse self.webFallbackFont(state_gpa, cp)) |raw_dyn_font| {
                     const dyn_font = raw_dyn_font.withSize(resolved.family_fonts[0].size);
                     const dyn_hash = dyn_font.hash();
                     var already_added = false;
@@ -1231,37 +1294,37 @@ pub const Cache = struct {
                         }
                     }
                     if (already_added) continue;
-                    // persist_gpa: getOrCreate inserts into self.cache, which
-                    // outlives this frame -- gpa here may be a frame-scoped
+                    // state_gpa: getOrCreate inserts into self.cache, which
+                    // outlives this frame -- output here may be a frame-scoped
                     // arena that resets right after this call returns.
-                    const dyn_entry = try self.getOrCreate(persist_gpa, dyn_font);
-                    try fonts_list.append(gpa, dyn_entry.parsed_font);
-                    try hashes_list.append(gpa, dyn_hash);
-                    try family_fonts_list.append(gpa, dyn_font);
+                    const dyn_entry = try self.getOrCreate(state_gpa, dyn_font);
+                    try fonts_list.append(output, dyn_entry.parsed_font);
+                    try hashes_list.append(output, dyn_hash);
+                    try family_fonts_list.append(output, dyn_font);
                     const cmap = dyn_entry.parsed_font.tableData(.{ 'c', 'm', 'a', 'p' }) orelse &.{};
-                    if (cmap.len > 0) try dynamic_cmaps.append(gpa, cmap);
-                } else logMissingCoverage(resolved, persist_gpa, cp);
+                    if (cmap.len > 0) try dynamic_cmaps.append(output, cmap);
+                } else logMissingCoverage(resolved, state_gpa, cp);
             }
         }
 
-        var result = Buffer.init(gpa);
+        var result = Buffer.init(output);
         errdefer result.deinit();
         var segments: std.ArrayList(Entry.ShapedLine.EntrySegment) = .empty;
-        errdefer segments.deinit(gpa);
+        errdefer segments.deinit(output);
         // Entry-hash twin of `segments`, cached in place of raw `*Entry`
         // pointers -- `cache`'s backing array can grow/rehash across frames
         // (loading a new bold/italic/mono variant), which would otherwise
         // leave a persisted segment's pointer dangling.
         var cache_segments: std.ArrayList(CachedShapedLine.Segment) = .empty;
-        errdefer cache_segments.deinit(gpa);
+        errdefer cache_segments.deinit(output);
 
         if (decoded.codepoints.len > 0 and fonts_list.items.len > 0) {
             // Bidi outer, font fallback inner, so visual reordering crosses font boundaries.
-            const shaped = shapeBidiParagraphWithFallback(gpa, fonts_list.items, decoded.codepoints, base_direction, &.{}, &.{}, &.{}, item_cp) catch |err| switch (err) {
+            const shaped = shapeBidiParagraphWithFallback(output, fonts_list.items, decoded.codepoints, base_direction, &.{}, &.{}, &.{}, item_cp) catch |err| switch (err) {
                 error.OutOfMemory => |e| return e,
-                else => BidiFallbackResult{ .buffer = Buffer.init(gpa), .font_indices = &.{} },
+                else => BidiFallbackResult{ .buffer = Buffer.init(output), .font_indices = &.{} },
             };
-            defer gpa.free(shaped.font_indices);
+            defer output.free(shaped.font_indices);
             result.deinit();
             result = shaped.buffer;
 
@@ -1279,8 +1342,8 @@ pub const Cache = struct {
                 const fi = shaped.font_indices[g];
                 var h = g + 1;
                 while (h < shaped.font_indices.len and shaped.font_indices[h] == fi) h += 1;
-                // persist_gpa: see note on the dynamic-fallback getOrCreate above.
-                _ = try self.getOrCreate(persist_gpa, family_fonts_list.items[fi]);
+                // state_gpa: see note on the dynamic-fallback getOrCreate above.
+                _ = try self.getOrCreate(state_gpa, family_fonts_list.items[fi]);
                 g = h;
             }
             g = 0;
@@ -1288,9 +1351,9 @@ pub const Cache = struct {
                 const fi = shaped.font_indices[g];
                 var h = g + 1;
                 while (h < shaped.font_indices.len and shaped.font_indices[h] == fi) h += 1;
-                const fce = try self.getOrCreate(persist_gpa, family_fonts_list.items[fi]);
-                try segments.append(gpa, .{ .entry = fce, .glyph_start = @intCast(g), .glyph_end = @intCast(h) });
-                try cache_segments.append(gpa, .{ .entry_hash = hashes_list.items[fi], .glyph_start = @intCast(g), .glyph_end = @intCast(h) });
+                const fce = try self.getOrCreate(state_gpa, family_fonts_list.items[fi]);
+                try segments.append(output, .{ .entry = fce, .glyph_start = @intCast(g), .glyph_end = @intCast(h) });
+                try cache_segments.append(output, .{ .entry_hash = hashes_list.items[fi], .glyph_start = @intCast(g), .glyph_end = @intCast(h) });
                 g = h;
             }
         }
@@ -1303,30 +1366,32 @@ pub const Cache = struct {
         // context having been there.
         if (item_cp) |it_cp| {
             const it = item.?;
-            const new_codepoints = try gpa.dupe(u21, line_codepoints[it_cp.start..it_cp.end]);
-            errdefer gpa.free(new_codepoints);
-            const new_offsets = try gpa.alloc(u32, it_cp.end - it_cp.start + 1);
+            const new_codepoints = try output.dupe(u21, line_codepoints[it_cp.start..it_cp.end]);
+            errdefer output.free(new_codepoints);
+            const new_offsets = try output.alloc(u32, it_cp.end - it_cp.start + 1);
             for (new_offsets[0 .. it_cp.end - it_cp.start], line_byte_offsets[it_cp.start..it_cp.end]) |*dst, off| {
                 dst.* = off -| @as(u32, @intCast(it.start));
             }
             new_offsets[it_cp.end - it_cp.start] = line_byte_offsets[it_cp.end] -| @as(u32, @intCast(it.start));
             for (result.info.items) |*info| info.cluster -= @intCast(it_cp.start);
-            gpa.free(line_codepoints);
-            gpa.free(line_byte_offsets);
+            output.free(line_codepoints);
+            output.free(line_byte_offsets);
             line_codepoints = new_codepoints;
             line_byte_offsets = new_offsets;
         }
 
-        const cluster_tables = try result.buildClusterTables(gpa, line_byte_offsets);
+        const cluster_tables = try result.buildClusterTables(output, line_byte_offsets);
+        errdefer output.free(cluster_tables.starts);
+        errdefer output.free(cluster_tables.ends);
 
         const line: Entry.ShapedLine = .{
-            .allocator = gpa,
+            .allocator = output,
             .codepoints = line_codepoints,
             .byte_offsets = line_byte_offsets,
             .buffer = result,
             .cluster_starts = cluster_tables.starts,
             .cluster_ends = cluster_tables.ends,
-            .segments = try segments.toOwnedSlice(gpa),
+            .segments = try segments.toOwnedSlice(output),
         };
 
         const to_cache: CachedShapedLine = .{
@@ -1337,18 +1402,18 @@ pub const Cache = struct {
             .cluster_ends = cluster_tables.ends,
             .segments = cache_segments.items,
         };
-        if (to_cache.clone(persist_gpa)) |persisted| {
+        if (to_cache.clone(state_gpa)) |persisted| {
             var to_store = persisted;
             // Every distinct (stack, text) slice ever shaped lands here and
             // reset() deliberately keeps it, so without a cap this grows
             // unbounded: a reflowing TextLayout or the bidi break-retreat
             // loop mints a fresh key per candidate prefix per width.
             if (self.shaped_line_cache.count() >= max_shaped_lines) {
-                self.clearShapedLineCache(persist_gpa);
+                self.clearShapedLineCache(state_gpa);
             }
-            self.shaped_line_cache.put(persist_gpa, cache_key, to_store) catch to_store.deinit(persist_gpa);
+            self.shaped_line_cache.put(state_gpa, cache_key, to_store) catch to_store.deinit(state_gpa);
         } else |_| {} // OOM on the persistent copy just means this shape isn't cached
-        cache_segments.deinit(gpa);
+        cache_segments.deinit(output);
 
         return line;
     }
@@ -1462,8 +1527,8 @@ pub const Cache = struct {
 
     pub fn textSizeRawShaped(
         self: *Cache,
-        scratch: std.mem.Allocator,
-        gpa: std.mem.Allocator,
+        output: std.mem.Allocator,
+        state_gpa: std.mem.Allocator,
         resolved: *ResolvedStack,
         text: []const u8,
         opts: Font.TextSizeOptions,
@@ -1481,7 +1546,7 @@ pub const Cache = struct {
         var window: usize = if (opts.max_width != null and opts.item == null) @min(newline_idx, 64) else newline_idx;
 
         while (true) {
-            var line = try self.shapeLineText(scratch, gpa, resolved, text[0..window], opts.item, opts.base_direction);
+            var line = try self.shapeLineText(output, state_gpa, resolved, text[0..window], opts.item, opts.base_direction);
             errdefer line.deinit();
 
             // Refetched after shapeLineText, not hoisted above the loop:
@@ -1502,7 +1567,7 @@ pub const Cache = struct {
 
             for (line.buffer.info.items, line.buffer.pos.items, 0..) |info, pos, gidx| {
                 const fce = line.entryForGlyph(fallback_entry orelse break, gidx);
-                const gi = try fce.glyphInfoGet(gpa, info.codepoint);
+                const gi = try fce.glyphInfoGet(state_gpa, info.codepoint);
                 const off_x = fce.toPixels(pos.x_offset);
                 const adv = fce.toPixels(pos.x_advance);
                 const adv_used = if (snap) @round(adv) else adv;
@@ -1542,7 +1607,7 @@ pub const Cache = struct {
                 // from the other end of the run.
                 if (found_break and line.buffer.isRtl()) {
                     if (fallback_entry) |fe| {
-                        const fit = try fe.logicalPrefixForWidth(gpa, &line, mwidth, opts.end_metric, snap);
+                        const fit = try fe.logicalPrefixForWidth(state_gpa, &line, mwidth, opts.end_metric, snap);
                         if (opts.end_idx) |endout| endout.* = fit.byte;
                         return .{ .size = .{ .w = fit.w, .h = th }, .line = line };
                     }
@@ -1698,12 +1763,13 @@ pub const Cache = struct {
                 if (probe_h <= 0) break :probe;
                 const ratio = probe_h / ppem;
                 const corrected = @max(min_pixel_size, font.size / ratio);
-                renderer.deinit(gpa);
-                ppem = corrected;
-                renderer = Renderer.init(gpa, dvui.currentWindow().lifo(), parsed_font, ppem, .{ .hint_glyf = true, .user_coords = user_coords }) catch |err| {
+                const corrected_renderer = Renderer.init(gpa, dvui.currentWindow().lifo(), parsed_font, corrected, .{ .hint_glyf = true, .user_coords = user_coords }) catch |err| {
                     dvui.log.warn("Font.Cache.Entry.init() opentype renderer error {any} font {s}\n", .{ err, fname });
                     return Error.FontError;
                 };
+                renderer.deinit(gpa);
+                renderer = corrected_renderer;
+                ppem = corrected;
                 em_height = measuredCapHeight(&renderer, gpa, m_glyph_id) orelse ppem;
             }
 
@@ -2036,12 +2102,12 @@ pub const Cache = struct {
         /// Size of the logical byte prefix [0, byte_offset) of an already
         /// shaped line; no reshaping. In an RTL run that prefix is the
         /// buffer's trailing glyphs, not its leading ones.
-        pub fn measureLogicalPrefix(self: *Entry, gpa: std.mem.Allocator, line: *const ShapedLine, byte_offset: usize, snap: bool) std.mem.Allocator.Error!Size {
+        pub fn measureLogicalPrefix(self: *Entry, state_gpa: std.mem.Allocator, line: *const ShapedLine, byte_offset: usize, snap: bool) std.mem.Allocator.Error!Size {
             const r = line.logicalPrefixGlyphs(byte_offset);
             // ponytail: one entry's metrics for every glyph -- a prefix that
             // fell back to a second font measures its ink against the
             // primary; thread entryForGlyph through if that ever shows.
-            const s = try opentype.measureGlyphRange(gpa, self, self.ascent, self.height, line.buffer.info.items[r.start..r.end], line.buffer.pos.items[r.start..r.end], r.end - r.start, snap);
+            const s = try opentype.measureGlyphRange(state_gpa, self, self.ascent, self.height, line.buffer.info.items[r.start..r.end], line.buffer.pos.items[r.start..r.end], r.end - r.start, snap);
             return .{ .w = s.w, .h = s.h };
         }
 
@@ -2051,13 +2117,13 @@ pub const Cache = struct {
         /// pixels), and its width: the inverse of `measureLogicalPrefix`, and
         /// exact in both directions because it is found by measuring through
         /// that same call at each cluster boundary.
-        pub fn logicalPrefixForWidth(self: *Entry, gpa: std.mem.Allocator, line: *const ShapedLine, mwidth: f32, end_metric: Font.EndMetric, snap: bool) std.mem.Allocator.Error!PrefixFit {
+        pub fn logicalPrefixForWidth(self: *Entry, state_gpa: std.mem.Allocator, line: *const ShapedLine, mwidth: f32, end_metric: Font.EndMetric, snap: bool) std.mem.Allocator.Error!PrefixFit {
             var best: PrefixFit = .{ .byte = 0, .w = 0 };
             // ponytail: re-measures from the run's logical start per candidate
             // (quadratic in glyphs), which a fragment-sized run never notices;
             // make it incremental if whole-paragraph lines ever come through.
             for (line.cluster_ends) |boundary| {
-                const w = (try self.measureLogicalPrefix(gpa, line, boundary, snap)).w;
+                const w = (try self.measureLogicalPrefix(state_gpa, line, boundary, snap)).w;
                 if (w > mwidth) {
                     if (end_metric == .nearest and w - mwidth < mwidth - best.w) return .{ .byte = boundary, .w = w };
                     return best;
@@ -2217,7 +2283,7 @@ test "an RTL run's logical prefix measures monotonically, and width maps back to
     // left, so the logical prefix a caret walks over is the *last* stretch
     // of the shape -- what a leading-glyph walk gets backwards.
     const txt = "\u{05e9}\u{05dc}\u{05d5}\u{05dd}";
-    var res = (try font.textSizeExShaped(gpa, txt, .{})).?;
+    var res = (try font.textSizeExShaped(dvui.currentWindow().gpa, gpa, txt, .{})).?;
     defer res.shaped.deinit();
     // Nothing in the stack covers Hebrew on this platform.
     if (res.shaped.line.buffer.info.items[0].codepoint == 0) return;
@@ -2346,6 +2412,91 @@ test "Cache.resolveStack: per-family entry overrides apply to the stack fonts" {
     defer line.deinit();
     const korean_entry = cw.fonts.stackEntry(resolved, 1).?;
     try std.testing.expect(korean_entry.height < primary.height);
+}
+
+test "Cache.resolveStack: a nested alias covers the scripts of its inner aliases" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+
+    try dvui.addFont("TestLatin", Source.fallback.bytes, null);
+    const cw = dvui.currentWindow();
+    try cw.fonts.database.append(cw.gpa, .{ .family = array("TestKorean"), .bytes = @embedFile("fonts/NotoSansKR-Regular.ttf") });
+
+    // Outer registered before its inner aliases exist.
+    try dvui.addFontFamily("TestOuter", &.{ "TestLatinAlias", "TestKoreanAlias" });
+    try dvui.addFontFamily("TestLatinAlias", &.{"TestLatin"});
+    try dvui.addFontFamily("TestKoreanAlias", &.{"TestKorean"});
+
+    const resolved = try cw.fonts.resolveStack(cw.gpa, Font.init("TestOuter"));
+    try std.testing.expectEqual(@as(usize, 2), resolved.family_fonts.len);
+    try std.testing.expectEqualStrings("TestLatin", resolved.family_fonts[0].familyName());
+    try std.testing.expectEqualStrings("TestKorean", resolved.family_fonts[1].familyName());
+    try std.testing.expectEqual(@as(?u8, 0), resolved.entryIndexFor('A'));
+    try std.testing.expectEqual(@as(?u8, 1), resolved.entryIndexFor(0xAC00));
+
+    const source = try cw.fonts.resolveSource(cw.gpa, Font.init("TestOuter"));
+    try std.testing.expectEqualStrings("TestLatin", source.familyName());
+}
+
+test "Cache.resolveStack: an alias cycle terminates at the depth limit" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+
+    try dvui.addFont("TestLatin", Source.fallback.bytes, null);
+    const cw = dvui.currentWindow();
+    try dvui.addFontFamily("TestCycleA", &.{"TestCycleB"});
+    try dvui.addFontFamily("TestCycleB", &.{ "TestCycleA", "TestLatin" });
+
+    var flattened: Cache.FlattenedAliasStack = .{};
+    cw.fonts.flattenAliasStack(&flattened, Font.init("TestCycleA"), 0);
+    try std.testing.expect(flattened.hit_depth_limit);
+    try std.testing.expectEqual(@as(u8, 1), flattened.len);
+    try std.testing.expectEqualStrings("TestLatin", flattened.fonts[0].familyName());
+
+    const resolved = try cw.fonts.resolveStack(cw.gpa, Font.init("TestCycleA"));
+    try std.testing.expectEqual(@as(usize, 1), resolved.family_fonts.len);
+    _ = try cw.fonts.resolveSource(cw.gpa, Font.init("TestCycleA"));
+}
+
+test "Cache.resolveStack: an outer alias override reaches inner entries" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+
+    try dvui.addFont("TestLatin", Source.fallback.bytes, null);
+    const cw = dvui.currentWindow();
+    try cw.fonts.database.append(cw.gpa, .{ .family = array("TestKorean"), .bytes = @embedFile("fonts/NotoSansKR-Regular.ttf") });
+
+    try dvui.addFontFamilyEntries("TestOuter", &.{.{ .family = array("TestInner"), .weight = .bold }});
+    try dvui.addFontFamilyEntries("TestInner", &.{
+        .{ .family = array("TestLatin") },
+        .{ .family = array("TestKorean"), .size_scale = 0.5, .weight = .light },
+    });
+
+    const stack: Font = .init("TestOuter");
+    const resolved = try cw.fonts.resolveStack(cw.gpa, stack);
+    try std.testing.expectEqual(@as(usize, 2), resolved.family_fonts.len);
+    try std.testing.expectEqual(Font.Weight.bold, resolved.family_fonts[0].weight);
+    try std.testing.expectEqual(stack.size, resolved.family_fonts[0].size);
+    try std.testing.expectEqual(Font.Weight.light, resolved.family_fonts[1].weight);
+    try std.testing.expectEqual(stack.size * 0.5, resolved.family_fonts[1].size);
+}
+
+test "Cache.resolveStack: a diamond of aliases keeps each family once, first position wins" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+
+    try dvui.addFont("TestLatin", Source.fallback.bytes, null);
+    const cw = dvui.currentWindow();
+    try cw.fonts.database.append(cw.gpa, .{ .family = array("TestKorean"), .bytes = @embedFile("fonts/NotoSansKR-Regular.ttf") });
+
+    try dvui.addFontFamily("TestTop", &.{ "TestLeft", "TestRight" });
+    try dvui.addFontFamily("TestLeft", &.{ "TestLatin", "TestKorean" });
+    try dvui.addFontFamily("TestRight", &.{ "TestKorean", "TestLatin" });
+
+    const resolved = try cw.fonts.resolveStack(cw.gpa, Font.init("TestTop"));
+    try std.testing.expectEqual(@as(usize, 2), resolved.family_fonts.len);
+    try std.testing.expectEqualStrings("TestLatin", resolved.family_fonts[0].familyName());
+    try std.testing.expectEqualStrings("TestKorean", resolved.family_fonts[1].familyName());
 }
 
 test "Cache.shapeLineText: shaped_line_cache stays bounded under distinct-slice churn" {
@@ -2520,7 +2671,7 @@ test "TextSizeOptions.item: shapes with context but reports only the item" {
     const gpa = std.testing.allocator;
     const font: Font = .find(.{ .family = "Vera", .size = 24 });
 
-    var res = (try font.textSizeExShaped(gpa, "Hello", .{ .item = .{ .start = 1, .end = 3 } })).?;
+    var res = (try font.textSizeExShaped(dvui.currentWindow().gpa, gpa, "Hello", .{ .item = .{ .start = 1, .end = 3 } })).?;
     defer res.shaped.deinit();
 
     // Only "el" produced glyphs, and the result is rebased so it reads like
@@ -2544,12 +2695,12 @@ test "TextSizeOptions.item: a joining neighbour changes the glyph chosen" {
     // lam as (discarded) context it must take its initial form -- a different
     // glyph. This is what per-addText-chunk shaping used to get wrong.
     const word = "\u{0633}\u{0644}";
-    var alone = (try font.textSizeExShaped(gpa, word[0..2], .{})).?;
+    var alone = (try font.textSizeExShaped(dvui.currentWindow().gpa, gpa, word[0..2], .{})).?;
     defer alone.shaped.deinit();
     // No Arabic anywhere in the font stack on this platform: nothing to test.
     if (alone.shaped.line.buffer.info.items[0].codepoint == 0) return;
 
-    var joined = (try font.textSizeExShaped(gpa, word, .{ .item = .{ .start = 0, .end = 2 } })).?;
+    var joined = (try font.textSizeExShaped(dvui.currentWindow().gpa, gpa, word, .{ .item = .{ .start = 0, .end = 2 } })).?;
     defer joined.shaped.deinit();
     try std.testing.expectEqual(@as(usize, 1), joined.shaped.line.buffer.info.items.len);
     try std.testing.expect(joined.shaped.line.buffer.info.items[0].codepoint !=
@@ -2565,7 +2716,7 @@ test "caret pen offsets step one glyph at a time through an RTL run" {
     // Four Hebrew letters, two bytes each. Coverage does not matter here:
     // bidi reorders the clusters whether or not the stack has the glyphs.
     const txt = "\u{05e9}\u{05dc}\u{05d5}\u{05dd}";
-    var res = (try font.textSizeExShaped(gpa, txt, .{})).?;
+    var res = (try font.textSizeExShaped(dvui.currentWindow().gpa, gpa, txt, .{})).?;
     defer res.shaped.deinit();
     try std.testing.expect(res.shaped.line.isRtl());
 
@@ -2598,7 +2749,7 @@ test "caret stops inside a ligature sit at the font's GDEF caret" {
 
     try dvui.addFont("TestAleo", @embedFile("fonts/Aleo/static/Aleo-Regular.ttf"), null);
     const font: Font = .find(.{ .family = "TestAleo", .size = 32 });
-    var res = (try font.textSizeExShaped(gpa, "fix", .{})).?;
+    var res = (try font.textSizeExShaped(dvui.currentWindow().gpa, gpa, "fix", .{})).?;
     defer res.shaped.deinit();
     // "fi" ligates into one glyph, "x" stays its own.
     try std.testing.expectEqual(@as(usize, 2), res.shaped.line.buffer.info.items.len);
