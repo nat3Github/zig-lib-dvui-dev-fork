@@ -212,6 +212,7 @@ pub fn build(b: *std.Build) !void {
     const opentype_android = b.option(bool, "android", "Enable the Android font-discovery backend (forwarded to opentype)") orelse (target.result.abi == .android);
     const opentype_manifest = b.option(bool, "manifest", "Enable the manifest font-discovery backend, for fonts resolved by URL instead of an OS font source (forwarded to opentype)") orelse true;
     const opentype_woff2 = b.option(bool, "woff2", "Enable WOFF2 font decoding, e.g. for fonts fetched via the manifest backend (forwarded to opentype; off by default for binary size)") orelse false;
+    const font_fallback = b.option(bool, "font-fallback", "Font fallback: OS font discovery and per-codepoint fallback natively, on-demand Noto fonts (plus web_fallback.js and WOFF2) on web. Off compiles none of it in (forwarded to opentype)") orelse true;
     const stb_image_option = b.option(bool, "stb-image", "Build stb_image (default is backend specific, some include stb_image)");
     const tree_sitter_option = b.option(bool, "tree-sitter", "Build tree sitter (default is backend specific)");
     const tvg_option = b.option(bool, "tvg", "Build tvg (default true)") orelse true;
@@ -312,6 +313,7 @@ pub fn build(b: *std.Build) !void {
         .opentype_android = opentype_android,
         .opentype_manifest = opentype_manifest,
         .opentype_woff2 = opentype_woff2,
+        .font_fallback = font_fallback,
 
         .tiny_file_dialogs = tiny_file_dialogs_option,
         .linux_display_backend = linux_display_backend,
@@ -1045,7 +1047,7 @@ pub fn buildBackend(
             }
 
             dvui_opts.setDefaults(.{ .libc = false,  .tiny_file_dialogs = false, .stb_image = true, .tree_sitter = false });
-            const export_symbol_names = &[_][]const u8{
+            const base_export_symbol_names = [_][]const u8{
                 "dvui_init",
                 "dvui_deinit",
                 "dvui_update",
@@ -1053,8 +1055,11 @@ pub fn buildBackend(
                 "arena_u8",
                 "gpa_u8",
                 "gpa_free",
-                "new_font",
             };
+            const export_symbol_names: []const []const u8 = if (dvui_opts.font_fallback)
+                &(base_export_symbol_names ++ [_][]const u8{ "dvui_font_fallback_loaded", "dvui_font_fallback_failed" })
+            else
+                &base_export_symbol_names;
 
             const web_mod = b.addModule("web", .{
                 .root_source_file = b.path("src/backends/web.zig"),
@@ -1096,7 +1101,9 @@ pub fn buildBackend(
                     .opentype_directwrite = false,
                     .opentype_android = false,
                     .opentype_manifest = true,
-                    .opentype_woff2 = false,
+                    // web fallback fonts are served as WOFF2
+                    .opentype_woff2 = dvui_opts.font_fallback,
+                    .font_fallback = dvui_opts.font_fallback,
                     .tiny_file_dialogs = false,
                     .stb_image = true,
                     .tree_sitter = false,
@@ -1242,6 +1249,7 @@ const DvuiModuleOptions = struct {
     opentype_android: bool,
     opentype_manifest: bool,
     opentype_woff2: bool,
+    font_fallback: bool,
     linux_display_backend: ?LinuxDisplayBackend = null,
     stb_image: ?bool,
     tree_sitter: ?bool,
@@ -1497,6 +1505,7 @@ pub fn addDvuiModule(
         .android = opts.opentype_android,
         .manifest = opts.opentype_manifest,
         .woff2 = opts.opentype_woff2,
+        .@"font-fallback" = opts.font_fallback,
     });
     dvui_mod.addImport("opentype", opentype_dep.module("opentype"));
 
@@ -1706,15 +1715,12 @@ fn addWebExample(
     cb_run.addFileArg(web_test.getEmittedBin());
     const output = cb_run.captureStdOut(.{ .basename = "index.html" });
 
-    const install_noto = b.addInstallFileWithDir(b.path("src/fonts/NotoSansKR-Regular.ttf"), install_dir, "NotoSansKR-Regular.ttf");
-
     const compile_step = b.step(name, "Compile " ++ name);
     compile_step.dependOn(&b.addInstallFileWithDir(output, install_dir, "index.html").step);
     const web_js = b.path("src/backends/web.js");
     compile_step.dependOn(&b.addInstallFileWithDir(web_js, install_dir, "web.js").step);
     b.addNamedLazyPath("web.js", web_js);
     compile_step.dependOn(&install_wasm.step);
-    compile_step.dependOn(&install_noto.step);
 
     const run_step = b.step("serve-" ++ name, "Serve " ++ name);
     const run_serve = b.addRunArtifact(web_serve_exe);
@@ -1722,6 +1728,14 @@ fn addWebExample(
     run_serve.addFileArg(output);
     run_serve.addFileArg(web_js);
     run_serve.addArtifactArg(web_test);
+
+    // web.js imports it only when the wasm module asks for font fallback.
+    if (opts.font_fallback) {
+        const web_fallback_js = b.path("src/backends/web_fallback.js");
+        compile_step.dependOn(&b.addInstallFileWithDir(web_fallback_js, install_dir, "web_fallback.js").step);
+        b.addNamedLazyPath("web_fallback.js", web_fallback_js);
+        run_serve.addFileArg(web_fallback_js);
+    }
 
     b.getInstallStep().dependOn(compile_step);
 }

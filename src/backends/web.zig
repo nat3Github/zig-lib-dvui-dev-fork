@@ -68,7 +68,9 @@ pub const wasm = if (!builtin.is_test) struct {
     pub extern "dvui" fn wasm_get_file_size(id: u64, file_index: usize) isize;
     pub extern "dvui" fn wasm_read_file_data(id: u64, file_index: usize, data: [*]u8) void;
 
-    pub extern "dvui" fn wasm_add_noto_font() void;
+    // from web_fallback.js; only imported when font fallback is compiled in
+    pub extern "dvui" fn wasm_font_fallback_fetch(font: u32, url_ptr: [*]const u8, url_len: usize) void;
+    pub extern "dvui" fn wasm_font_fallback_language(buf_ptr: [*]u8, buf_len: usize) usize;
 } else struct { // Mock api for testing that this backend is semantically correct, cannot test behaviour
     pub fn wasm_about_webgl2() u8 {
         return undefined;
@@ -136,7 +138,10 @@ pub const wasm = if (!builtin.is_test) struct {
     }
     pub fn wasm_read_file_data(_: u64, _: usize, _: [*]u8) void {}
 
-    pub fn wasm_add_noto_font() void {}
+    pub fn wasm_font_fallback_fetch(_: u32, _: [*]const u8, _: usize) void {}
+    pub fn wasm_font_fallback_language(_: [*]u8, _: usize) usize {
+        return 0;
+    }
 };
 
 export fn dvui_c_alloc(size: usize) ?*anyopaque {
@@ -251,10 +256,35 @@ export fn arena_u8(len: usize) [*c]u8 {
     return buf.ptr;
 }
 
-export fn new_font(ptr: [*c]u8, len: usize) void {
-    if (win_ok) {
-        win.addFont("Noto", ptr[0..len], gpa) catch unreachable;
+/// Called by `Font.Cache.processWebFallback`; the reply arrives through
+/// `dvui_font_fallback_loaded`/`dvui_font_fallback_failed`.
+pub fn fetchFallbackFont(font: u16, url: []const u8) void {
+    wasm.wasm_font_fallback_fetch(font, url.ptr, url.len);
+}
+
+fn dvui_font_fallback_loaded(font: u32, ptr: [*]u8, len: usize) callconv(.c) void {
+    const bytes = ptr[0..len];
+    if (!win_ok) return gpa.free(bytes);
+    win.fonts.webFallbackLoaded(gpa, @intCast(font), bytes);
+}
+
+fn dvui_font_fallback_failed(font: u32) callconv(.c) void {
+    if (win_ok) win.fonts.webFallbackFailed(gpa, @intCast(font));
+}
+
+comptime {
+    if (dvui.Font.web_fallback_enabled) {
+        @export(&dvui_font_fallback_loaded, .{ .name = "dvui_font_fallback_loaded" });
+        @export(&dvui_font_fallback_failed, .{ .name = "dvui_font_fallback_failed" });
     }
+}
+
+var browser_language: [35]u8 = undefined;
+
+/// `navigator.language`, for `Font.Cache.fallback_language`.
+pub fn fallbackLanguage() ?[]const u8 {
+    const len = wasm.wasm_font_fallback_language(&browser_language, browser_language.len);
+    return if (len > 0) browser_language[0..len] else null;
 }
 
 export fn add_event(which: u8, int1: u32, int2: u32, float1: f32, float2: f32) void {

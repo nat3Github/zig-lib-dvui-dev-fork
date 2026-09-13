@@ -5,6 +5,10 @@ var text_entry_multiline_allocator_buf: [1000]u8 = undefined;
 var text_entry_multiline_fba = std.heap.FixedBufferAllocator.init(&text_entry_multiline_allocator_buf);
 var text_entry_multiline_buf: []u8 = &.{};
 var text_entry_multiline_break = false;
+var text_entry_multiline_line_break: @FieldType(dvui.TextEntryWidget.InitOptions, "line_break") = .strict;
+var text_entry_multiline_word_break: @FieldType(dvui.TextEntryWidget.InitOptions, "word_break") = .normal;
+var text_entry_multiline_overflow_wrap: @FieldType(dvui.TextEntryWidget.InitOptions, "overflow_wrap") = .anywhere;
+var text_entry_bidi_direction: @FieldType(dvui.TextEntryWidget.InitOptions, "base_direction") = .auto;
 
 /// ![image](Examples-text_entry.png)
 pub fn textEntryWidgets() void {
@@ -153,6 +157,40 @@ pub fn textEntryWidgets() void {
         dvui.label(@src(), "(limit {d})", .{text_entry_password_buf.len}, .{ .gravity_y = 0.5 });
     }
 
+    {
+        var hbox = dvui.box(@src(), .{ .dir = .horizontal }, .{});
+        defer hbox.deinit();
+
+        {
+            var vbox = dvui.box(@src(), .{}, .{ .gravity_y = 0.5 });
+            defer vbox.deinit();
+            dvui.label(@src(), "Bidi", .{}, .{});
+            _ = dvui.dropdownEnum(@src(), @TypeOf(text_entry_bidi_direction), .{ .choice = &text_entry_bidi_direction }, .{}, .{});
+        }
+
+        left_alignment.spacer(@src(), 0);
+
+        var vbox = dvui.box(@src(), .{}, .{});
+        defer vbox.deinit();
+
+        var te = dvui.textEntry(@src(), .{ .base_direction = text_entry_bidi_direction }, .{ .max_size_content = .sizeM(20, 1) });
+        if (dvui.firstFrame(te.data().id)) {
+            te.textSet("abc שלום עולם 123 def", false);
+        }
+        te.deinit();
+
+        var te_multi = dvui.textEntry(@src(), .{
+            .multiline = true,
+            .break_lines = true,
+            .scroll_horizontal = false,
+            .base_direction = text_entry_bidi_direction,
+        }, .{ .min_size_content = .sizeM(20, 4), .max_size_content = .sizeM(20, 4) });
+        if (dvui.firstFrame(te_multi.data().id)) {
+            te_multi.textSet("English, then עברית עם 42 מספרים, and back.\nمرحبا بالعالم with Latin 2026 inside.\n", false);
+        }
+        te_multi.deinit();
+    }
+
     const FontEntry = struct {
         idx: usize,
         name: []const u8,
@@ -189,6 +227,11 @@ pub fn textEntryWidgets() void {
             dvui.label(@src(), "Multiline", .{}, .{});
 
             _ = dvui.checkbox(@src(), &text_entry_multiline_break, "Break Lines", .{});
+            if (text_entry_multiline_break) {
+                _ = dvui.dropdownEnum(@src(), @TypeOf(text_entry_multiline_line_break), .{ .choice = &text_entry_multiline_line_break }, .{}, .{});
+                _ = dvui.dropdownEnum(@src(), @TypeOf(text_entry_multiline_word_break), .{ .choice = &text_entry_multiline_word_break }, .{}, .{});
+                _ = dvui.dropdownEnum(@src(), @TypeOf(text_entry_multiline_overflow_wrap), .{ .choice = &text_entry_multiline_overflow_wrap }, .{}, .{});
+            }
         }
 
         left_alignment.spacer(@src(), 0);
@@ -207,6 +250,9 @@ pub fn textEntryWidgets() void {
         if (text_entry_multiline_break) {
             te_opts.break_lines = true;
             te_opts.scroll_horizontal = false;
+            te_opts.line_break = text_entry_multiline_line_break;
+            te_opts.word_break = text_entry_multiline_word_break;
+            te_opts.overflow_wrap = text_entry_multiline_overflow_wrap;
         }
 
         var te = dvui.textEntry(
@@ -220,7 +266,7 @@ pub fn textEntryWidgets() void {
         );
 
         if (dvui.firstFrame(te.data().id)) {
-            te.textSet("This multiline text\nentry can scroll\nin both directions.", false);
+            te.textSet("This multiline text\nentry can scroll\nin both directions.\nffi e\u{301} क्ष \u{1F469}\u{200D}\u{1F4BB} ปี่", false);
         }
 
         const bytes = te.len;
@@ -261,11 +307,7 @@ pub fn textEntryWidgets() void {
         var la2 = dvui.Alignment.init(@src(), 0);
         defer la2.deinit();
 
-        if (dvui.backend.kind == .web) {
-            if (dvui.button(@src(), "Add Noto Font", .{}, .{})) {
-                dvui.backend.wasm.wasm_add_noto_font();
-            }
-        } else {
+        if (dvui.backend.kind != .web) {
             var hbox2 = dvui.box(@src(), .{ .dir = .horizontal }, .{});
             dvui.label(@src(), "Name", .{}, .{ .gravity_y = 0.5 });
 

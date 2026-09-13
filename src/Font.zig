@@ -340,6 +340,26 @@ const system_font_backend: ?type = blk: {
     break :blk null;
 };
 
+/// On-demand Noto fonts (`opentype.discovery_web_fallback`) for the web,
+/// which has no OS fonts to ask; the backend fetches them via
+/// `fetchFallbackFont`. The testing backend compiles it in but never fetches.
+pub const web_fallback_enabled = opentype.font_fallback and (dvui.backend.kind == .web or dvui.backend.kind == .testing);
+pub const WebFallback = if (web_fallback_enabled) opentype.discovery_web_fallback.Service else void;
+
+/// `Window.InitOptions.web_font_fallback`; read by the web backend only. To
+/// switch at runtime: `dvui.currentWindow().fonts.setWebFallback(gpa, .{ .enabled = false })`.
+pub const WebFallbackOptions = struct {
+    /// false: nothing is fetched; scripts the app's own fonts lack render as tofu.
+    enabled: bool = true,
+    /// Fonts are fetched from `base_url` + each font's relative path (a
+    /// trailing '/' is optional); not copied. The default is Google's font
+    /// CDN, as in Flutter web: every visitor's browser then contacts Google
+    /// servers, disclosing their IP address (GDPR-relevant). To self-host,
+    /// mirror the set with `scripts/mirror_web_fallback.py <dir>` and point
+    /// this at wherever that directory is served (cross-origin needs CORS).
+    base_url: []const u8 = if (web_fallback_enabled) opentype.discovery_web_fallback.default_base_url else "",
+};
+
 const system_font_size_limit = 256 * 1024 * 1024; // needed for big emoji fonts (Apple Color Emoji.ttc is ~180MB)
 
 /// The CSS generic family keywords "serif", "sans-serif" and "monospace",
@@ -770,6 +790,9 @@ pub const Cache = struct {
     /// it before text is shaped: codepoints already looked up stay memoized
     /// in `dynamic_fallback`. Not copied; must outlive the `Cache`.
     fallback_language: ?[]const u8 = null,
+    /// Set by the web backend at init. A codepoint no font covers renders as
+    /// tofu while its font downloads; arrival clears `shaped_line_cache`.
+    web_fallback: if (web_fallback_enabled) ?WebFallback else void = if (web_fallback_enabled) null else {},
     /// Family aliases from `dvui.addFontFamily`: alias -> ordered family
     /// names, most-preferred first. Unbounded in length, unlike the family
     /// name a `Font` itself carries.
@@ -801,6 +824,9 @@ pub const Cache = struct {
         }
         self.database.deinit(gpa);
         self.dynamic_fallback.deinit(gpa);
+        if (web_fallback_enabled) {
+            if (self.web_fallback) |*service| service.deinit(gpa);
+        }
 
         var ait = self.family_aliases.iterator();
         while (ait.next()) |kv| {
@@ -1082,6 +1108,7 @@ pub const Cache = struct {
     /// touches them (a later frame's `dynamic_fallback.get`, or the byte
     /// buffer's owning-allocator free in `Cache.deinit`).
     pub fn discoverDynamicFallback(self: *Cache, persist_gpa: std.mem.Allocator, codepoint: u21) ?Font {
+        if (system_font_backend == null) return null;
         if (self.dynamic_fallback.get(codepoint)) |cached| return cached;
         const found = self.loadDynamicFallback(persist_gpa, codepoint);
         self.dynamic_fallback.put(persist_gpa, codepoint, found) catch {};
@@ -1148,6 +1175,80 @@ pub const Cache = struct {
         return synthetic;
     }
 
+    /// Web counterpart to `discoverDynamicFallback`: a registered web fallback
+    /// font covering `codepoint`, else queues it for `processWebFallback` and
+    /// returns null (tofu until the font arrives).
+    fn webFallbackFont(self: *Cache, persist_gpa: std.mem.Allocator, codepoint: u21) ?Font {
+        if (!web_fallback_enabled) return null;
+        const service = if (self.web_fallback) |*s| s else return null;
+        if (service.registeredFontFor(codepoint)) |font| return webFallbackFamily(font);
+        service.addMissingCodepoint(persist_gpa, codepoint) catch {};
+        return null;
+    }
+
+    fn webFallbackFamily(font: u16) Font {
+        var buf: [16]u8 = undefined;
+        return Font.init(std.fmt.bufPrint(&buf, "wf:{d}", .{font}) catch unreachable);
+    }
+
+    /// Hands the fonts `web_fallback` picked for the frame's missing
+    /// codepoints to the backend's `fetchFallbackFont`. Called from `Window.end`.
+    pub fn processWebFallback(self: *Cache, gpa: std.mem.Allocator, scratch: std.mem.Allocator) void {
+        if (!web_fallback_enabled) return;
+        const service = if (self.web_fallback) |*s| s else return;
+        if (!service.needs_process) return;
+        service.language = self.fallback_language;
+        var fonts: std.ArrayList(u16) = .empty;
+        defer fonts.deinit(scratch);
+        service.process(gpa, scratch, &fonts) catch return;
+        if (!@hasDecl(dvui.backend, "fetchFallbackFont")) return;
+        var url_buf: [512]u8 = undefined;
+        for (fonts.items) |font| {
+            const url = service.url(font, &url_buf) catch {
+                service.fontFailed(gpa, font);
+                continue;
+            };
+            dvui.backend.fetchFallbackFont(font, url);
+        }
+    }
+
+    /// `bytes` (allocated with `gpa`, owned by the cache from here on) arrived
+    /// for web fallback `font`.
+    pub fn webFallbackLoaded(self: *Cache, gpa: std.mem.Allocator, font: u16, bytes: []u8) void {
+        if (!web_fallback_enabled) return gpa.free(bytes);
+        const service = if (self.web_fallback) |*s| s else return gpa.free(bytes);
+        const parsed = Entry.parseFontOrCollection(gpa, bytes, 0) catch {
+            gpa.free(bytes);
+            return service.fontFailed(gpa, font);
+        };
+        parsed.deinit(gpa);
+        self.database.append(gpa, .{
+            .family = webFallbackFamily(font).family,
+            .bytes = bytes,
+            .allocator = gpa,
+            .display_family = array(service.set.fonts[font].name),
+        }) catch {
+            gpa.free(bytes);
+            return service.fontFailed(gpa, font);
+        };
+        service.fontLoaded(font);
+        self.clearShapedLineCache(gpa);
+    }
+
+    /// Replaces the web fallback service. Fonts fetched so far stay loaded
+    /// but go unused.
+    pub fn setWebFallback(self: *Cache, gpa: std.mem.Allocator, options: WebFallbackOptions) void {
+        if (!web_fallback_enabled) return;
+        if (self.web_fallback) |*service| service.deinit(gpa);
+        self.web_fallback = if (options.enabled) .{ .base_url = options.base_url } else null;
+        self.clearShapedLineCache(gpa);
+    }
+
+    pub fn webFallbackFailed(self: *Cache, gpa: std.mem.Allocator, font: u16) void {
+        if (!web_fallback_enabled) return;
+        if (self.web_fallback) |*service| service.fontFailed(gpa, font);
+    }
+
     /// Shape text up to first newline, splitting runs by font stack coverage.
     /// `persist_gpa` backs only `resolved.logged_missing`, which outlives the
     /// frame (cached in `resolved_stacks`) -- passing a per-frame arena there
@@ -1192,37 +1293,32 @@ pub const Cache = struct {
 
         // Fallback font stack in priority order, from the cheap parse-only
         // fonts `resolveStack` built -- no `cache` lookup/eviction concerns
-        // since `raw_fonts` is owned by `resolved` itself. A few trailing
-        // slots for dynamically discovered system fonts (see below), for
-        // codepoints no registered family covers.
-        const dynamic_fallback_cap = 4;
-        const max_stack_fonts = resolved.entry_hashes.len + dynamic_fallback_cap;
-        const fonts_buf = try gpa.alloc(OtFont, max_stack_fonts);
-        defer gpa.free(fonts_buf);
-        const hashes_buf = try gpa.alloc(u64, max_stack_fonts);
-        defer gpa.free(hashes_buf);
-        const family_fonts_buf = try gpa.alloc(Font, max_stack_fonts);
-        defer gpa.free(family_fonts_buf);
-        var nfonts: usize = resolved.entry_hashes.len;
-        for (0..nfonts) |i| {
-            fonts_buf[i] = resolved.raw_fonts[i];
-            hashes_buf[i] = resolved.entry_hashes[i];
-            family_fonts_buf[i] = resolved.family_fonts[i];
-        }
+        // since `raw_fonts` is owned by `resolved` itself, followed by
+        // dynamically discovered fonts (see below) for codepoints no
+        // registered family covers.
+        const static_fonts = resolved.entry_hashes.len;
+        var fonts_list: std.ArrayList(OtFont) = .empty;
+        defer fonts_list.deinit(gpa);
+        var hashes_list: std.ArrayList(u64) = .empty;
+        defer hashes_list.deinit(gpa);
+        var family_fonts_list: std.ArrayList(Font) = .empty;
+        defer family_fonts_list.deinit(gpa);
+        try fonts_list.appendSlice(gpa, resolved.raw_fonts[0..static_fonts]);
+        try hashes_list.appendSlice(gpa, resolved.entry_hashes);
+        try family_fonts_list.appendSlice(gpa, resolved.family_fonts[0..static_fonts]);
 
-        // Query the OS for each newly-uncovered codepoint (skipping any
-        // already covered by a font discovered earlier in this same line),
-        // until the line is covered or `dynamic_fallback_cap` slots are used
-        // -- a line mixing several scripts absent from the static stack
-        // needs more than one dynamic font, not just the first.
-        var dynamic_cmaps: [dynamic_fallback_cap][]const u8 = undefined;
-        var ndynamic: usize = 0;
-        if (nfonts > 0) {
+        // Query the OS (or the web fallback service) for each newly-uncovered
+        // codepoint, skipping any already covered by a font discovered
+        // earlier in this same line. Uncapped: a CJK web fallback font is
+        // split into ~100 slices, so a long CJK line can need dozens, and
+        // every missing codepoint must reach `webFallbackFont` to be fetched.
+        var dynamic_cmaps: std.ArrayList([]const u8) = .empty;
+        defer dynamic_cmaps.deinit(gpa);
+        if (static_fonts > 0) {
             for (decoded.codepoints) |cp| {
-                if (nfonts >= max_stack_fonts) break;
                 if (resolved.entryIndexFor(cp) != null) continue;
                 var covered = false;
-                for (dynamic_cmaps[0..ndynamic]) |cm| {
+                for (dynamic_cmaps.items) |cm| {
                     if (Cmap.lookup(cm, cp) != null) {
                         covered = true;
                         break;
@@ -1233,11 +1329,11 @@ pub const Cache = struct {
                 // (which family covers it, independent of size), so its
                 // result carries Font.DefaultSize -- rescale to the size the
                 // primary font was actually requested at.
-                if (self.discoverDynamicFallback(persist_gpa, cp)) |raw_dyn_font| {
+                if (self.discoverDynamicFallback(persist_gpa, cp) orelse self.webFallbackFont(persist_gpa, cp)) |raw_dyn_font| {
                     const dyn_font = raw_dyn_font.withSize(resolved.family_fonts[0].size);
                     const dyn_hash = dyn_font.hash();
                     var already_added = false;
-                    for (hashes_buf[resolved.entry_hashes.len..nfonts]) |h| {
+                    for (hashes_list.items[static_fonts..]) |h| {
                         if (h == dyn_hash) {
                             already_added = true;
                             break;
@@ -1248,15 +1344,11 @@ pub const Cache = struct {
                     // outlives this frame -- gpa here may be a frame-scoped
                     // arena that resets right after this call returns.
                     const dyn_entry = try self.getOrCreate(persist_gpa, dyn_font);
-                    fonts_buf[nfonts] = dyn_entry.parsed_font;
-                    hashes_buf[nfonts] = dyn_hash;
-                    family_fonts_buf[nfonts] = dyn_font;
-                    nfonts += 1;
+                    try fonts_list.append(gpa, dyn_entry.parsed_font);
+                    try hashes_list.append(gpa, dyn_hash);
+                    try family_fonts_list.append(gpa, dyn_font);
                     const cmap = dyn_entry.parsed_font.tableData(.{ 'c', 'm', 'a', 'p' }) orelse &.{};
-                    if (cmap.len > 0 and ndynamic < dynamic_fallback_cap) {
-                        dynamic_cmaps[ndynamic] = cmap;
-                        ndynamic += 1;
-                    }
+                    if (cmap.len > 0) try dynamic_cmaps.append(gpa, cmap);
                 }
             }
         }
@@ -1272,11 +1364,11 @@ pub const Cache = struct {
         var cache_segments: std.ArrayList(CachedShapedLine.Segment) = .empty;
         errdefer cache_segments.deinit(gpa);
 
-        if (decoded.codepoints.len > 0 and nfonts > 0) {
+        if (decoded.codepoints.len > 0 and fonts_list.items.len > 0) {
             for (decoded.codepoints) |cp| {
                 if (resolved.entryIndexFor(cp) != null) continue;
                 var covered = false;
-                for (dynamic_cmaps[0..ndynamic]) |cm| {
+                for (dynamic_cmaps.items) |cm| {
                     if (Cmap.lookup(cm, cp) != null) {
                         covered = true;
                         break;
@@ -1286,7 +1378,7 @@ pub const Cache = struct {
                 _ = self.entryIndexForLogged(resolved, persist_gpa, cp); // diagnostics
             }
             // Bidi outer, font fallback inner, so visual reordering crosses font boundaries.
-            const shaped = shapeBidiParagraphWithFallback(gpa, fonts_buf[0..nfonts], decoded.codepoints, base_direction, &.{}, &.{}, &.{}, item_cp) catch |err| switch (err) {
+            const shaped = shapeBidiParagraphWithFallback(gpa, fonts_list.items, decoded.codepoints, base_direction, &.{}, &.{}, &.{}, item_cp) catch |err| switch (err) {
                 error.OutOfMemory => |e| return e,
                 else => BidiFallbackResult{ .buffer = Buffer.init(gpa), .font_indices = &.{} },
             };
@@ -1309,7 +1401,7 @@ pub const Cache = struct {
                 var h = g + 1;
                 while (h < shaped.font_indices.len and shaped.font_indices[h] == fi) h += 1;
                 // persist_gpa: see note on the dynamic-fallback getOrCreate above.
-                _ = try self.getOrCreate(persist_gpa, family_fonts_buf[fi]);
+                _ = try self.getOrCreate(persist_gpa, family_fonts_list.items[fi]);
                 g = h;
             }
             g = 0;
@@ -1317,9 +1409,9 @@ pub const Cache = struct {
                 const fi = shaped.font_indices[g];
                 var h = g + 1;
                 while (h < shaped.font_indices.len and shaped.font_indices[h] == fi) h += 1;
-                const fce = try self.getOrCreate(persist_gpa, family_fonts_buf[fi]);
+                const fce = try self.getOrCreate(persist_gpa, family_fonts_list.items[fi]);
                 try segments.append(gpa, .{ .entry = fce, .glyph_start = @intCast(g), .glyph_end = @intCast(h) });
-                try cache_segments.append(gpa, .{ .entry_hash = hashes_buf[fi], .glyph_start = @intCast(g), .glyph_end = @intCast(h) });
+                try cache_segments.append(gpa, .{ .entry_hash = hashes_list.items[fi], .glyph_start = @intCast(g), .glyph_end = @intCast(h) });
                 g = h;
             }
         }
@@ -2529,6 +2621,98 @@ test "Cache.shapeLineText: emoji next to CJK gets its own dynamic-fallback font,
     }
 }
 
+
+test "Cache web fallback: a missing codepoint is requested once and resolves to the arrived font" {
+    if (!web_fallback_enabled) return error.SkipZigTest;
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    const cw = dvui.currentWindow();
+    cw.fonts.web_fallback = .{};
+    cw.fonts.fallback_language = "ko";
+
+    const pendingFont = struct {
+        fn get(service: *const WebFallback) ?u16 {
+            var found: ?u16 = null;
+            for (service.font_states, 0..) |state, i| {
+                if (state != .pending) continue;
+                if (found != null) return null;
+                found = @intCast(i);
+            }
+            return found;
+        }
+    }.get;
+
+    try std.testing.expect(cw.fonts.webFallbackFont(cw.gpa, 0xAC00) == null);
+    cw.fonts.processWebFallback(cw.gpa, std.testing.allocator);
+    const service = &cw.fonts.web_fallback.?;
+    const font = pendingFont(service).?;
+    try std.testing.expect(std.mem.startsWith(u8, service.set.fonts[font].name, "Noto Sans KR "));
+
+    // a later frame hitting the same codepoint requests nothing new
+    try std.testing.expect(cw.fonts.webFallbackFont(cw.gpa, 0xAC00) == null);
+    cw.fonts.processWebFallback(cw.gpa, std.testing.allocator);
+    try std.testing.expectEqual(@as(?u16, font), pendingFont(service));
+
+    cw.fonts.webFallbackLoaded(cw.gpa, font, try cw.gpa.dupe(u8, @embedFile("fonts/NotoSansKR-Regular.ttf")));
+    const arrived = cw.fonts.webFallbackFont(cw.gpa, 0xAC00).?;
+    try std.testing.expect(cw.fonts.findSource(arrived).@"0" != null);
+    try std.testing.expectEqual(@as(usize, 0), cw.fonts.shaped_line_cache.count());
+}
+
+test "Cache web fallback: a long CJK line needing many fallback fonts requests every codepoint and renders once loaded" {
+    if (!web_fallback_enabled or system_font_backend == null) return error.SkipZigTest;
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    const gpa = std.testing.allocator;
+    try dvui.addFont("TestLatin", Source.fallback.bytes, null);
+    const cw = dvui.currentWindow();
+    cw.fonts.web_fallback = .{};
+    cw.fonts.fallback_language = "ko";
+    const resolved = try cw.fonts.resolveStack(cw.gpa, .init("TestLatin"));
+
+    // 200 frequent Hanzi; fonts/hanzi_slices.ttc holds 17 fontTools subsets of
+    // NotoSansKR-Regular.ttf covering 10 consecutive ones each, standing in
+    // for the ~100 slices each CJK font is split into on the web
+    const slice_count = 17;
+    const text ="的一是不了人我在有他中大来上国到子和地出道也年得就那要下以生会自着去之家学对可里后小心多天而能好都然日于起成事只作当想看文无手十用主行方又如前所本见面公同三已老两长知民分将外但身些与高意把法此回二理美点月明其声全工己儿者向情部正名定女力机等几很最新什打便位因重被走四第门相次政海口使教西再平真听世气信北少并加化由却代入先山五太水万市眼体才比住九笑性通目立马命活神件安表原车白路期叫死常提感金何更反合放";
+    // the slices come in as already-discovered fallback fonts; nothing covers the last 30
+    var codepoints = (try std.unicode.Utf8View.init(text)).iterator();
+    var index: usize = 0;
+    while (codepoints.nextCodepoint()) |cp| : (index += 1) {
+        const slice = index / 10;
+        if (slice >= slice_count) {
+            try cw.fonts.dynamic_fallback.put(cw.gpa, cp, null);
+            continue;
+        }
+        var name_buf: [16]u8 = undefined;
+        const family = Font.init(try std.fmt.bufPrint(&name_buf, "slice:{d}", .{slice}));
+        if (index % 10 == 0) try cw.fonts.database.append(cw.gpa, .{
+            .family = family.family,
+            .bytes = @embedFile("fonts/hanzi_slices.ttc"),
+            .collection_index = @intCast(slice),
+        });
+        try cw.fonts.dynamic_fallback.put(cw.gpa, cp, family);
+    }
+
+    var first = try cw.fonts.shapeLineText(gpa, cw.gpa, resolved, text, null, .auto);
+    first.deinit();
+    const service = &cw.fonts.web_fallback.?;
+    try std.testing.expectEqual(@as(usize, 200 - slice_count * 10), service.unprocessed.count());
+
+    cw.fonts.processWebFallback(cw.gpa, gpa);
+    var requested: usize = 0;
+    for (service.font_states, 0..) |state, font| {
+        if (state != .pending) continue;
+        requested += 1;
+        cw.fonts.webFallbackLoaded(cw.gpa, @intCast(font), try cw.gpa.dupe(u8, @embedFile("fonts/NotoSansKR-Regular.ttf")));
+    }
+    try std.testing.expectEqual(@as(usize, 1), requested); // the monolithic KR parent, preferred for "ko"
+
+    var line = try cw.fonts.shapeLineText(gpa, cw.gpa, resolved, text, null, .auto);
+    defer line.deinit();
+    try std.testing.expectEqual(@as(usize, 200), line.buffer.info.items.len);
+    for (line.buffer.info.items) |info| try std.testing.expect(info.codepoint != 0);
+}
 
 test "TextSizeOptions.item: shapes with context but reports only the item" {
     var t = try dvui.testing.init(.{});

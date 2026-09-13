@@ -128,13 +128,18 @@ const fragmentShaderSource_webgl2 = `# version 300 es
 
 /**
  * @param {string | HTMLCanvasElement} canvas - A canvas element or string id of one
- * @param {DVUI.WasmArg} wasmRef - The url to the wasm file, to be used in `fetch`
+ * @param {DVUI.WasmArg} wasmRef - The url to the wasm file, to be used in `fetch`;
+ *   or a function instantiating it with the given imports (use this to bring
+ *   your own wasm: the imports differ per build, e.g. -Dfont-fallback adds some);
+ *   or an already instantiated source, which must have been given those imports.
  * @returns {Promise<Dvui>}
  */
 export function dvui(canvas, wasmRef) {
     const dvui = new Dvui();
     const wasmPromise = typeof wasmRef === "string"
         ? WebAssembly.instantiateStreaming(fetch(wasmRef), { dvui: dvui.imports })
+        : typeof wasmRef === "function"
+        ? wasmRef({ dvui: dvui.imports })
         : Promise.resolve(wasmRef);
     return wasmPromise.then((result) => {
         dvui.setInstance(result.instance);
@@ -977,15 +982,23 @@ export class Dvui {
                     this.hidden_input.value = "";
                 }
             },
-            wasm_add_noto_font: () => {
-                dvui_fetch("NotoSansKR-Regular.ttf").then((bytes) => {
-                    //console.log("bytes len " + bytes.length);
-                    const ptr = this.allocBuffer(this.instance.exports.gpa_u8, bytes)
-                    this.instance.exports.new_font(
-                        ptr,
-                        bytes.length,
-                    );
-                });
+            wasm_font_fallback_language: (ptr, len) => {
+                const bytes = utf8encoder.encode(navigator.language || "");
+                if (bytes.length > len) return 0;
+                new Uint8Array(this.instance.exports.memory.buffer, ptr, len).set(bytes);
+                return bytes.length;
+            },
+            // only -Dfont-fallback builds call this, so only they load web_fallback.js
+            wasm_font_fallback_fetch: (font, ptr, len) => {
+                const url = this.stringFromPointer(ptr, len);
+                import("./web_fallback.js").then(
+                    (fallback) => fallback.fetchFallbackFont(this, font, url),
+                    (err) => {
+                        console.warn(`font fallback: web_fallback.js unavailable: ${err}`);
+                        this.instance.exports.dvui_font_fallback_failed(font);
+                        this.requestRender();
+                    },
+                );
             },
         };
     }

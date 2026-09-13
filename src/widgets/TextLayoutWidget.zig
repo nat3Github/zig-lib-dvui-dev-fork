@@ -1560,11 +1560,13 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
         }
     }
 
-    var txt = dvui.toUtf8(cw.lifo(), visible_chunk) catch |err| blk: {
+    const utf8_chunk = dvui.toUtf8(cw.lifo(), visible_chunk) catch |err| blk: {
         dvui.logError(@src(), err, "Failed to convert to utf8", .{});
         break :blk visible_chunk;
     };
-    defer if (txt.ptr != visible_chunk.ptr) cw.lifo().free(txt);
+    // `txt` is advanced below, so free the original slice, not what's left.
+    defer if (utf8_chunk.ptr != visible_chunk.ptr) cw.lifo().free(utf8_chunk);
+    var txt = utf8_chunk;
 
     const options = self.data().options.override(opts);
     const font = options.fontGet();
@@ -1688,14 +1690,27 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
 
         if (self.break_lines) blk: {
 
-            // try to break on space if:
-            // - slice ended due to width (not newline)
-            // - linewidth is long enough (otherwise too narrow to break on space)
-            if (end < txt.len and !self.newline and linewidth > (10 * msize.w)) {
-                // now we are under the length limit but might be in the middle of a word
-                // look one char further because we might be right at the end of a word
-                if (lastLineBreakOpportunity(dvui.currentWindow().lifo(), txt, end + 1, self.line_break, self.word_break)) |brk| {
+            // Slice ended due to width (not newline): retreat to a break
+            // opportunity. No narrow-width cutoff -- without an opportunity
+            // `overflow_wrap` already falls back to a character break.
+            if (end < txt.len and !self.newline) {
+                // Spaces past the width hang (CSS white-space: normal), and
+                // UAX #14 only breaks after them, so search from past the run.
+                // ponytail: U+0020 only; tabs/NBSP-like spaces don't hang.
+                var hang_end = end;
+                while (hang_end < txt.len and txt[hang_end] == ' ') hang_end += 1;
+                if (Font.firstHardBreak(txt[hang_end..])) |hb| {
+                    if (hb.start == 0) hang_end += hb.len;
+                }
+                // `+ 1` decodes the codepoint at `hang_end`, so a break right
+                // at `hang_end` isn't discarded as the window-edge eot.
+                const brk_found: ?usize = if (hang_end == txt.len) txt.len else lastLineBreakOpportunity(dvui.currentWindow().lifo(), txt, hang_end + 1, self.line_break, self.word_break);
+                if (brk_found) |brk| {
                     end = brk;
+                    self.newline = Font.trailingHardBreakLen(txt[0..end]) > 0;
+                    var ink_end = end - Font.trailingHardBreakLen(txt[0..end]);
+                    while (ink_end > 0 and txt[ink_end - 1] == ' ') ink_end -= 1;
+                    if (ink_end == 0) ink_end = end;
                     if (shaped) |*st| {
                         const shaped_len = st.line.byte_offsets[st.line.codepoints.len];
                         if (end <= shaped_len) {
@@ -1703,18 +1718,17 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
                             // what we already shaped above -- re-measure
                             // by summing already-computed advances instead
                             // of reshaping.
-                            s = st.measureUpToByteOffset(cw.gpa, end) catch font.textSizeEx(txt[0..end], .{});
+                            s = st.measureUpToByteOffset(cw.gpa, ink_end) catch font.textSizeEx(txt[0..ink_end], .{});
                         } else {
-                            // Rare: the break search's one-char lookahead
-                            // crossed past what was shaped. Fall back to a
-                            // single reshape for this fragment (matches
-                            // old behavior; `shaped` no longer matches
-                            // `end` so downstream reuse is skipped too).
+                            // Rare: the break search's lookahead crossed
+                            // past what was shaped. Fall back to a single
+                            // reshape for this fragment (`shaped` no longer
+                            // matches `end` so downstream reuse is skipped).
                             shaped = null;
-                            s = font.textSizeEx(txt[0..end], .{});
+                            s = font.textSizeEx(txt[0..ink_end], .{});
                         }
                     } else {
-                        s = font.textSizeEx(txt[0..end], .{});
+                        s = font.textSizeEx(txt[0..ink_end], .{});
                     }
                     break :blk; // this part will fit
                 }
@@ -3694,6 +3708,34 @@ test "e2e: a wrapped RTL paragraph stays inside its width" {
     // Drop it and the same text fits in fewer, over-wide lines.
     try std.testing.expect(fns.lines > 1);
     try std.testing.expect(fns.total_width / fns.lines <= fns.avail);
+}
+
+test "e2e: a word that fits keeps its line when only the trailing space overflows" {
+    var t = try dvui.testing.init(.{ .window_size = .{ .w = 800, .h = 200 } });
+    defer t.deinit();
+
+    const fns = struct {
+        const word = "mmmmmmmmmmmmmm";
+        var word_width: f32 = 0;
+        var lines: usize = 0;
+
+        fn frame() !dvui.App.Result {
+            var tl = dvui.textLayout(@src(), .{}, .{ .padding = .{}, .rect = .{ .w = word_width + 1, .h = 180 } });
+            word_width = tl.data().options.fontGet().textSize(word).w;
+            tl.addText(word ++ " " ++ word, .{});
+            tl.addTextDone(.{});
+            lines = tl.line + 1;
+            tl.deinit();
+            return .ok;
+        }
+    };
+
+    try dvui.testing.settle(fns.frame);
+
+    // Before: the seed stopped on the space, the `end + 1` lookahead never saw
+    // the break after it, and the first word was char-broken off, leaving the
+    // second line to start with a space and wrap again.
+    try std.testing.expectEqual(@as(usize, 2), fns.lines);
 }
 
 test "e2e: an RTL paragraph starts at the right edge" {

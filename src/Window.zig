@@ -213,6 +213,11 @@ pub const InitOptions = struct {
     open_flag: ?*bool = null,
 
     button_order: ?dvui.enums.DialogButtonOrder = null,
+
+    /// Web backend only: where fonts for scripts the app's fonts lack come
+    /// from, and whether to fetch them at all. Defaults to Google's font CDN;
+    /// see `dvui.Font.WebFallbackOptions`.
+    web_font_fallback: dvui.Font.WebFallbackOptions = .{},
 };
 
 pub fn init(
@@ -259,6 +264,11 @@ pub fn init(
     }
 
     try self.initEvents();
+
+    if (dvui.Font.web_fallback_enabled and dvui.backend.kind == .web) {
+        self.fonts.setWebFallback(gpa, init_opts.web_font_fallback);
+        self.fonts.fallback_language = dvui.backend.fallbackLanguage();
+    }
 
     self.button_order = init_opts.button_order orelse switch (builtin.os.tag) {
         .windows => .ok_cancel,
@@ -1654,6 +1664,8 @@ pub fn end(self: *Self, opts: endOptions) !?u32 {
     if (!self.end_rendering_done) {
         self.endRendering(opts);
     }
+
+    self.fonts.processWebFallback(self.gpa, self.lifo());
 
     // events may have been tagged with a focus widget that never showed up
     const evts = dvui.events();
