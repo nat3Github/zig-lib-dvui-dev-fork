@@ -24,42 +24,6 @@ const demo_stack_alias = "Demo Stack (Aleo + Noto KR)";
 var family_choices: ?[]const []const u8 = null;
 var family_choices_buf: [1024][]const u8 = undefined;
 var family_names_storage: [64 * 1024]u8 = undefined;
-var manifest_font_state: enum { unresolved, loaded, failed } = .unresolved;
-var manifest_woff2_font_state: enum { unresolved, loaded, failed } = .unresolved;
-
-/// css2-API-style manifest (family name -> variants -> font URL); see
-/// `opentype.discovery_manifest.ManifestSource`. Points at a real,
-/// statically-hosted OFL font so the demo can fetch it over HTTP.
-const manifest_test_fixture =
-    \\{
-    \\  "families": [
-    \\    {
-    \\      "name": "Tinos",
-    \\      "variants": [
-    \\        {"weight": 400, "style": "normal", "url": "https://raw.githubusercontent.com/google/fonts/main/ofl/tinos/Tinos-Regular.ttf"}
-    \\      ]
-    \\    }
-    \\  ]
-    \\}
-;
-
-/// Same font, WOFF2-encoded (Google Fonts' actual serving format) -- exercises
-/// the `opentype` WOFF2 decoder end to end, which the plain-.ttf fixture above
-/// never touches. Requires the library built with `-Dwoff2=true`; otherwise
-/// `resolveManifestFont` fails with `error.Woff2NotSupported`, same as any
-/// other unsupported-format failure.
-const manifest_woff2_test_fixture =
-    \\{
-    \\  "families": [
-    \\    {
-    \\      "name": "Tinos WOFF2",
-    \\      "variants": [
-    \\        {"weight": 400, "style": "normal", "url": "https://fonts.gstatic.com/s/tinos/v26/buE4poGnedXvwjX7fmQ.woff2"}
-    \\      ]
-    \\    }
-    \\  ]
-    \\}
-;
 
 /// ![image](Examples-text_layout.png)
 pub fn layoutText() void {
@@ -450,26 +414,6 @@ fn multiScript() void {
             cw.fonts.dynamic_fallback.clearRetainingCapacity();
         }
     }
-    {
-        var hbox = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
-        defer hbox.deinit();
-        // Fetch only on explicit click -- resolveManifestFont blocks the UI
-        // thread on a synchronous HTTP GET.
-        if (manifest_font_state == .unresolved and dvui.button(@src(), "Fetch Tinos", .{}, .{ .gravity_y = 0.5 })) {
-            manifest_font_state = .failed;
-            if (dvui.Font.resolveManifestFont(dvui.currentWindow().gpa, manifest_test_fixture, dvui.Font.find(.{ .family = "Tinos" }))) |source| {
-                dvui.currentWindow().fonts.database.append(dvui.currentWindow().gpa, source) catch {};
-                manifest_font_state = .loaded;
-            }
-        }
-        if (manifest_woff2_font_state == .unresolved and dvui.button(@src(), "Fetch Tinos WOFF2", .{}, .{ .gravity_y = 0.5 })) {
-            manifest_woff2_font_state = .failed;
-            if (dvui.Font.resolveManifestFont(dvui.currentWindow().gpa, manifest_woff2_test_fixture, dvui.Font.find(.{ .family = "Tinos WOFF2" }))) |source| {
-                dvui.currentWindow().fonts.database.append(dvui.currentWindow().gpa, source) catch {};
-                manifest_woff2_font_state = .loaded;
-            }
-        }
-    }
 
     var mtl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal });
     defer mtl.deinit();
@@ -513,20 +457,6 @@ fn multiScript() void {
         // Language in the line text too: shaped lines are cached by text, so this reshapes on a switch.
         mtl.format("Han, fallback language {s}: {s}\n", .{ lang, resolvedFontName(han_font, firstCodepoint(han_sample), &source) }, .{ .font = han_font });
         mtl.format("[{s}] {s}\n\n", .{ lang, han_sample }, .{ .font = han_font });
-    }
-
-    const manifest_font = dvui.Font.find(.{ .family = "Tinos", .size = font_size });
-    switch (manifest_font_state) {
-        .unresolved => mtl.format("Manifest (remote font): press \"Fetch Tinos\"\n\n", .{}, .{}),
-        .loaded => mtl.format("Fetched over HTTP from a manifest URL: the quick brown fox\n\n", .{}, .{ .font = manifest_font }),
-        .failed => mtl.format("Manifest fetch failed (offline, or not available on this target)\n\n", .{}, .{}),
-    }
-
-    const manifest_woff2_font = dvui.Font.find(.{ .family = "Tinos WOFF2", .size = font_size });
-    switch (manifest_woff2_font_state) {
-        .unresolved => mtl.format("Manifest (remote WOFF2 font): press \"Fetch Tinos WOFF2\"\n\n", .{}, .{}),
-        .loaded => mtl.format("Fetched WOFF2 over HTTP from a manifest URL: the quick brown fox\n\n", .{}, .{ .font = manifest_woff2_font }),
-        .failed => mtl.format("WOFF2 manifest fetch failed (offline, not built with -Dwoff2=true, or not available on this target)\n\n", .{}, .{}),
     }
 }
 

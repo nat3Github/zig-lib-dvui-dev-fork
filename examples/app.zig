@@ -133,7 +133,7 @@ pub fn content() ?dvui.App.Result {
     tl2.addText("Framerate is variable and adjusts as needed for input events and animations.\n\n", .{});
     tl2.addText("Framerate is capped by vsync.\n\n", .{});
     tl2.addText("Cursor is always being set by dvui.\n\n", .{});
-            tl2.addText("Fonts are being rendered by opentype (lib-opentype-renderer).", .{});
+    tl2.addText("Fonts are being rendered by opentype (lib-opentype-renderer).", .{});
     tl2.deinit();
 
     const label = if (dvui.Examples.show_demo_window) "Hide Demo Window" else "Show Demo Window";

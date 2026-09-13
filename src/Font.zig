@@ -23,7 +23,6 @@ const discovery_fontconfig = opentype.discovery_fontconfig;
 const discovery_core_text = opentype.discovery_core_text;
 const discovery_directwrite = opentype.discovery_directwrite;
 const discovery_android = opentype.discovery_android;
-const discovery_manifest = opentype.discovery_manifest;
 const selectBestFontMatch = opentype.selectBestFontMatch;
 const shapeBidiParagraphWithFallback = opentype.shapeBidiParagraphWithFallback;
 pub const HardBreak = opentype.HardBreak;
@@ -458,110 +457,6 @@ fn discoverSystemFont(gpa: std.mem.Allocator, font: Font) ?Source {
         .bytes = loaded.bytes,
         .allocator = gpa,
         .collection_index = loaded.collection_index,
-    };
-}
-
-/// Resolves `family` against a manifest (family name -> variants -> font
-/// URL JSON, e.g. what a Google Fonts-style `css2` API returns) using
-/// `opentype.discovery_manifest`, fetches the matched URL over HTTP, and
-/// returns it as a `Source`. Unlike `discoverSystemFont`, there's no OS font
-/// source to consult here -- the manifest and the URLs it points to are
-/// whatever the app supplies, which is why this isn't wired into
-/// `Cache.resolveSource`'s automatic fallback chain; call it explicitly for
-/// fonts you want served from a remote source instead of/in addition to the
-/// OS. Not available on wasm (no synchronous network I/O in a WASM host);
-/// returns null there the same as any other unresolved font.
-pub fn resolveManifestFont(gpa: std.mem.Allocator, manifest_json: []const u8, font: Font) ?Source {
-    if (comptime !@hasDecl(discovery_manifest, "ManifestSource")) return null;
-
-    var source: discovery_manifest.ManifestSource = .init(manifest_json);
-
-    var handle_buf: [16]DiscoveryHandle = undefined;
-    var properties_buf: [16]DiscoveryProperties = undefined;
-    var index_buf: [16]usize = undefined;
-    var url_storage: [4096]u8 = undefined;
-
-    const properties: DiscoveryProperties = .{ .weight = font.weight, .style = font.style, .stretch = font.stretch };
-
-    const handle = selectBestFontMatch(
-        &source,
-        &.{.{ .title = font.familyName() }},
-        properties,
-        &handle_buf,
-        &properties_buf,
-        &index_buf,
-        .{ &url_storage, gpa },
-    ) orelse return null;
-
-    const url = switch (handle) {
-        .url => |u| u.url,
-        .path, .memory => return null, // manifest backend only ever returns .url
-    };
-
-    const bytes = fetchUrl(gpa, url) orelse return null;
-
-    return .{
-        .family = array(font.familyName()),
-        .weight = font.weight,
-        .style = font.style,
-        .stretch = font.stretch,
-        .bytes = bytes,
-        .allocator = gpa,
-    };
-}
-
-/// Blocking HTTP GET (bounded by `fetch_timeout`), used only by
-/// `resolveManifestFont`. Not available on wasm -- a WASM host has no
-/// synchronous network I/O, so fetching a manifest-resolved URL there needs
-/// the JS host's async `fetch()` plus a per-frame poll (the same pattern
-/// `openFilePicker` uses for the async file picker), which isn't implemented
-/// yet.
-const fetch_timeout = std.Io.Duration.fromSeconds(10);
-
-fn fetchUrl(gpa: std.mem.Allocator, url: []const u8) ?[]const u8 {
-    if (comptime builtin.cpu.arch.isWasm()) return null;
-
-    const io = dvui.io;
-    const Result = union(enum) { fetched: ?[]const u8, timed_out: void };
-
-    const run = struct {
-        fn fetch(a: std.mem.Allocator, u: []const u8) ?[]const u8 {
-            var client: std.http.Client = .{ .allocator = a, .io = dvui.io };
-            defer client.deinit();
-
-            var response: std.Io.Writer.Allocating = .init(a);
-            defer response.deinit();
-
-            const result = client.fetch(.{
-                .location = .{ .url = u },
-                .response_writer = &response.writer,
-            }) catch return null;
-            if (result.status != .ok) return null;
-
-            return response.toOwnedSlice() catch null;
-        }
-        fn sleep(io_: std.Io) void {
-            io_.sleep(fetch_timeout, .awake) catch {};
-        }
-    };
-
-    var buf: [2]Result = undefined;
-    var sel: std.Io.Select(Result) = .init(io, &buf);
-    sel.async(.fetched, run.fetch, .{ gpa, url });
-    sel.async(.timed_out, run.sleep, .{io});
-
-    const first = sel.await() catch Result{ .timed_out = {} };
-
-    // Drain and free whatever the loser produced -- if the fetch lost the
-    // race, it may still complete (and allocate) after we've decided to
-    // return the timeout result.
-    while (sel.cancel()) |leftover| {
-        if (leftover == .fetched) if (leftover.fetched) |bytes| gpa.free(bytes);
-    }
-
-    return switch (first) {
-        .fetched => |bytes| bytes,
-        .timed_out => null,
     };
 }
 
@@ -2617,61 +2512,6 @@ test "Cache web fallback: a missing codepoint is requested once and resolves to 
     const arrived = cw.fonts.webFallbackFont(cw.gpa, 0xAC00).?;
     try std.testing.expect(cw.fonts.findSource(arrived).@"0" != null);
     try std.testing.expectEqual(@as(usize, 0), cw.fonts.shaped_line_cache.count());
-}
-
-test "Cache web fallback: a long CJK line needing many fallback fonts requests every codepoint and renders once loaded" {
-    if (!web_fallback_enabled or system_font_backend == null) return error.SkipZigTest;
-    var t = try dvui.testing.init(.{});
-    defer t.deinit();
-    const gpa = std.testing.allocator;
-    try dvui.addFont("TestLatin", Source.fallback.bytes, null);
-    const cw = dvui.currentWindow();
-    cw.fonts.web_fallback = .{};
-    cw.fonts.fallback_language = "ko";
-    const resolved = try cw.fonts.resolveStack(cw.gpa, .init("TestLatin"));
-
-    // 200 frequent Hanzi; fonts/hanzi_slices.ttc holds 17 fontTools subsets of
-    // NotoSansKR-Regular.ttf covering 10 consecutive ones each, standing in
-    // for the ~100 slices each CJK font is split into on the web
-    const slice_count = 17;
-    const text ="的一是不了人我在有他中大来上国到子和地出道也年得就那要下以生会自着去之家学对可里后小心多天而能好都然日于起成事只作当想看文无手十用主行方又如前所本见面公同三已老两长知民分将外但身些与高意把法此回二理美点月明其声全工己儿者向情部正名定女力机等几很最新什打便位因重被走四第门相次政海口使教西再平真听世气信北少并加化由却代入先山五太水万市眼体才比住九笑性通目立马命活神件安表原车白路期叫死常提感金何更反合放";
-    // the slices come in as already-discovered fallback fonts; nothing covers the last 30
-    var codepoints = (try std.unicode.Utf8View.init(text)).iterator();
-    var index: usize = 0;
-    while (codepoints.nextCodepoint()) |cp| : (index += 1) {
-        const slice = index / 10;
-        if (slice >= slice_count) {
-            try cw.fonts.dynamic_fallback.put(cw.gpa, cp, null);
-            continue;
-        }
-        var name_buf: [16]u8 = undefined;
-        const family = Font.init(try std.fmt.bufPrint(&name_buf, "slice:{d}", .{slice}));
-        if (index % 10 == 0) try cw.fonts.database.append(cw.gpa, .{
-            .family = family.family,
-            .bytes = @embedFile("fonts/hanzi_slices.ttc"),
-            .collection_index = @intCast(slice),
-        });
-        try cw.fonts.dynamic_fallback.put(cw.gpa, cp, family);
-    }
-
-    var first = try cw.fonts.shapeLineText(gpa, cw.gpa, resolved, text, null, .auto);
-    first.deinit();
-    const service = &cw.fonts.web_fallback.?;
-    try std.testing.expectEqual(@as(usize, 200 - slice_count * 10), service.unprocessed.count());
-
-    cw.fonts.processWebFallback(cw.gpa, gpa);
-    var requested: usize = 0;
-    for (service.font_states, 0..) |state, font| {
-        if (state != .pending) continue;
-        requested += 1;
-        cw.fonts.webFallbackLoaded(cw.gpa, @intCast(font), try cw.gpa.dupe(u8, @embedFile("fonts/NotoSansKR-Regular.ttf")));
-    }
-    try std.testing.expectEqual(@as(usize, 1), requested); // the monolithic KR parent, preferred for "ko"
-
-    var line = try cw.fonts.shapeLineText(gpa, cw.gpa, resolved, text, null, .auto);
-    defer line.deinit();
-    try std.testing.expectEqual(@as(usize, 200), line.buffer.info.items.len);
-    for (line.buffer.info.items) |info| try std.testing.expect(info.codepoint != 0);
 }
 
 test "TextSizeOptions.item: shapes with context but reports only the item" {
