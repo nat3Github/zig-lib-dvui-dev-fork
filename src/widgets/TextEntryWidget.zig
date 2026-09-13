@@ -1021,14 +1021,7 @@ pub fn processEvent(self: *TextEntryWidget, e: *Event) void {
                             sel.start = sel.cursor;
                             self.textLayout.scroll_to_cursor = true;
                         } else if (sel.cursor > 0) {
-                            // delete character just before cursor
-                            //
-                            // A utf8 char might consist of more than one byte.
-                            // Find the beginning of the last byte by iterating over
-                            // the string backwards. The first byte of a utf8 char
-                            // does not have the pattern 10xxxxxx.
-                            var i: usize = 1;
-                            while (sel.cursor - i > 0 and self.text[sel.cursor - i] & 0xc0 == 0x80) : (i += 1) {}
+                            const i = sel.cursor - opentype.unicode.backspaceStart(self.text[0..self.len], sel.cursor);
                             self.textChangedRemoved(sel.cursor - i, sel.cursor);
                             @memmove(self.text[sel.cursor - i ..][0 .. self.len - sel.cursor], self.text[sel.cursor..self.len]);
                             self.setLen(self.len - i);
@@ -1091,11 +1084,7 @@ pub fn processEvent(self: *TextEntryWidget, e: *Event) void {
                             sel.start = sel.cursor;
                             self.textLayout.scroll_to_cursor = true;
                         } else if (sel.cursor < self.len) {
-                            // delete the character just after the cursor
-                            //
-                            // A utf8 char might consist of more than one byte.
-                            const ii = std.unicode.utf8ByteSequenceLength(self.text[sel.cursor]) catch 1;
-                            const i = @min(ii, self.len - sel.cursor);
+                            const i = opentype.unicode.nextGraphemeBoundary(self.text[0..self.len], sel.cursor) - sel.cursor;
 
                             self.textChangedRemoved(sel.cursor, sel.cursor + i);
                             const remaining = self.len - (sel.cursor + i);
@@ -1835,4 +1824,111 @@ test "overflow_wrap reaches the inner TextLayout" {
 
     try std.testing.expect(broken > 1);
     try std.testing.expectEqual(@as(usize, 1), whole);
+}
+
+const GraphemeEntry = struct {
+    var cursor: usize = 0;
+    var text_buf: [64]u8 = undefined;
+    var text_len: usize = 0;
+    var reset: ?[]const u8 = null;
+
+    fn frame() !dvui.App.Result {
+        var entry: TextEntryWidget = undefined;
+        entry.init(@src(), .{}, .{ .tag = "entry" });
+        defer entry.deinit();
+
+        if (reset) |s| {
+            entry.textSet(s, false);
+            reset = null;
+        }
+
+        entry.processEvents();
+        entry.draw();
+        cursor = entry.textLayout.selection.cursor;
+        const txt = entry.getText();
+        text_len = @min(txt.len, text_buf.len);
+        @memcpy(text_buf[0..text_len], txt[0..text_len]);
+        return .ok;
+    }
+
+    fn text() []const u8 {
+        return text_buf[0..text_len];
+    }
+
+    fn focus() !void {
+        try dvui.testing.settle(frame);
+        try dvui.testing.pressKey(.tab, .none);
+        try dvui.testing.settle(frame);
+    }
+
+    fn load(s: []const u8) !void {
+        reset = s;
+        try dvui.testing.settle(frame);
+        try dvui.testing.pressKey(.home, .lcontrol);
+        try dvui.testing.settle(frame);
+    }
+
+    fn press(key: dvui.enums.Key) !void {
+        try dvui.testing.pressKey(key, .none);
+        try dvui.testing.settle(frame);
+    }
+};
+
+test "graphemes: a combining accent is part of its letter's caret stop" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    try GraphemeEntry.focus();
+
+    try GraphemeEntry.load("e\u{0301}x");
+    try GraphemeEntry.press(.right);
+    try std.testing.expectEqual(@as(usize, 3), GraphemeEntry.cursor);
+    // Backspace takes the accent alone, as Blink and Android do.
+    try GraphemeEntry.press(.backspace);
+    try std.testing.expectEqualStrings("ex", GraphemeEntry.text());
+
+    try GraphemeEntry.load("e\u{0301}x");
+    try GraphemeEntry.press(.delete);
+    try std.testing.expectEqualStrings("x", GraphemeEntry.text());
+}
+
+test "graphemes: a Devanagari conjunct is one caret stop" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    try GraphemeEntry.focus();
+
+    try GraphemeEntry.load("\u{0915}\u{094D}\u{0937}a");
+    try GraphemeEntry.press(.right);
+    try std.testing.expectEqual(@as(usize, 9), GraphemeEntry.cursor);
+    try GraphemeEntry.press(.backspace);
+    try std.testing.expectEqualStrings("\u{0915}\u{094D}a", GraphemeEntry.text());
+}
+
+test "graphemes: a ZWJ emoji sequence moves and deletes as one" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    try GraphemeEntry.focus();
+
+    const family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+    try GraphemeEntry.load(family ++ "x");
+    try GraphemeEntry.press(.right);
+    try std.testing.expectEqual(@as(usize, family.len), GraphemeEntry.cursor);
+    try GraphemeEntry.press(.backspace);
+    try std.testing.expectEqualStrings("x", GraphemeEntry.text());
+
+    try GraphemeEntry.load(family ++ "x");
+    try GraphemeEntry.press(.delete);
+    try std.testing.expectEqualStrings("x", GraphemeEntry.text());
+}
+
+test "graphemes: Thai tone marks ride on their consonant" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    try GraphemeEntry.focus();
+
+    try GraphemeEntry.load("\u{0E17}\u{0E35}\u{0E48}x");
+    try GraphemeEntry.press(.right);
+    try std.testing.expectEqual(@as(usize, 9), GraphemeEntry.cursor);
+    try GraphemeEntry.load("\u{0E17}\u{0E35}\u{0E48}x");
+    try GraphemeEntry.press(.delete);
+    try std.testing.expectEqualStrings("x", GraphemeEntry.text());
 }

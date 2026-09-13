@@ -300,15 +300,25 @@ pub fn renderText(opts: TextOptions) Backend.GenericError!void {
             if (sel) {
                 const range = line.clusterByteRange(gidx);
                 const in_sel = range.start < sel_end and range.end > sel_start;
+                var lo = @min(x, leftx);
+                var hi = nextx;
+                if (in_sel and (range.start < sel_start or range.end > sel_end)) {
+                    // The selection ends inside a ligature: shade only the
+                    // components it covers, at the carets the cursor uses.
+                    const a = start.x + fallback_entry.caretPenOffset(&line, @max(range.start, sel_start), snap);
+                    const b = start.x + fallback_entry.caretPenOffset(&line, @min(range.end, sel_end), snap);
+                    lo = @min(a, b);
+                    hi = @max(a, b);
+                }
                 if (!sel_in and in_sel) {
                     sel_in = true;
-                    sel_start_x = @min(x, leftx);
+                    sel_start_x = lo;
                 } else if (sel_in and !in_sel) {
                     sel_in = false;
                 }
 
                 if (sel_in) {
-                    sel_end_x = nextx;
+                    sel_end_x = hi;
                 }
             }
             if (dvui.accesskit_enabled) {

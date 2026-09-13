@@ -777,7 +777,7 @@ fn visualStops(self: *TextLayoutWidget, arena: std.mem.Allocator) []const CaretS
                 .rtl = f.rtl,
             }) catch break;
             if (off >= text.len) break;
-            off = @min(text.len, off + (std.unicode.utf8ByteSequenceLength(text[off]) catch 1));
+            off = opentype.unicode.nextGraphemeBoundary(text, off);
         }
     }
     std.mem.sort(CaretStop, stops.items, {}, struct {
@@ -1108,8 +1108,7 @@ fn selMoveText(self: *TextLayoutWidget, txt: []const u8, start_idx: usize) void 
                 } else if (cur < start_idx + txt.len) {
                     const newline = txt[cur - start_idx] == '\n';
 
-                    // move cursor one utf8 char right
-                    cur += std.unicode.utf8ByteSequenceLength(txt[cur - start_idx]) catch 1;
+                    cur = start_idx + opentype.unicode.nextGraphemeBoundary(txt, cur - start_idx);
 
                     self.selection.moveCursor(cur, clr.select);
                     if (cur == start_idx + txt.len and !newline) {
@@ -4138,6 +4137,8 @@ test "visualStops: fragments meeting inside one run share a caret position" {
     defer t.deinit();
 
     const fns = struct {
+        // Copied out of the frame arena, which is gone once `settle` returns.
+        var bytes_buf: [16]usize = undefined;
         var bytes: []usize = &.{};
 
         fn frame() !dvui.App.Result {
@@ -4159,9 +4160,9 @@ test "visualStops: fragments meeting inside one run share a caret position" {
             tl.line_frags.appendSlice(arena, &frags) catch {};
 
             const stops = tl.visualStops(arena);
-            const out = arena.alloc(usize, stops.len) catch return .ok;
-            for (stops, out) |st, *b| b.* = st.byte;
-            bytes = out;
+            const n = @min(stops.len, bytes_buf.len);
+            for (stops[0..n], bytes_buf[0..n]) |st, *b| b.* = st.byte;
+            bytes = bytes_buf[0..n];
 
             tl.line_frags.clearRetainingCapacity();
             tl.addTextDone(.{});

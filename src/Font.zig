@@ -2200,28 +2200,31 @@ pub const Cache = struct {
         /// caret placed from it drifts off the pen positions `renderText`
         /// actually draws the glyphs at, by a different amount per prefix.
         pub fn caretPenOffset(self: *Entry, line: *const ShapedLine, byte_offset: usize, snap: bool) f32 {
-            const r = line.logicalPrefixGlyphs(byte_offset);
-            // An RTL run's logical prefix is the buffer's *trailing* glyphs,
-            // so its caret is at the prefix's left edge -- and an empty
-            // prefix sits at the run's right edge, past every glyph.
-            const limit = if (!line.isRtl()) r.end else if (r.end == 0) line.buffer.info.items.len else r.start;
+            const spot = line.buffer.caretSpot(line.byte_offsets, line.codepoints, byte_offset);
             var x: f32 = 0;
-            for (line.buffer.pos.items[0..limit], 0..) |pos, gidx| {
+            var cluster_w: f32 = 0;
+            for (line.buffer.pos.items[0..spot.glyph_end], 0..) |pos, gidx| {
                 const adv = line.entryForGlyph(self, gidx).toPixels(pos.x_advance);
-                x += if (snap) @round(adv) else adv;
+                const used = if (snap) @round(adv) else adv;
+                if (gidx < spot.glyph_start) x += used else cluster_w += used;
             }
-            return x;
+            if (spot.glyph_end == spot.glyph_start) return x;
+            const gdef = line.entryForGlyph(self, spot.glyph_start).parsed_font.tableData("GDEF".*);
+            return x + cluster_w * line.buffer.caretFraction(spot, gdef);
         }
 
-        /// Inverse of `caretPenOffset`: the caret stop nearest pen x. Pen
-        /// offsets run backwards through an RTL run's text, so this picks by
-        /// distance rather than walking until a width is exceeded.
+        /// Inverse of `caretPenOffset`: the caret stop nearest pen x, one
+        /// per grapheme. Pen offsets run backwards through an RTL run's
+        /// text, so this picks by distance rather than walking until a
+        /// width is exceeded.
         /// ponytail: quadratic in glyphs, same as `logicalPrefixForWidth`;
         /// one click, one fragment-sized run.
         pub fn byteAtPenOffset(self: *Entry, line: *const ShapedLine, x: f32, snap: bool) usize {
             var best: usize = 0;
             var best_d: f32 = @abs(self.caretPenOffset(line, 0, snap) - x);
-            for (line.cluster_ends) |boundary| {
+            var graphemes = opentype.unicode.GraphemeBreakIterator.init(line.codepoints);
+            while (graphemes.next()) |_| {
+                const boundary = line.byte_offsets[graphemes.pos];
                 const d = @abs(self.caretPenOffset(line, boundary, snap) - x);
                 if (d < best_d) {
                     best_d = d;
@@ -2789,4 +2792,26 @@ test "caret pen offsets step one glyph at a time through an RTL run" {
         prev = x;
     }
     try std.testing.expectApproxEqAbs(@as(f32, 0), prev, 0.01);
+}
+
+test "caret stops inside a ligature sit at the font's GDEF caret" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    const gpa = std.testing.allocator;
+
+    try dvui.addFont("TestAleo", @embedFile("fonts/Aleo/static/Aleo-Regular.ttf"), null);
+    const font: Font = .find(.{ .family = "TestAleo", .size = 32 });
+    var res = (try font.textSizeExShaped(gpa, "fix", .{})).?;
+    defer res.shaped.deinit();
+    // "fi" ligates into one glyph, "x" stays its own.
+    try std.testing.expectEqual(@as(usize, 2), res.shaped.line.buffer.info.items.len);
+
+    const x0 = res.shaped.caretOffset(0);
+    const x1 = res.shaped.caretOffset(1);
+    const x2 = res.shaped.caretOffset(2);
+    try std.testing.expect(x0 < x1 and x1 < x2);
+    // Aleo's LigCaretList puts the fi caret at 300 of the glyph's 601 units.
+    try std.testing.expectApproxEqAbs((x2 - x0) * 300.0 / 601.0, x1 - x0, 0.01);
+    try std.testing.expectEqual(@as(usize, 1), res.shaped.byteAtOffset(x1));
+    try std.testing.expectEqual(@as(usize, 1), res.shaped.byteAtOffset(x1 + 1));
 }
