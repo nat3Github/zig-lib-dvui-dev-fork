@@ -396,9 +396,7 @@ pub fn systemFamilies(names_buf: [][]const u8, name_storage: []u8, gpa: std.mem.
     var backend = SysBackend.init() catch return names_buf[0..0];
     defer backend.deinit();
 
-    const needs_allocator = @typeInfo(@TypeOf(SysBackend.availableFamilies)).@"fn".params.len == 4;
-    const args = .{ &backend, names_buf, name_storage };
-    const families = @call(.auto, SysBackend.availableFamilies, if (needs_allocator) args ++ .{gpa} else args);
+    const families = backend.availableFamilies(names_buf, name_storage, gpa);
 
     // A `Font`'s family key is a fixed NAME_MAX_LEN array, so a longer name
     // can't round-trip back into a lookup -- drop it rather than offer it.
@@ -435,8 +433,6 @@ fn discoverSystemFont(gpa: std.mem.Allocator, font: Font) ?Source {
 
     const properties: DiscoveryProperties = .{ .weight = font.weight, .style = font.style, .stretch = font.stretch };
 
-    const needs_allocator = @typeInfo(@TypeOf(SysBackend.selectFamilyByName)).@"fn".params.len == 6;
-    const scratch = if (needs_allocator) .{ &path_storage, gpa } else .{&path_storage};
 
     const handle = selectBestFontMatch(
         &backend,
@@ -445,7 +441,7 @@ fn discoverSystemFont(gpa: std.mem.Allocator, font: Font) ?Source {
         &handle_buf,
         &properties_buf,
         &index_buf,
-        scratch,
+        .{ &path_storage, gpa },
     ) orelse return null;
 
     const loaded: struct { bytes: []const u8, collection_index: u32 } = switch (handle) {
@@ -1349,7 +1345,7 @@ pub const Cache = struct {
                     try family_fonts_list.append(gpa, dyn_font);
                     const cmap = dyn_entry.parsed_font.tableData(.{ 'c', 'm', 'a', 'p' }) orelse &.{};
                     if (cmap.len > 0) try dynamic_cmaps.append(gpa, cmap);
-                }
+                } else logMissingCoverage(resolved, persist_gpa, cp);
             }
         }
 
@@ -1365,18 +1361,6 @@ pub const Cache = struct {
         errdefer cache_segments.deinit(gpa);
 
         if (decoded.codepoints.len > 0 and fonts_list.items.len > 0) {
-            for (decoded.codepoints) |cp| {
-                if (resolved.entryIndexFor(cp) != null) continue;
-                var covered = false;
-                for (dynamic_cmaps.items) |cm| {
-                    if (Cmap.lookup(cm, cp) != null) {
-                        covered = true;
-                        break;
-                    }
-                }
-                if (covered) continue;
-                _ = self.entryIndexForLogged(resolved, persist_gpa, cp); // diagnostics
-            }
             // Bidi outer, font fallback inner, so visual reordering crosses font boundaries.
             const shaped = shapeBidiParagraphWithFallback(gpa, fonts_list.items, decoded.codepoints, base_direction, &.{}, &.{}, &.{}, item_cp) catch |err| switch (err) {
                 error.OutOfMemory => |e| return e,
@@ -1573,17 +1557,12 @@ pub const Cache = struct {
         };
     }
 
-    /// `resolved.entryIndexFor(codepoint)`, falling back to entry 0 and
-    /// warning once per uncovered codepoint block (`codepoint >> 8`).
-    fn entryIndexForLogged(self: *Cache, resolved: *ResolvedStack, gpa: std.mem.Allocator, codepoint: u21) u8 {
-        _ = self;
-        if (resolved.entryIndexFor(codepoint)) |idx| return idx;
+    /// Warns once per uncovered codepoint block (`codepoint >> 8`).
+    fn logMissingCoverage(resolved: *ResolvedStack, gpa: std.mem.Allocator, codepoint: u21) void {
         const block: u21 = codepoint >> 8;
-        if (resolved.logged_missing.get(block) == null) {
-            resolved.logged_missing.put(gpa, block, {}) catch {};
-            dvui.log.warn("Font: no entry covers codepoint block U+{X:0>4}xx (e.g. U+{X:0>4}), falling back to entry 0 (.notdef)", .{ block, codepoint });
-        }
-        return 0;
+        if (resolved.logged_missing.get(block) != null) return;
+        resolved.logged_missing.put(gpa, block, {}) catch {};
+        dvui.log.warn("Font: no entry covers codepoint block U+{X:0>4}xx (e.g. U+{X:0>4}), falling back to entry 0 (.notdef)", .{ block, codepoint });
     }
 
     pub fn textSizeRawShaped(
@@ -2238,28 +2217,6 @@ pub const Cache = struct {
 
 test {
     @import("std").testing.refAllDecls(@This());
-}
-
-test "firstHardBreak / trailingHardBreakLen: UAX #14 mandatory breaks" {
-    const t = std.testing;
-    try t.expectEqual(@as(?HardBreak, null), firstHardBreak("plain text"));
-    try t.expectEqual(HardBreak{ .start = 1, .len = 1 }, firstHardBreak("a\nb").?); // LF
-    try t.expectEqual(HardBreak{ .start = 1, .len = 2 }, firstHardBreak("a\r\nb").?); // CRLF is one break
-    try t.expectEqual(HardBreak{ .start = 1, .len = 1 }, firstHardBreak("a\rb").?); // lone CR
-    try t.expectEqual(HardBreak{ .start = 0, .len = 1 }, firstHardBreak("\x0bx").?); // VT
-    try t.expectEqual(HardBreak{ .start = 1, .len = 2 }, firstHardBreak("a\u{0085}b").?); // NEL
-    try t.expectEqual(HardBreak{ .start = 1, .len = 3 }, firstHardBreak("a\u{2028}b").?); // LS
-    try t.expectEqual(HardBreak{ .start = 1, .len = 3 }, firstHardBreak("a\u{2029}").?); // PS at end
-    // a lone 0xe2/0xc2 lead byte that isn't LS/PS/NEL must not be a break
-    try t.expectEqual(@as(?HardBreak, null), firstHardBreak("caf\u{00e9}")); // é = 0xc3 0xa9
-    try t.expectEqual(@as(?HardBreak, null), firstHardBreak("\u{2022}")); // bullet = 0xe2 0x80 0xa2
-
-    try t.expectEqual(@as(usize, 0), trailingHardBreakLen("no break"));
-    try t.expectEqual(@as(usize, 1), trailingHardBreakLen("line\n"));
-    try t.expectEqual(@as(usize, 2), trailingHardBreakLen("line\r\n"));
-    try t.expectEqual(@as(usize, 1), trailingHardBreakLen("line\r"));
-    try t.expectEqual(@as(usize, 3), trailingHardBreakLen("line\u{2028}"));
-    try t.expectEqual(@as(usize, 0), trailingHardBreakLen("a\nb")); // break not at end
 }
 
 test "smoke: shape + measure + rasterize against embedded Vera.ttf" {

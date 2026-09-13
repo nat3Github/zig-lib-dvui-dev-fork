@@ -1623,163 +1623,55 @@ test "text delete to line start and end multiline" {
 test "right-to-left text: Left moves the caret forward through the bytes" {
     var t = try dvui.testing.init(.{});
     defer t.deinit();
-
-    const hebrew = "\u{05e9}\u{05dc}\u{05d5}\u{05dd}";
-
-    const Local = struct {
-        var cursor: usize = 0;
-        var reset: ?[]const u8 = null;
-
-        fn frame() !dvui.App.Result {
-            var entry: TextEntryWidget = undefined;
-            entry.init(@src(), .{}, .{ .tag = "entry" });
-            defer entry.deinit();
-
-            if (reset) |s| {
-                entry.textSet(s, false);
-                reset = null;
-            }
-
-            entry.processEvents();
-            entry.draw();
-            cursor = entry.textLayout.selection.cursor;
-            return .ok;
-        }
-    };
-
-    try dvui.testing.settle(Local.frame);
-    try dvui.testing.pressKey(.tab, .none);
-    try dvui.testing.settle(Local.frame);
+    try TestEntry.focus();
     try dvui.testing.expectFocused("entry");
 
-    Local.reset = hebrew;
-    try dvui.testing.settle(Local.frame);
-    try dvui.testing.pressKey(.home, .lcontrol);
-    try dvui.testing.settle(Local.frame);
-    try std.testing.expectEqual(@as(usize, 0), Local.cursor);
-
-    // Byte 0 of an RTL line sits at its right edge, so Left is the key that
-    // walks into the text and Right has nowhere to go.
-    try dvui.testing.pressKey(.right, .none);
-    try dvui.testing.settle(Local.frame);
-    try std.testing.expectEqual(@as(usize, 0), Local.cursor);
-
-    for (0..2) |_| {
-        try dvui.testing.pressKey(.left, .none);
-        try dvui.testing.settle(Local.frame);
-    }
-    try std.testing.expectEqual(@as(usize, 4), Local.cursor);
-
-    try dvui.testing.pressKey(.right, .none);
-    try dvui.testing.settle(Local.frame);
-    try std.testing.expectEqual(@as(usize, 2), Local.cursor);
+    try TestEntry.load("\u{05e9}\u{05dc}\u{05d5}\u{05dd}");
+    try std.testing.expectEqual(@as(usize, 0), TestEntry.cursor);
+    // Byte 0 of an RTL line sits at its right edge, so Left walks into the
+    // text and Right has nowhere to go.
+    try TestEntry.press(.right);
+    try std.testing.expectEqual(@as(usize, 0), TestEntry.cursor);
+    try TestEntry.press(.left);
+    try TestEntry.press(.left);
+    try std.testing.expectEqual(@as(usize, 4), TestEntry.cursor);
+    try TestEntry.press(.right);
+    try std.testing.expectEqual(@as(usize, 2), TestEntry.cursor);
 }
 
 test "mixed-direction text: the caret walks the line in visual order" {
     var t = try dvui.testing.init(.{});
     defer t.deinit();
+    try TestEntry.focus();
 
-    // "abc" | Hebrew | "xyz": bytes 0..3, 3..11, 11..14. The Hebrew run is
-    // drawn between them but reversed, so its logical end (byte 11) is its
-    // leftmost caret position and its start (byte 3) its rightmost.
-    const mixed = "abc\u{05e9}\u{05dc}\u{05d5}\u{05dd}xyz";
-
-    const Local = struct {
-        var cursor: usize = 0;
-        var reset: ?[]const u8 = null;
-
-        fn frame() !dvui.App.Result {
-            var entry: TextEntryWidget = undefined;
-            entry.init(@src(), .{}, .{ .tag = "entry" });
-            defer entry.deinit();
-
-            if (reset) |s| {
-                entry.textSet(s, false);
-                reset = null;
-            }
-
-            entry.processEvents();
-            entry.draw();
-            cursor = entry.textLayout.selection.cursor;
-            return .ok;
-        }
-    };
-
-    try dvui.testing.settle(Local.frame);
-    try dvui.testing.pressKey(.tab, .none);
-    try dvui.testing.settle(Local.frame);
-
-    Local.reset = mixed;
-    try dvui.testing.settle(Local.frame);
-    try dvui.testing.pressKey(.home, .lcontrol);
-    try dvui.testing.settle(Local.frame);
-
-    for (0..3) |_| {
-        try dvui.testing.pressKey(.right, .none);
-        try dvui.testing.settle(Local.frame);
-    }
-    try std.testing.expectEqual(@as(usize, 3), Local.cursor);
-
-    // Stepping right off the end of "abc" enters the Hebrew run at its left
-    // edge, which is the end of that run's text.
-    try dvui.testing.pressKey(.right, .none);
-    try dvui.testing.settle(Local.frame);
-    try std.testing.expectEqual(@as(usize, 11), Local.cursor);
-
-    // ...and keeps going right through it, backwards through the bytes.
-    try dvui.testing.pressKey(.right, .none);
-    try dvui.testing.settle(Local.frame);
-    try std.testing.expectEqual(@as(usize, 9), Local.cursor);
+    // "abc" | Hebrew | "xyz": bytes 0..3, 3..11, 11..14; the Hebrew run is
+    // drawn reversed, so its logical end (11) is its leftmost caret stop.
+    try TestEntry.load("abc\u{05e9}\u{05dc}\u{05d5}\u{05dd}xyz");
+    for (0..3) |_| try TestEntry.press(.right);
+    try std.testing.expectEqual(@as(usize, 3), TestEntry.cursor);
+    try TestEntry.press(.right);
+    try std.testing.expectEqual(@as(usize, 11), TestEntry.cursor);
+    try TestEntry.press(.right);
+    try std.testing.expectEqual(@as(usize, 9), TestEntry.cursor);
 }
 
 test "right-to-left text: Left at the end of the text stays put" {
     var t = try dvui.testing.init(.{});
     defer t.deinit();
+    TestEntry.multiline = true;
+    defer TestEntry.multiline = false;
+    try TestEntry.focus();
 
-    const hebrew = "\u{05e9}\u{05dc}\u{05d5}\u{05dd}.";
-
-    const Local = struct {
-        var cursor: usize = 0;
-        var reset: ?[]const u8 = null;
-
-        fn frame() !dvui.App.Result {
-            var entry: TextEntryWidget = undefined;
-            entry.init(@src(), .{ .multiline = true }, .{ .tag = "entry" });
-            defer entry.deinit();
-
-            if (reset) |s| {
-                entry.textSet(s, false);
-                reset = null;
-            }
-
-            entry.processEvents();
-            entry.draw();
-            cursor = entry.textLayout.selection.cursor;
-            return .ok;
-        }
-    };
-
-    try dvui.testing.settle(Local.frame);
-    try dvui.testing.pressKey(.tab, .none);
-    try dvui.testing.settle(Local.frame);
-
-    Local.reset = hebrew;
-    try dvui.testing.settle(Local.frame);
-    try dvui.testing.pressKey(.end, .lcontrol);
-    try dvui.testing.settle(Local.frame);
-    try std.testing.expectEqual(@as(usize, 9), Local.cursor);
-
-    // The end of the text is the left edge of an RTL line: Left has nowhere
-    // to go and Right walks back into the text.
+    try TestEntry.load("\u{05e9}\u{05dc}\u{05d5}\u{05dd}.");
+    try TestEntry.pressMod(.end, .lcontrol);
+    try std.testing.expectEqual(@as(usize, 9), TestEntry.cursor);
+    // The end of the text is the left edge of an RTL line.
     for (0..2) |_| {
-        try dvui.testing.pressKey(.left, .none);
-        try dvui.testing.settle(Local.frame);
-        try std.testing.expectEqual(@as(usize, 9), Local.cursor);
+        try TestEntry.press(.left);
+        try std.testing.expectEqual(@as(usize, 9), TestEntry.cursor);
     }
-
-    try dvui.testing.pressKey(.right, .none);
-    try dvui.testing.settle(Local.frame);
-    try std.testing.expectEqual(@as(usize, 8), Local.cursor);
+    try TestEntry.press(.right);
+    try std.testing.expectEqual(@as(usize, 8), TestEntry.cursor);
 }
 
 test "overflow_wrap reaches the inner TextLayout" {
@@ -1826,15 +1718,16 @@ test "overflow_wrap reaches the inner TextLayout" {
     try std.testing.expectEqual(@as(usize, 1), whole);
 }
 
-const GraphemeEntry = struct {
+const TestEntry = struct {
     var cursor: usize = 0;
+    var multiline = false;
     var text_buf: [64]u8 = undefined;
     var text_len: usize = 0;
     var reset: ?[]const u8 = null;
 
     fn frame() !dvui.App.Result {
         var entry: TextEntryWidget = undefined;
-        entry.init(@src(), .{}, .{ .tag = "entry" });
+        entry.init(@src(), .{ .multiline = multiline }, .{ .tag = "entry" });
         defer entry.deinit();
 
         if (reset) |s| {
@@ -1869,7 +1762,11 @@ const GraphemeEntry = struct {
     }
 
     fn press(key: dvui.enums.Key) !void {
-        try dvui.testing.pressKey(key, .none);
+        try pressMod(key, .none);
+    }
+
+    fn pressMod(key: dvui.enums.Key, mod: dvui.enums.Mod) !void {
+        try dvui.testing.pressKey(key, mod);
         try dvui.testing.settle(frame);
     }
 };
@@ -1877,58 +1774,58 @@ const GraphemeEntry = struct {
 test "graphemes: a combining accent is part of its letter's caret stop" {
     var t = try dvui.testing.init(.{});
     defer t.deinit();
-    try GraphemeEntry.focus();
+    try TestEntry.focus();
 
-    try GraphemeEntry.load("e\u{0301}x");
-    try GraphemeEntry.press(.right);
-    try std.testing.expectEqual(@as(usize, 3), GraphemeEntry.cursor);
+    try TestEntry.load("e\u{0301}x");
+    try TestEntry.press(.right);
+    try std.testing.expectEqual(@as(usize, 3), TestEntry.cursor);
     // Backspace takes the accent alone, as Blink and Android do.
-    try GraphemeEntry.press(.backspace);
-    try std.testing.expectEqualStrings("ex", GraphemeEntry.text());
+    try TestEntry.press(.backspace);
+    try std.testing.expectEqualStrings("ex", TestEntry.text());
 
-    try GraphemeEntry.load("e\u{0301}x");
-    try GraphemeEntry.press(.delete);
-    try std.testing.expectEqualStrings("x", GraphemeEntry.text());
+    try TestEntry.load("e\u{0301}x");
+    try TestEntry.press(.delete);
+    try std.testing.expectEqualStrings("x", TestEntry.text());
 }
 
 test "graphemes: a Devanagari conjunct is one caret stop" {
     var t = try dvui.testing.init(.{});
     defer t.deinit();
-    try GraphemeEntry.focus();
+    try TestEntry.focus();
 
-    try GraphemeEntry.load("\u{0915}\u{094D}\u{0937}a");
-    try GraphemeEntry.press(.right);
-    try std.testing.expectEqual(@as(usize, 9), GraphemeEntry.cursor);
-    try GraphemeEntry.press(.backspace);
-    try std.testing.expectEqualStrings("\u{0915}\u{094D}a", GraphemeEntry.text());
+    try TestEntry.load("\u{0915}\u{094D}\u{0937}a");
+    try TestEntry.press(.right);
+    try std.testing.expectEqual(@as(usize, 9), TestEntry.cursor);
+    try TestEntry.press(.backspace);
+    try std.testing.expectEqualStrings("\u{0915}\u{094D}a", TestEntry.text());
 }
 
 test "graphemes: a ZWJ emoji sequence moves and deletes as one" {
     var t = try dvui.testing.init(.{});
     defer t.deinit();
-    try GraphemeEntry.focus();
+    try TestEntry.focus();
 
     const family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
-    try GraphemeEntry.load(family ++ "x");
-    try GraphemeEntry.press(.right);
-    try std.testing.expectEqual(@as(usize, family.len), GraphemeEntry.cursor);
-    try GraphemeEntry.press(.backspace);
-    try std.testing.expectEqualStrings("x", GraphemeEntry.text());
+    try TestEntry.load(family ++ "x");
+    try TestEntry.press(.right);
+    try std.testing.expectEqual(@as(usize, family.len), TestEntry.cursor);
+    try TestEntry.press(.backspace);
+    try std.testing.expectEqualStrings("x", TestEntry.text());
 
-    try GraphemeEntry.load(family ++ "x");
-    try GraphemeEntry.press(.delete);
-    try std.testing.expectEqualStrings("x", GraphemeEntry.text());
+    try TestEntry.load(family ++ "x");
+    try TestEntry.press(.delete);
+    try std.testing.expectEqualStrings("x", TestEntry.text());
 }
 
 test "graphemes: Thai tone marks ride on their consonant" {
     var t = try dvui.testing.init(.{});
     defer t.deinit();
-    try GraphemeEntry.focus();
+    try TestEntry.focus();
 
-    try GraphemeEntry.load("\u{0E17}\u{0E35}\u{0E48}x");
-    try GraphemeEntry.press(.right);
-    try std.testing.expectEqual(@as(usize, 9), GraphemeEntry.cursor);
-    try GraphemeEntry.load("\u{0E17}\u{0E35}\u{0E48}x");
-    try GraphemeEntry.press(.delete);
-    try std.testing.expectEqualStrings("x", GraphemeEntry.text());
+    try TestEntry.load("\u{0E17}\u{0E35}\u{0E48}x");
+    try TestEntry.press(.right);
+    try std.testing.expectEqual(@as(usize, 9), TestEntry.cursor);
+    try TestEntry.load("\u{0E17}\u{0E35}\u{0E48}x");
+    try TestEntry.press(.delete);
+    try std.testing.expectEqualStrings("x", TestEntry.text());
 }

@@ -1852,7 +1852,7 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
             // advance below hasn't run yet, but current_line_height is final.
             .newline_pt = .{ .x = 0, .y = self.insert_pt.y + self.current_line_height },
         }) catch {};
-        self.line_maybe_rtl = self.line_maybe_rtl or maybeRtl(txt[0..end]);
+        self.line_maybe_rtl = self.line_maybe_rtl or opentype.unicode.Bidi.mayNeedReorder(txt[0..end]);
 
         // The line closes right here, so place and draw it before the layout
         // half moves on: lineBreak() below mutates the same selection state
@@ -1930,28 +1930,6 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
 /// no character that bidi could resolve as anything but left-to-right, so
 /// Latin -- and CJK, and emoji -- never run the bidi pass. Conservative by
 /// construction: a truncated sequence at the end of `text` says yes.
-fn maybeRtl(text: []const u8) bool {
-    for (text, 0..) |b, i| {
-        if (b < 0xd6) continue;
-        const next: u8 = if (i + 1 < text.len) text[i + 1] else 0;
-        switch (b) {
-            // U+0590..U+07FF: Hebrew, Arabic, Syriac, Thaana, NKo.
-            0xd6...0xdf => return true,
-            // U+0800..U+08FF: Samaritan, Mandaic, Arabic Extended-A.
-            0xe0 => if (next >= 0xa0) return true,
-            // U+2000..U+207F: the bidi marks, embeddings and isolates.
-            0xe2 => if (next <= 0x81) return true,
-            // U+FB00..U+FFFF: Hebrew and Arabic presentation forms.
-            0xef => if (next >= 0xac) return true,
-            // U+10000..U+10FFF and U+1E000..U+1EFFF hold the RTL supplementary
-            // blocks; U+1F000.. (emoji) does not.
-            0xf0 => if (next == 0x90 or next == 0x9e) return true,
-            else => {},
-        }
-    }
-    return false;
-}
-
 /// Where a caret with no text to sit against goes: the pen, except that an
 /// RTL paragraph starts at the right edge, so an empty line's caret belongs
 /// there rather than at x=0.
@@ -1974,78 +1952,11 @@ fn baseDir(self: *const TextLayoutWidget) opentype.unicode.Bidi.ParagraphDirecti
     return self.paragraph_direction orelse self.base_direction;
 }
 
-/// One same-level slice of one buffered fragment: the unit UAX #9 rule L2
-/// actually reorders. A fragment straddling a level run (a highlight span
-/// holding the space between an RTL word and an LTR one, say) has to be cut
-/// here, because the two halves land in different places on screen.
-const BidiPiece = struct {
-    frag: u32,
-    /// Byte range within that fragment's text.
-    start: u32,
-    end: u32,
-    level: u8,
-};
-
-/// Runs UAX #9 over the concatenated logical text of `frags` and cuts it into
-/// level runs. Bidi sees the whole line, so neutrals and weak types resolve
-/// against neighbours in other fragments -- which is exactly what shaping one
-/// addText chunk at a time cannot do. Returns null when every level is even,
-/// i.e. the line is plain left-to-right and placement is unchanged.
-fn bidiPieces(arena: std.mem.Allocator, frags: []const Fragment, base_direction: *opentype.unicode.Bidi.ParagraphDirection) ?[]BidiPiece {
-    var total_bytes: usize = 0;
-    for (frags) |f| total_bytes += f.text.len;
-    if (total_bytes == 0) return null;
-
-    var codepoints: std.ArrayList(u21) = .empty;
-    var frag_of: std.ArrayList(u32) = .empty;
-    var offset_of: std.ArrayList(u32) = .empty;
-    codepoints.ensureTotalCapacityPrecise(arena, total_bytes) catch return null;
-    frag_of.ensureTotalCapacityPrecise(arena, total_bytes) catch return null;
-    offset_of.ensureTotalCapacityPrecise(arena, total_bytes + 1) catch return null;
-    for (frags, 0..) |f, fi| {
-        var it: std.unicode.Utf8Iterator = .{ .bytes = f.text, .i = 0 };
-        while (true) {
-            const at = it.i;
-            const cp = it.nextCodepoint() orelse break;
-            codepoints.appendAssumeCapacity(cp);
-            frag_of.appendAssumeCapacity(@intCast(fi));
-            offset_of.appendAssumeCapacity(@intCast(at));
-        }
-    }
-    if (codepoints.items.len == 0) return null;
-
-    const classes = arena.alloc(opentype.unicode.BidiClass, codepoints.items.len) catch return null;
-    for (codepoints.items, classes) |cp, *c| c.* = opentype.unicode.BidiClass.of(cp);
-
-    const levels = opentype.unicode.Bidi.paragraphEmbeddingLevels(arena, classes, base_direction.*, codepoints.items) catch return null;
-    if (base_direction.* == .auto) {
-        if (opentype.unicode.firstStrongDirection(classes)) |strong| {
-            base_direction.* = if (strong == .l) .ltr else .rtl;
-        }
-    }
-
-    var any_rtl = false;
-    for (levels) |l| {
-        if (l % 2 == 1) any_rtl = true;
-    }
-    if (!any_rtl) return null;
-
-    var pieces: std.ArrayList(BidiPiece) = .empty;
-    for (levels, frag_of.items, offset_of.items, 0..) |lvl, fi, off, i| {
-        const cp_end: u32 = if (i + 1 < levels.len and frag_of.items[i + 1] == fi)
-            offset_of.items[i + 1]
-        else
-            @intCast(frags[fi].text.len);
-        if (pieces.items.len > 0) {
-            const last = &pieces.items[pieces.items.len - 1];
-            if (last.frag == fi and last.level == lvl) {
-                last.end = cp_end;
-                continue;
-            }
-        }
-        pieces.append(arena, .{ .frag = fi, .start = off, .end = cp_end, .level = lvl }) catch return null;
-    }
-    return pieces.items;
+/// Level runs of the buffered line; see `opentype.unicode.Bidi.lineRuns`.
+fn bidiPieces(arena: std.mem.Allocator, frags: []const Fragment, base_direction: *opentype.unicode.Bidi.ParagraphDirection) ?[]const opentype.unicode.Bidi.LineRun {
+    const texts = arena.alloc([]const u8, frags.len) catch return null;
+    for (frags, texts) |f, *t| t.* = f.text;
+    return opentype.unicode.Bidi.lineRuns(arena, texts, base_direction) catch null;
 }
 
 /// How much of a neighbouring fragment to carry into a fragment's own
@@ -2135,7 +2046,7 @@ fn reorderLineVisual(self: *TextLayoutWidget) void {
     var out: std.ArrayList(Fragment) = .empty;
     out.ensureTotalCapacityPrecise(arena, pieces.len) catch return;
     for (pieces) |p| {
-        const src = frags[p.frag];
+        const src = frags[p.slice];
         var f = src;
         f.text = src.text[p.start..p.end];
         f.bytes_seen = src.bytes_seen + p.start;
@@ -2171,7 +2082,7 @@ fn reorderLineVisual(self: *TextLayoutWidget) void {
 /// Rule L2: walk the pieces in visual order, laying them out left to right
 /// from the line's origin, and write back where each one lands. Reordering is
 /// a permutation, so the line's total width doesn't change.
-fn assignVisualX(arena: std.mem.Allocator, pieces: []const BidiPiece, out: []Fragment, origin: f32) void {
+fn assignVisualX(arena: std.mem.Allocator, pieces: []const opentype.unicode.Bidi.LineRun, out: []Fragment, origin: f32) void {
     const levels = arena.alloc(u8, pieces.len) catch return;
     for (pieces, levels) |p, *l| l.* = p.level;
     const order = opentype.unicode.Bidi.reorderVisual(arena, levels) catch return;
@@ -3294,39 +3205,6 @@ test {
     @import("std").testing.refAllDecls(@This());
 }
 
-test "bidiPieces: level runs cross addText chunk boundaries" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    // Two styled chunks on one visual line, the way syntax highlighting emits
-    // them. Base direction resolves RTL off the first strong character.
-    var frags: [2]Fragment = undefined;
-    frags[0].text = "\u{05e9}\u{05dc}\u{05d5}\u{05dd}";
-    frags[1].text = " world";
-
-    var dir: opentype.unicode.Bidi.ParagraphDirection = .auto;
-    const pieces = bidiPieces(arena, &frags, &dir) orelse return error.TestExpectedPieces;
-
-    // The second chunk is cut: its leading space is a neutral between an RTL
-    // and an LTR run, so it resolves to the paragraph level and travels with
-    // the Hebrew, not with "world".
-    try std.testing.expectEqual(@as(usize, 3), pieces.len);
-    try std.testing.expectEqual(@as(u8, 1), pieces[0].level);
-    try std.testing.expectEqual(@as(u32, 1), pieces[1].frag);
-    try std.testing.expectEqual(@as(u32, 0), pieces[1].start);
-    try std.testing.expectEqual(@as(u32, 1), pieces[1].end);
-    try std.testing.expectEqual(@as(u8, 1), pieces[1].level);
-    try std.testing.expectEqual(@as(u8, 2), pieces[2].level);
-
-    const levels = try arena.alloc(u8, pieces.len);
-    for (pieces, levels) |p, *l| l.* = p.level;
-    const order = try opentype.unicode.Bidi.reorderVisual(arena, levels);
-
-    // The logically-first chunk draws rightmost -- the whole point.
-    try std.testing.expectEqualSlices(usize, &.{ 2, 1, 0 }, order);
-}
-
 test "reshapeWithNeighbourContext: a word split across chunks joins across the split" {
     var t = try dvui.testing.init(.{});
     defer t.deinit();
@@ -3389,17 +3267,6 @@ test "stickyBoundary: only a boundary that could join or kern pays for a reshape
     try std.testing.expect(std.unicode.utf8ValidateSlice(contextTail(long)));
     try std.testing.expect(std.unicode.utf8ValidateSlice(contextHead(long)));
     try std.testing.expectEqual(@as(usize, neighbour_context_bytes), contextHead(long).len);
-}
-
-test "bidiPieces: left-to-right lines are left alone" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-
-    var frags: [2]Fragment = undefined;
-    frags[0].text = "const ";
-    frags[1].text = "x = 1;";
-    var dir: opentype.unicode.Bidi.ParagraphDirection = .auto;
-    try std.testing.expect(bidiPieces(arena_state.allocator(), &frags, &dir) == null);
 }
 
 test "caretX/hitWithin: the two sides of a level-run boundary are two places" {
@@ -3549,59 +3416,6 @@ test "e2e: an RTL line built from two addText chunks stays one line" {
     // never wrapped.
     try std.testing.expect(fns.width > 60);
     try std.testing.expect(fns.height < 40);
-}
-
-test "maybeRtl: only text bidi could reorder pays for the pass" {
-    try std.testing.expect(!maybeRtl("const x = 1;"));
-    try std.testing.expect(!maybeRtl("\u{4f60}\u{597d}")); // CJK
-    try std.testing.expect(!maybeRtl("\u{1f600}")); // emoji
-    try std.testing.expect(!maybeRtl("caf\u{e9}")); // Latin-1 supplement
-
-    try std.testing.expect(maybeRtl("\u{05e9}")); // Hebrew
-    try std.testing.expect(maybeRtl("\u{0627}")); // Arabic
-    try std.testing.expect(maybeRtl("\u{0660}")); // Arabic-Indic digit
-    try std.testing.expect(maybeRtl("\u{0840}")); // Mandaic
-    try std.testing.expect(maybeRtl("\u{200f}")); // RLM
-    try std.testing.expect(maybeRtl("\u{fb2a}")); // Hebrew presentation form
-    try std.testing.expect(maybeRtl("\u{10800}")); // Cypriot
-    try std.testing.expect(maybeRtl("\u{1e900}")); // Adlam
-}
-
-test "bidiPieces: base direction carries across the lines of a paragraph" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const visualOrder = struct {
-        fn f(a: std.mem.Allocator, pieces: []const BidiPiece) ![]const usize {
-            const levels = try a.alloc(u8, pieces.len);
-            for (pieces, levels) |p, *l| l.* = p.level;
-            return opentype.unicode.Bidi.reorderVisual(a, levels);
-        }
-    }.f;
-
-    // First line of the paragraph: its strong character is Hebrew.
-    var first: [1]Fragment = undefined;
-    first[0].text = "\u{05e9}\u{05dc}\u{05d5}\u{05dd}";
-    var dir: opentype.unicode.Bidi.ParagraphDirection = .auto;
-    _ = bidiPieces(arena, &first, &dir) orelse return error.TestExpectedPieces;
-    try std.testing.expectEqual(opentype.unicode.Bidi.ParagraphDirection.rtl, dir);
-
-    // Second line starts with a Latin word, but it is still that paragraph, so
-    // the logically-first piece belongs on the right.
-    var second: [2]Fragment = undefined;
-    second[0].text = "world ";
-    second[1].text = "\u{05e9}\u{05dc}\u{05d5}\u{05dd}";
-    const carried = bidiPieces(arena, &second, &dir) orelse return error.TestExpectedPieces;
-    const carried_order = try visualOrder(arena, carried);
-    try std.testing.expectEqual(@as(usize, 0), carried_order[carried_order.len - 1]);
-
-    // Resolved on its own, that same line would read left-to-right instead --
-    // the flip this fix exists to prevent.
-    var fresh: opentype.unicode.Bidi.ParagraphDirection = .auto;
-    const alone = bidiPieces(arena, &second, &fresh) orelse return error.TestExpectedPieces;
-    const alone_order = try visualOrder(arena, alone);
-    try std.testing.expectEqual(@as(usize, 0), alone_order[0]);
 }
 
 test "e2e: a clickable chunk is reordered, and answers one frame late" {
