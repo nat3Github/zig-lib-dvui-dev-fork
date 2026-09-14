@@ -110,6 +110,31 @@ strike: ?Strike = null,
 variations: [max_variations]UserCoord = @splat(.{ .tag = @splat(0), .value = 0 }),
 variation_count: u8 = 0,
 
+/// CSS `font-feature-settings` (`withFeature`). Shaping only, so not in
+/// `hash`: toggling a feature reuses the same glyph atlas.
+features: [max_features]Feature = @splat(.{ .tag = @splat(0), .value = 0 }),
+feature_count: u8 = 0,
+
+/// CSS `tab-size`: a tab advances to the next multiple of this many space
+/// advances from the line start. Shaping only, like `features`.
+tab_size: u8 = 8,
+
+pub const Feature = opentype.Feature;
+pub const max_features = 8;
+
+/// What a `Font` adds to shaping beyond the glyphs its `hash` names.
+pub const ShapeStyle = struct {
+    features: []const Feature = &.{},
+    tab_size: u8 = 8,
+    /// Device-pixel pen x the text starts at on its line, so tab stops
+    /// count from the line start rather than from the text.
+    tab_origin: f32 = 0,
+};
+
+pub fn shapeStyle(self: *const Font, tab_origin: f32) ShapeStyle {
+    return .{ .features = self.features[0..self.feature_count], .tab_size = self.tab_size, .tab_origin = tab_origin };
+}
+
 pub const FindOptions = struct {
     family: []const u8,
 
@@ -206,6 +231,30 @@ pub fn withVariation(self: Font, tag: *const [4]u8, value: f32) Font {
     return r;
 }
 
+/// Turns an OpenType feature on or off (e.g. `withFeature("tnum", true)`,
+/// `withFeature("liga", false)`), replacing any earlier setting for the
+/// same tag. Silently ignored past `max_features` distinct tags.
+pub fn withFeature(self: Font, tag: *const [4]u8, on: bool) Font {
+    var r = self;
+    const value: u32 = @intFromBool(on);
+    for (r.features[0..r.feature_count]) |*f| {
+        if (std.mem.eql(u8, &f.tag, tag)) {
+            f.value = value;
+            return r;
+        }
+    }
+    if (r.feature_count >= max_features) return r;
+    r.features[r.feature_count] = .{ .tag = tag.*, .value = value };
+    r.feature_count += 1;
+    return r;
+}
+
+pub fn withTabSize(self: Font, spaces: u8) Font {
+    var r = self;
+    r.tab_size = spaces;
+    return r;
+}
+
 pub fn withUnderline(self: Font, underline: ?Underline) Font {
     var r = self;
     r.underline = underline;
@@ -274,6 +323,11 @@ pub const Source = struct {
     /// discovery can match a specific weight/style to a non-zero face);
     /// ignored for a plain sfnt.
     collection_index: u32 = 0,
+    /// Axis values the discovered face is a named instance of (e.g. Android's
+    /// sans-serif-condensed = Roboto at wdth 75); beat the request's
+    /// weight/stretch but lose to `withVariation`.
+    pinned_axes: [DiscoveryProperties.max_pinned_axes]UserCoord = undefined,
+    pinned_axis_count: u8 = 0,
     /// Human-readable family name from the font's own `name` table, for UI
     /// display only -- `family` itself is a synthetic key (e.g. "fb:1a2b3c")
     /// for dynamic-fallback sources, so it isn't fit to print. Empty unless
@@ -282,6 +336,10 @@ pub const Source = struct {
 
     pub fn familyName(self: *const Source) []const u8 {
         return string(&self.family);
+    }
+
+    pub fn pinnedAxes(self: *const Source) []const UserCoord {
+        return self.pinned_axes[0..self.pinned_axis_count];
     }
 
     /// `display_family` if set, else `familyName()` -- use this to show the
@@ -326,7 +384,7 @@ pub const Source = struct {
         return switch (DiscoveryFamilyName.fromString(family)) {
             .serif => fallback_serif,
             .monospace => fallback_monospace,
-            .title, .sans_serif => fallback,
+            .title, .sans_serif, .system_ui => fallback,
         };
     }
 };
@@ -361,17 +419,18 @@ pub const WebFallbackOptions = struct {
 
 const system_font_size_limit = 256 * 1024 * 1024; // needed for big emoji fonts (Apple Color Emoji.ttc is ~180MB)
 
-/// The CSS generic family keywords "serif", "sans-serif" and "monospace",
-/// usable as a `Font` family anywhere a real family name is. Each resolves to
-/// the first installed font of a metric-compatible chain
-/// (`opentype.discovery.generic_family_chains`), so text measures and breaks
-/// lines the same on every OS:
+/// The CSS generic family keywords "serif", "sans-serif", "monospace" and
+/// "system-ui", usable as a `Font` family anywhere a real family name is. The
+/// first three resolve to the first installed font of a metric-compatible
+/// chain (`opentype.discovery.generic_family_chains`), so text measures and
+/// breaks lines the same on every OS; "system-ui" is the OS's own UI font:
 ///
 /// | generic    | macOS                 | Windows         | Linux              | Android         |
 /// |------------|-----------------------|-----------------|--------------------|-----------------|
 /// | sans-serif | Arial                 | Arial           | Liberation Sans    | Roboto          |
 /// | serif      | Times New Roman       | Times New Roman | Liberation Serif   | Noto Serif      |
 /// | monospace  | Menlo (iOS: Courier New) | Consolas     | DejaVu Sans Mono   | Droid Sans Mono |
+/// | system-ui  | SF Pro                | Segoe UI        | fontconfig's alias | Roboto          |
 ///
 /// On Linux a missing chain font falls to fontconfig's own alias (Fedora
 /// ships no DejaVu, so monospace there is Noto Sans Mono); with no system
@@ -433,7 +492,7 @@ fn discoverSystemFont(gpa: std.mem.Allocator, font: Font) ?Source {
     const properties: DiscoveryProperties = .{ .weight = font.weight, .style = font.style, .stretch = font.stretch };
 
 
-    const handle = selectBestFontMatch(
+    const match = selectBestFontMatch(
         &backend,
         &.{DiscoveryFamilyName.fromString(font.familyName())},
         properties,
@@ -443,13 +502,13 @@ fn discoverSystemFont(gpa: std.mem.Allocator, font: Font) ?Source {
         .{ &path_storage, gpa },
     ) orelse return null;
 
-    const loaded: struct { bytes: []const u8, collection_index: u32 } = switch (handle) {
+    const loaded: struct { bytes: []const u8, collection_index: u32 } = switch (match.handle) {
         .path => |p| .{ .bytes = std.Io.Dir.cwd().readFileAlloc(dvui.io, p.path, gpa, .limited(system_font_size_limit)) catch return null, .collection_index = p.font_index },
         .memory => |m| .{ .bytes = gpa.dupe(u8, m.bytes) catch return null, .collection_index = m.font_index },
         .url => return null, // web-only handle; native discovery backends never return one
     };
 
-    return .{
+    var source: Source = .{
         .family = array(font.familyName()),
         .weight = font.weight,
         .style = font.style,
@@ -458,6 +517,9 @@ fn discoverSystemFont(gpa: std.mem.Allocator, font: Font) ?Source {
         .allocator = gpa,
         .collection_index = loaded.collection_index,
     };
+    for (match.properties.pinnedAxes(), 0..) |axis, i| source.pinned_axes[i] = .{ .tag = axis.tag, .value = axis.value };
+    source.pinned_axis_count = match.properties.pinned_axis_count;
+    return source;
 }
 
 pub fn textHeight(self: Font) f32 {
@@ -478,7 +540,7 @@ pub fn sizeM(self: Font, wide: f32, tall: f32) Size {
     const resolved = cw.fonts.resolveStack(cw.gpa, sized_font) catch return .{ .w = 10, .h = 10 };
 
     if (resolved.m_size == null) {
-        var result = cw.fonts.textSizeRawShaped(cw.arena(), cw.gpa, resolved, "M", .{}) catch return .{ .w = 10, .h = 10 };
+        var result = cw.fonts.textSizeRawShaped(cw.arena(), cw.gpa, resolved, "M", .{}, .{}) catch return .{ .w = 10, .h = 10 };
         result.line.deinit();
         resolved.m_size = result.size;
     }
@@ -521,6 +583,46 @@ pub fn textSize(self: Font, text: []const u8) Size {
     return ret;
 }
 
+/// `text-overflow: ellipsis` marker: U+2026 when the stack covers it, else "...".
+pub fn ellipsis(self: Font) []const u8 {
+    const cw = dvui.currentWindow();
+    const ss = dvui.parentGet().screenRectScale(Rect{}).s;
+    const resolved = cw.fonts.resolveStack(cw.gpa, self.withSize(self.size * ss)) catch return "...";
+    return if (resolved.entryIndexFor(0x2026) != null) "\u{2026}" else "...";
+}
+
+/// Byte length of the prefix of `text`'s first line that still fits
+/// `max_width` with `ellipsis()` after it. A logical prefix, so an RTL line
+/// loses its left end, and cut on a grapheme boundary.
+pub fn ellipsisCut(self: Font, text: []const u8, max_width: f32, opts: TextSizeOptions) usize {
+    var end: usize = 0;
+    const ellipsis_w = self.textSizeEx(self.ellipsis(), .{}).w;
+    var measure = opts;
+    measure.max_width = max_width - ellipsis_w;
+    measure.end_idx = &end;
+    _ = self.textSizeEx(text, measure);
+    var cut: usize = 0;
+    while (cut < end) {
+        const next = opentype.unicode.nextGraphemeBoundary(text, cut);
+        if (next > end) break;
+        cut = next;
+    }
+    // The walk above measures inside the whole line's shape; the prefix is
+    // drawn shaped on its own (joining forms at the cut can differ), so
+    // confirm against that.
+    const prefix_opts: TextSizeOptions = .{ .base_direction = opts.base_direction, .tab_origin = opts.tab_origin };
+    while (cut > 0 and self.textSizeEx(text[0..cut], prefix_opts).w + ellipsis_w > max_width) {
+        var prev: usize = 0;
+        while (true) {
+            const next = opentype.unicode.nextGraphemeBoundary(text, prev);
+            if (next >= cut) break;
+            prev = next;
+        }
+        cut = prev;
+    }
+    return cut;
+}
+
 pub const EndMetric = opentype.EndMetric;
 
 /// Byte range of the text to actually produce glyphs for. Bytes outside it
@@ -542,6 +644,9 @@ pub const TextSizeOptions = struct {
     /// which resolves LTR for a neutral-only or LTR-leading run even inside
     /// an RTL paragraph -- so a caller that knows the paragraph says so.
     base_direction: opentype.unicode.Bidi.ParagraphDirection = .auto,
+    /// Where on its line `text` starts (logical pixels); tab stops count
+    /// from the line start.
+    tab_origin: f32 = 0,
 };
 
 /// textSizeEx always stops at a newline, use textSize to get multiline sizes
@@ -627,7 +732,7 @@ pub fn textSizeExShaped(self: Font, state_gpa: std.mem.Allocator, output: std.me
         options.max_width = mwidth * ss;
     }
 
-    var result = try cw.fonts.textSizeRawShaped(output, state_gpa, resolved, text, options);
+    var result = try cw.fonts.textSizeRawShaped(output, state_gpa, resolved, text, options, self.shapeStyle(opts.tab_origin * ss));
 
     // Fetched after textSizeRawShaped, not before: it shapes text via
     // shapeLineText, which can insert into self.cache while lazily
@@ -873,12 +978,12 @@ pub const Cache = struct {
 
         const boxed = try state_gpa.create(Entry);
         errdefer state_gpa.destroy(boxed);
-        boxed.* = Entry.init(state_gpa, source.bytes, source.collection_index, font) catch |err| blk: {
+        boxed.* = Entry.init(state_gpa, source.bytes, source.collection_index, source.pinnedAxes(), font) catch |err| blk: {
             dvui.log.err("Font {s} init got {any}, using fallback", .{ fname, err });
             // Fallback bytes under the *requested* hash, not the fallback
             // font's: callers (resolveStack/stackEntry) look this entry up by
             // the hash they asked for, and would find nothing otherwise.
-            break :blk Entry.init(state_gpa, Source.fallback.bytes, Source.fallback.collection_index, font) catch return error.OutOfMemory;
+            break :blk Entry.init(state_gpa, Source.fallback.bytes, Source.fallback.collection_index, &.{}, font) catch return error.OutOfMemory;
         };
         entry.value_ptr.* = boxed;
         //log.debug("- size {d} ascent {d} height {d}", .{ font.size, entry.ascent, entry.height });
@@ -1207,12 +1312,19 @@ pub const Cache = struct {
     /// The returned line (and per-call temporaries) come from `output`;
     /// `state_gpa` backs everything the cache keeps, so it must be the
     /// allocator later passed to `Cache.deinit`, never a frame arena.
-    pub fn shapeLineText(self: *Cache, output: std.mem.Allocator, state_gpa: std.mem.Allocator, resolved: *ResolvedStack, text: []const u8, item: ?Font.ShapeItem, base_direction: opentype.unicode.Bidi.ParagraphDirection) std.mem.Allocator.Error!Entry.ShapedLine {
+    pub fn shapeLineText(self: *Cache, output: std.mem.Allocator, state_gpa: std.mem.Allocator, resolved: *ResolvedStack, text: []const u8, item: ?Font.ShapeItem, base_direction: opentype.unicode.Bidi.ParagraphDirection, style: Font.ShapeStyle) std.mem.Allocator.Error!Entry.ShapedLine {
+        const has_tab = std.mem.indexOfScalar(u8, text, '\t') != null;
         var key_hash = dvui.fnv.init();
         key_hash.update(std.mem.asBytes(&resolved.font_hash));
         key_hash.update(text);
         if (item) |it| key_hash.update(std.mem.asBytes(&it));
         key_hash.update(std.mem.asBytes(&base_direction));
+        key_hash.update(std.mem.sliceAsBytes(style.features));
+        // Tab-free text shapes the same wherever it starts, so it keeps one key.
+        if (has_tab) {
+            key_hash.update(std.mem.asBytes(&style.tab_size));
+            key_hash.update(std.mem.asBytes(&style.tab_origin));
+        }
         const cache_key = key_hash.final();
         if (self.shaped_line_cache.get(cache_key)) |cached| {
             if (try self.materializeShapedLine(output, cached)) |line| return line;
@@ -1320,7 +1432,7 @@ pub const Cache = struct {
 
         if (decoded.codepoints.len > 0 and fonts_list.items.len > 0) {
             // Bidi outer, font fallback inner, so visual reordering crosses font boundaries.
-            const shaped = shapeBidiParagraphWithFallback(output, fonts_list.items, decoded.codepoints, base_direction, &.{}, &.{}, &.{}, item_cp) catch |err| switch (err) {
+            const shaped = shapeBidiParagraphWithFallback(output, fonts_list.items, decoded.codepoints, base_direction, &.{}, &.{}, style.features, item_cp) catch |err| switch (err) {
                 error.OutOfMemory => |e| return e,
                 else => BidiFallbackResult{ .buffer = Buffer.init(output), .font_indices = &.{} },
             };
@@ -1356,6 +1468,7 @@ pub const Cache = struct {
                 try cache_segments.append(output, .{ .entry_hash = hashes_list.items[fi], .glyph_start = @intCast(g), .glyph_end = @intCast(h) });
                 g = h;
             }
+            if (has_tab) applyTabStops(&result, segments.items, decoded.codepoints, style);
         }
         result.have_positions = true;
 
@@ -1416,6 +1529,45 @@ pub const Cache = struct {
         cache_segments.deinit(output);
 
         return line;
+    }
+
+    /// Fonts have no real tab glyph (U+0009 is .notdef or a zero-width
+    /// control), so each tab becomes the space glyph with whatever advance
+    /// reaches the next stop, `tab_size` space advances apart from the line
+    /// start. Stops follow the pen in reading order: an RTL line counts
+    /// them from its right edge.
+    /// ponytail: pen positions in a mixed-direction line are visual, so a
+    /// tab inside its embedded opposite-direction run snaps off the
+    /// visual pen rather than a per-run one.
+    fn applyTabStops(buffer: *Buffer, segments: []const Entry.ShapedLine.EntrySegment, codepoints: []const u21, style: Font.ShapeStyle) void {
+        const rtl = buffer.isRtl();
+        var pen = style.tab_origin;
+        for (0..segments.len) |si| {
+            const seg = segments[if (rtl) segments.len - 1 - si else si];
+            const font = seg.entry.parsed_font;
+            const space_glyph = Cmap.lookup(font.tableData("cmap".*) orelse &.{}, ' ') orelse 0;
+            const space_units: i32 = blk: {
+                const hhea = opentype.parsing.Table.hhea.parse(font.tableData("hhea".*) orelse &.{}) catch break :blk 0;
+                const hmtx = font.tableData("hmtx".*) orelse break :blk 0;
+                break :blk opentype.parsing.Table.hmtx.metricForGlyph(hmtx, space_glyph, hhea.number_of_h_metrics).advance_width;
+            };
+            const space_px = seg.entry.toPixels(space_units);
+            for (seg.glyph_start..seg.glyph_end) |k| {
+                const g = if (rtl) seg.glyph_end - 1 - (k - seg.glyph_start) else k;
+                const info = &buffer.info.items[g];
+                const pos = &buffer.pos.items[g];
+                if (codepoints[info.cluster] == '\t' and space_px > 0) {
+                    const stop = space_px * @as(f32, @floatFromInt(style.tab_size));
+                    var next = if (stop > 0) (@floor(pen / stop) + 1) * stop else pen;
+                    // CSS: a stop closer than half a space is skipped.
+                    if (stop > 0 and next - pen < space_px * 0.5) next += stop;
+                    info.codepoint = space_glyph;
+                    pos.x_offset = 0;
+                    pos.x_advance = @intFromFloat(@round((next - pen) * @as(f32, @floatFromInt(space_units)) / space_px));
+                }
+                pen += seg.entry.toPixels(pos.x_advance);
+            }
+        }
     }
 
     /// Owned copy of a shape result kept in `shaped_line_cache`. Segments
@@ -1532,6 +1684,7 @@ pub const Cache = struct {
         resolved: *ResolvedStack,
         text: []const u8,
         opts: Font.TextSizeOptions,
+        style: Font.ShapeStyle,
     ) std.mem.Allocator.Error!Entry.MeasureResult {
         const mwidth = opts.max_width orelse dvui.max_float_safe;
         const snap = if (dvui.current_window) |cw| cw.snap_to_pixels else true;
@@ -1546,7 +1699,7 @@ pub const Cache = struct {
         var window: usize = if (opts.max_width != null and opts.item == null) @min(newline_idx, 64) else newline_idx;
 
         while (true) {
-            var line = try self.shapeLineText(output, state_gpa, resolved, text[0..window], opts.item, opts.base_direction);
+            var line = try self.shapeLineText(output, state_gpa, resolved, text[0..window], opts.item, opts.base_direction, style);
             errdefer line.deinit();
 
             // Refetched after shapeLineText, not hoisted above the loop:
@@ -1690,22 +1843,37 @@ pub const Cache = struct {
             return collection.fonts[collection_index];
         }
 
-        /// Adds a synthetic `wght` coordinate from `font.weight` when the
-        /// caller hasn't already pinned `wght` via `withVariation` -- so a
-        /// bundled variable font instances at the requested CSS weight
-        /// instead of always rendering its default (usually Regular)
-        /// instance. A no-op for fonts without a `wght` axis.
-        fn effectiveUserCoords(font: Font, buf: *[max_variations + 1]UserCoord) []const UserCoord {
-            var n: usize = 0;
-            var has_wght = false;
-            for (font.variations[0..font.variation_count]) |v| {
-                buf[n] = v;
-                n += 1;
-                if (std.mem.eql(u8, &v.tag, "wght")) has_wght = true;
-            }
-            if (!has_wght) {
-                buf[n] = .{ .tag = "wght".*, .value = font.weight.value };
-                n += 1;
+        const max_user_coords = max_variations + DiscoveryProperties.max_pinned_axes + 3;
+
+        /// Axis coordinates in precedence order: `withVariation` pins, then
+        /// the face's own named-instance pins (`face_pinned`), then synthetic
+        /// `wght`/`wdth`/`ital`/`slnt` from `font.weight`/`stretch`/`style`
+        /// -- so a variable font instances at the requested CSS weight, width
+        /// and style (CSS Fonts 4 §7.1) instead of its default instance.
+        /// Axes the font lacks are ignored.
+        fn effectiveUserCoords(font: Font, face_pinned: []const UserCoord, buf: *[max_user_coords]UserCoord) []const UserCoord {
+            const pinned = font.variations[0..font.variation_count];
+            @memcpy(buf[0..pinned.len], pinned);
+            var n = pinned.len;
+            const style_coord: UserCoord = switch (font.style) {
+                .normal => .{ .tag = "ital".*, .value = 0 },
+                .italic => .{ .tag = "ital".*, .value = 1 },
+                .oblique => .{ .tag = "slnt".*, .value = -14 },
+            };
+            const synthetic = [_]UserCoord{
+                .{ .tag = "wght".*, .value = font.weight.value },
+                .{ .tag = "wdth".*, .value = font.stretch.value * 100 },
+                style_coord,
+            };
+            for ([_][]const UserCoord{ face_pinned, &synthetic }) |layer| {
+                for (layer) |coord| {
+                    const already_set = for (buf[0..n]) |v| {
+                        if (std.mem.eql(u8, &v.tag, &coord.tag)) break true;
+                    } else false;
+                    if (already_set) continue;
+                    buf[n] = coord;
+                    n += 1;
+                }
             }
             return buf[0..n];
         }
@@ -1719,7 +1887,7 @@ pub const Cache = struct {
         }
 
         /// Load font, calibrating ppem so rendered M height matches font.size.
-        pub fn init(gpa: std.mem.Allocator, ttf_bytes: []const u8, collection_index: u32, font: Font) Error!Entry {
+        pub fn init(gpa: std.mem.Allocator, ttf_bytes: []const u8, collection_index: u32, face_pinned: []const UserCoord, font: Font) Error!Entry {
             const min_pixel_size: f32 = 1;
 
             const fname = font.name(gpa);
@@ -1732,8 +1900,8 @@ pub const Cache = struct {
             errdefer parsed_font.deinit(gpa);
 
             var ppem = @max(min_pixel_size, font.size);
-            var coords_buf: [max_variations + 1]UserCoord = undefined;
-            const user_coords = effectiveUserCoords(font, &coords_buf);
+            var coords_buf: [max_user_coords]UserCoord = undefined;
+            const user_coords = effectiveUserCoords(font, face_pinned, &coords_buf);
             var renderer = Renderer.init(gpa, dvui.currentWindow().lifo(), parsed_font, ppem, .{ .hint_glyf = true, .user_coords = user_coords }) catch |err| {
                 dvui.log.warn("Font.Cache.Entry.init() opentype renderer error {any} font {s}\n", .{ err, fname });
                 return Error.FontError;
@@ -2104,11 +2272,27 @@ pub const Cache = struct {
         /// buffer's trailing glyphs, not its leading ones.
         pub fn measureLogicalPrefix(self: *Entry, state_gpa: std.mem.Allocator, line: *const ShapedLine, byte_offset: usize, snap: bool) std.mem.Allocator.Error!Size {
             const r = line.logicalPrefixGlyphs(byte_offset);
-            // ponytail: one entry's metrics for every glyph -- a prefix that
-            // fell back to a second font measures its ink against the
-            // primary; thread entryForGlyph through if that ever shows.
-            const s = try opentype.measureGlyphRange(state_gpa, self, self.ascent, self.height, line.buffer.info.items[r.start..r.end], line.buffer.pos.items[r.start..r.end], r.end - r.start, snap);
-            return .{ .w = s.w, .h = s.h };
+            // Per-glyph entry, not opentype.measureGlyphRange: an RTL run
+            // from a fallback font must measure against that font's metrics.
+            var x: f32 = 0;
+            var minx: f32 = 0;
+            var maxx: f32 = 0;
+            var miny: f32 = 0;
+            var maxy: f32 = self.height;
+            for (line.buffer.info.items[r.start..r.end], line.buffer.pos.items[r.start..r.end], r.start..) |info, pos, gidx| {
+                const entry = line.entryForGlyph(self, gidx);
+                const gi = try entry.glyphInfoGet(state_gpa, info.codepoint);
+                const off_x = entry.toPixels(pos.x_offset);
+                const adv = entry.toPixels(pos.x_advance);
+                const adv_used = if (snap) @round(adv) else adv;
+                minx = @min(minx, x + off_x + gi.leftBearing);
+                maxx = @max(maxx, x + off_x + gi.leftBearing + gi.w);
+                maxx = @max(maxx, x + adv_used);
+                miny = @min(miny, entry.ascent - gi.topBearing);
+                maxy = @max(maxy, entry.ascent - gi.topBearing + gi.h);
+                x += adv_used;
+            }
+            return .{ .w = maxx - minx, .h = maxy - miny };
         }
 
         pub const PrefixFit = struct { byte: usize, w: f32 };
@@ -2180,6 +2364,96 @@ test {
     @import("std").testing.refAllDecls(@This());
 }
 
+test "tab stops: a tab reaches the next multiple of tab_size spaces from the line start" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    const gpa = std.testing.allocator;
+    const cw = dvui.currentWindow();
+    const font: Font = .find(.{ .family = "Vera", .size = 24 });
+    const resolved = try cw.fonts.resolveStack(cw.gpa, font);
+    const entry = cw.fonts.stackEntry(resolved, 0).?;
+
+    var space = try cw.fonts.shapeLineText(gpa, gpa, resolved, " ", null, .auto, .{});
+    defer space.deinit();
+    const space_glyph = space.buffer.info.items[0].codepoint;
+    const space_px = entry.toPixels(space.buffer.pos.items[0].x_advance);
+
+    const cases = [_]struct { text: []const u8, origin: f32, stop: f32 }{
+        .{ .text = "\tb", .origin = 0, .stop = 4 },
+        .{ .text = "a\tb", .origin = 0, .stop = 4 },
+        .{ .text = "\tb", .origin = 5 * space_px, .stop = 8 },
+        // Less than half a space short of a stop skips to the one after.
+        .{ .text = "\tb", .origin = 3.8 * space_px, .stop = 8 },
+    };
+    for (cases) |c| {
+        var line = try cw.fonts.shapeLineText(gpa, gpa, resolved, c.text, null, .auto, .{ .tab_size = 4, .tab_origin = c.origin });
+        defer line.deinit();
+        const tab = std.mem.indexOfScalar(u8, c.text, '\t').?;
+        try std.testing.expectEqual(space_glyph, line.buffer.info.items[tab].codepoint);
+        try std.testing.expectApproxEqAbs(c.stop * space_px - c.origin, entry.caretPenOffset(&line, c.text.len - 1, false), 1);
+    }
+}
+
+test "features: liga off splits a ligature, tnum evens out digit advances" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    const gpa = std.testing.allocator;
+    const cw = dvui.currentWindow();
+    try dvui.addFont("Aleo VF", @embedFile("fonts/Aleo/Aleo-VariableFont_wght.ttf"), null);
+    try dvui.addFont("OpenDyslexic", @embedFile("fonts/OpenDyslexic/compiled/OpenDyslexic-Regular.otf"), null);
+
+    const aleo: Font = .find(.{ .family = "Aleo VF", .size = 24 });
+    const aleo_stack = try cw.fonts.resolveStack(cw.gpa, aleo);
+    var liga = try cw.fonts.shapeLineText(gpa, gpa, aleo_stack, "office", null, .auto, aleo.shapeStyle(0));
+    defer liga.deinit();
+    const no_liga_font = aleo.withFeature("liga", false);
+    var no_liga = try cw.fonts.shapeLineText(gpa, gpa, aleo_stack, "office", null, .auto, no_liga_font.shapeStyle(0));
+    defer no_liga.deinit();
+    try std.testing.expectEqual(5, liga.buffer.info.items.len);
+    try std.testing.expectEqual(6, no_liga.buffer.info.items.len);
+
+    const dys: Font = .find(.{ .family = "OpenDyslexic", .size = 24 });
+    const dys_stack = try cw.fonts.resolveStack(cw.gpa, dys);
+    var proportional = try cw.fonts.shapeLineText(gpa, gpa, dys_stack, "17", null, .auto, dys.shapeStyle(0));
+    defer proportional.deinit();
+    const tnum_font = dys.withFeature("tnum", true);
+    var tabular = try cw.fonts.shapeLineText(gpa, gpa, dys_stack, "17", null, .auto, tnum_font.shapeStyle(0));
+    defer tabular.deinit();
+    const p = proportional.buffer.pos.items;
+    const tn = tabular.buffer.pos.items;
+    try std.testing.expect(p[0].x_advance != p[1].x_advance);
+    try std.testing.expectEqual(tn[0].x_advance, tn[1].x_advance);
+}
+
+test "ellipsisCut: widest grapheme-aligned logical prefix that fits with the ellipsis" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    const fns = struct {
+        fn frame() !dvui.App.Result {
+            const font = Font.theme(.body);
+            const texts = [_][]const u8{
+                "The quick brown fox jumps over the lazy dog",
+                "\u{05e9}\u{05dc}\u{05d5}\u{05dd} \u{05e2}\u{05d5}\u{05dc}\u{05dd} \u{05d6}\u{05d4} \u{05de}\u{05e9}\u{05e4}\u{05d8} \u{05d0}\u{05e8}\u{05d5}\u{05da}",
+                "e\u{0301}e\u{0301}e\u{0301}e\u{0301}e\u{0301}e\u{0301}e\u{0301}e\u{0301}e\u{0301}e\u{0301}",
+            };
+            for (texts) |text| {
+                const max_w = font.textSize(text).w / 2;
+                const ellipsis_w = font.textSize(font.ellipsis()).w;
+                const cut = font.ellipsisCut(text, max_w, .{});
+                try std.testing.expect(cut > 0 and cut < text.len);
+                var boundary: usize = 0;
+                while (boundary < cut) boundary = opentype.unicode.nextGraphemeBoundary(text, boundary);
+                try std.testing.expectEqual(cut, boundary);
+                try std.testing.expect(font.textSize(text[0..cut]).w + ellipsis_w <= max_w + 0.5);
+                const next = opentype.unicode.nextGraphemeBoundary(text, cut);
+                try std.testing.expect(font.textSize(text[0..next]).w + ellipsis_w > max_w - 0.5);
+            }
+            return .ok;
+        }
+    };
+    try dvui.testing.settle(fns.frame);
+}
+
 test "smoke: shape + measure + rasterize against embedded Vera.ttf" {
     var t = try dvui.testing.init(.{});
     defer t.deinit();
@@ -2195,7 +2469,7 @@ test "smoke: shape + measure + rasterize against embedded Vera.ttf" {
     try std.testing.expect(entry.em_height > 0);
     std.debug.print("ascent={d} height={d} em_height={d}\n", .{ entry.ascent, entry.height, entry.em_height });
 
-    var line = try cw.fonts.shapeLineText(gpa, gpa, resolved, "Hello, world! fi ffi", null, .auto);
+    var line = try cw.fonts.shapeLineText(gpa, gpa, resolved, "Hello, world! fi ffi", null, .auto, .{});
     defer line.deinit();
 
     try std.testing.expect(line.buffer.info.items.len > 0);
@@ -2205,7 +2479,7 @@ test "smoke: shape + measure + rasterize against embedded Vera.ttf" {
     }
 
     var end_idx: usize = 0;
-    var result = try cw.fonts.textSizeRawShaped(gpa, gpa, resolved, "Hello, world!", .{ .end_idx = &end_idx });
+    var result = try cw.fonts.textSizeRawShaped(gpa, gpa, resolved, "Hello, world!", .{ .end_idx = &end_idx }, .{});
     defer result.line.deinit();
     std.debug.print("measured size w={d} h={d} end_idx={d}\n", .{ result.size.w, result.size.h, end_idx });
     try std.testing.expect(result.size.w > 0);
@@ -2229,7 +2503,7 @@ test "sizeM: memoized result matches a fresh textSizeRawShaped(\"M\") call" {
     const ss = dvui.parentGet().screenRectScale(Rect{}).s;
     const resolved = try cw.fonts.resolveStack(cw.gpa, font.withSize(font.size * ss));
 
-    var reference = try cw.fonts.textSizeRawShaped(gpa, gpa, resolved, "M", .{});
+    var reference = try cw.fonts.textSizeRawShaped(gpa, gpa, resolved, "M", .{}, .{});
     defer reference.line.deinit();
 
     const expected = reference.size.scale(1.0 / ss, Size);
@@ -2254,7 +2528,7 @@ test "smoke: bidi/RTL text shapes without crashing" {
     const cw = dvui.currentWindow();
     const resolved = try cw.fonts.resolveStack(cw.gpa, font);
 
-    var line = try cw.fonts.shapeLineText(gpa, gpa, resolved, "abc \u{0627}\u{0644}\u{0633}\u{0644}\u{0627}\u{0645} xyz", null, .auto);
+    var line = try cw.fonts.shapeLineText(gpa, gpa, resolved, "abc \u{0627}\u{0644}\u{0633}\u{0644}\u{0627}\u{0645} xyz", null, .auto, .{});
     defer line.deinit();
     try std.testing.expect(line.buffer.info.items.len > 0);
     // Latin around an Arabic run: the line holds both directions at once, so
@@ -2263,12 +2537,12 @@ test "smoke: bidi/RTL text shapes without crashing" {
     try std.testing.expect(line.isMixedDirection());
 
     // One direction, either one, keeps the shape sliceable by byte offset.
-    var ltr = try cw.fonts.shapeLineText(gpa, gpa, resolved, "Hello, world!", null, .auto);
+    var ltr = try cw.fonts.shapeLineText(gpa, gpa, resolved, "Hello, world!", null, .auto, .{});
     defer ltr.deinit();
     try std.testing.expect(!ltr.isMixedDirection());
     try std.testing.expect(!ltr.isRtl());
 
-    var rtl = try cw.fonts.shapeLineText(gpa, gpa, resolved, "\u{05e9}\u{05dc}\u{05d5}\u{05dd}", null, .auto);
+    var rtl = try cw.fonts.shapeLineText(gpa, gpa, resolved, "\u{05e9}\u{05dc}\u{05d5}\u{05dd}", null, .auto, .{});
     defer rtl.deinit();
     try std.testing.expect(!rtl.isMixedDirection());
 }
@@ -2353,7 +2627,7 @@ test "Cache.shapeLineText: mixed-script text splits glyphs by stack entry" {
     // "AB" (Latin) + two Hangul syllables (Korean) + "CD" (Latin) -- Vera
     // has no Hangul glyphs and NotoSansKR-Regular has no use registering it
     // as the primary family, so coverage is naturally disjoint here.
-    var line = try cw.fonts.shapeLineText(std.testing.allocator, std.testing.allocator, resolved, "AB\u{AC00}\u{AC01}CD", null, .auto);
+    var line = try cw.fonts.shapeLineText(std.testing.allocator, std.testing.allocator, resolved, "AB\u{AC00}\u{AC01}CD", null, .auto, .{});
     defer line.deinit();
 
     // TestKorean is a fallback family (stack index 1), materialized lazily
@@ -2384,6 +2658,24 @@ test "Cache.shapeLineText: mixed-script text splits glyphs by stack entry" {
     }
 }
 
+test "measureLogicalPrefix: glyphs from a fallback font measure with that font's metrics" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+
+    try dvui.addFont("TestLatin", Source.fallback.bytes, null);
+    const cw = dvui.currentWindow();
+    try cw.fonts.database.append(cw.gpa, .{ .family = array("TestKorean"), .bytes = @embedFile("fonts/NotoSansKR-Regular.ttf") });
+    try dvui.addFontFamily("TestStack", &.{ "TestLatin", "TestKorean" });
+    const resolved = try cw.fonts.resolveStack(cw.gpa, Font.init("TestStack").withSize(24));
+
+    const text = "AB\u{AC00}\u{AC01}CD";
+    var whole = try cw.fonts.textSizeRawShaped(std.testing.allocator, std.testing.allocator, resolved, text, .{}, .{});
+    defer whole.line.deinit();
+    const latin_entry = cw.fonts.stackEntry(resolved, 0).?;
+    const prefix = try latin_entry.measureLogicalPrefix(std.testing.allocator, &whole.line, text.len, true);
+    try std.testing.expectApproxEqAbs(whole.size.w, prefix.w, 0.01);
+}
+
 test "Cache.resolveStack: per-family entry overrides apply to the stack fonts" {
     var t = try dvui.testing.init(.{});
     defer t.deinit();
@@ -2408,7 +2700,7 @@ test "Cache.resolveStack: per-family entry overrides apply to the stack fonts" {
     const primary = try cw.fonts.getOrCreate(cw.gpa, resolved.family_fonts[0]);
     try std.testing.expectEqual(primary, cw.fonts.stackEntry(resolved, 0).?);
 
-    var line = try cw.fonts.shapeLineText(std.testing.allocator, std.testing.allocator, resolved, "A\u{AC00}", null, .auto);
+    var line = try cw.fonts.shapeLineText(std.testing.allocator, std.testing.allocator, resolved, "A\u{AC00}", null, .auto, .{});
     defer line.deinit();
     const korean_entry = cw.fonts.stackEntry(resolved, 1).?;
     try std.testing.expect(korean_entry.height < primary.height);
@@ -2512,7 +2804,7 @@ test "Cache.shapeLineText: shaped_line_cache stays bounded under distinct-slice 
     var buf: [32]u8 = undefined;
     for (0..Cache.max_shaped_lines + 64) |i| {
         const text = try std.fmt.bufPrint(&buf, "slice-{d}", .{i});
-        var line = try cw.fonts.shapeLineText(std.testing.allocator, cw.gpa, resolved, text, null, .auto);
+        var line = try cw.fonts.shapeLineText(std.testing.allocator, cw.gpa, resolved, text, null, .auto, .{});
         line.deinit();
     }
 
@@ -2532,7 +2824,7 @@ test "Cache.shapeLineText: a shaped_line_cache hit reshapes instead of dropping 
     const resolved = try cw.fonts.resolveStack(cw.gpa, stack);
     const text = "AB\u{AC00}\u{AC01}CD";
 
-    var line = try cw.fonts.shapeLineText(std.testing.allocator, cw.gpa, resolved, text, null, .auto);
+    var line = try cw.fonts.shapeLineText(std.testing.allocator, cw.gpa, resolved, text, null, .auto, .{});
     defer line.deinit();
     try std.testing.expectEqual(@as(usize, 3), line.segments.len);
 
@@ -2547,7 +2839,7 @@ test "Cache.shapeLineText: a shaped_line_cache hit reshapes instead of dropping 
     // still has the old line cached, but its Korean segment now points at
     // an evicted entry. Must reshape from scratch, not silently drop the
     // Korean segment and leave the caller thinking it's Latin-only.
-    var line2 = try cw.fonts.shapeLineText(std.testing.allocator, cw.gpa, resolved, text, null, .auto);
+    var line2 = try cw.fonts.shapeLineText(std.testing.allocator, cw.gpa, resolved, text, null, .auto, .{});
     defer line2.deinit();
     try std.testing.expectEqual(@as(usize, 3), line2.segments.len);
 
@@ -2575,7 +2867,7 @@ test "Cache.loadDynamicFallback: rejects a discovered font with no rasterizable 
     // primary font's notdef) rather than registering a font that produces
     // zero-size glyphs for everything.
     const text = "这是一个中文测试句子。";
-    var line = try cw.fonts.shapeLineText(gpa, gpa, resolved, text, null, .auto);
+    var line = try cw.fonts.shapeLineText(gpa, gpa, resolved, text, null, .auto, .{});
     defer line.deinit();
 
     for (line.segments) |seg| {
@@ -2609,7 +2901,7 @@ test "Cache.shapeLineText: emoji next to CJK gets its own dynamic-fallback font,
     // fallback font file read at 64MiB, silently failing to load Apple
     // Color Emoji.ttc (~180MiB on modern macOS) and returning null.
     const text = "\u{4E2D}\u{6587}\u{1F600}";
-    var line = try cw.fonts.shapeLineText(gpa, gpa, resolved, text, null, .auto);
+    var line = try cw.fonts.shapeLineText(gpa, gpa, resolved, text, null, .auto, .{});
     defer line.deinit();
 
     if (line.segments.len < 2) return error.SkipZigTest; // no dynamic fallback available in this environment

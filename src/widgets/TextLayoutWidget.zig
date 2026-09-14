@@ -37,6 +37,7 @@ pub var defaults: Options = .{
 };
 
 pub const OverflowWrap = enum { normal, anywhere };
+pub const TextAlign = enum { start, end, left, right, center };
 
 pub const InitOptions = struct {
     selection: ?*Selection = null,
@@ -78,6 +79,16 @@ pub const InitOptions = struct {
     /// neutral-only line or an LTR-leading line all read left to right --
     /// wrong when the surrounding UI is RTL. Set it to pin the direction.
     base_direction: opentype.unicode.Bidi.ParagraphDirection = .auto,
+
+    /// CSS `text-align`, applied to each line once it is broken. `.start`
+    /// and `.end` follow the paragraph's resolved direction. No justify.
+    text_align: TextAlign = .start,
+
+    /// CSS `line-clamp`: lay out at most this many lines, ending the last
+    /// one in an ellipsis if the text didn't fit (`text-overflow:
+    /// ellipsis`); 1 truncates a single line. Text past it is not laid out.
+    /// ponytail: a last line closed by a hard break gets no ellipsis.
+    max_lines: ?usize = null,
 };
 
 pub const Selection = struct {
@@ -173,6 +184,12 @@ line_break: LineBreakStrictness,
 word_break: WordBreakMode,
 overflow_wrap: OverflowWrap,
 base_direction: opentype.unicode.Bidi.ParagraphDirection,
+text_align: TextAlign,
+max_lines: ?usize,
+/// `max_lines` was reached: the rest of the text is only counted, not laid out.
+clamped: bool = false,
+/// How far `alignLine` moved the most recently placed line.
+line_shift: f32 = 0,
 current_line_width: f32 = 0.0, // width of lines if break_lines was false
 touch_edit_just_focused: bool,
 process_events_in_deinit: bool,
@@ -340,6 +357,8 @@ pub fn init(self: *TextLayoutWidget, src: std.builtin.SourceLocation, init_opts:
         .word_break = init_opts.word_break,
         .overflow_wrap = init_opts.overflow_wrap,
         .base_direction = init_opts.base_direction,
+        .text_align = init_opts.text_align,
+        .max_lines = init_opts.max_lines,
         .cache_layout = init_opts.cache_layout,
         .touch_edit_just_focused = init_opts.touch_edit_just_focused,
         .process_events_in_deinit = init_opts.process_events_in_deinit,
@@ -1579,6 +1598,11 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
         }
     }
 
+    if (self.clamped) {
+        self.bytes_seen += text_in.len;
+        return ret;
+    }
+
     // clip to content rect for all text
     _ = dvui.clip(self.data().contentRectScale().r);
     self.newline = false;
@@ -1700,6 +1724,7 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
             .end_idx = &end,
             .ascent_out = &ascent,
             .base_direction = self.baseDir(),
+            .tab_origin = self.insert_pt.x,
         }) catch null) |res| {
             s = res.size;
             shaped = res.shaped;
@@ -1716,13 +1741,14 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
                 .max_width = if (self.break_lines) width else null,
                 .end_idx = &end,
                 .ascent_out = &ascent,
+                .tab_origin = self.insert_pt.x,
             });
         }
 
         // ensure we always get at least 1 codepoint so we make progress
         if (end == 0) {
             end = std.unicode.utf8ByteSequenceLength(txt[0]) catch 1;
-            s = if (shaped) |*st| st.measureUpToByteOffset(cw.gpa, end) catch font.textSizeEx(txt[0..end], .{}) else font.textSizeEx(txt[0..end], .{});
+            s = if (shaped) |*st| st.measureUpToByteOffset(cw.gpa, end) catch font.textSizeEx(txt[0..end], .{ .tab_origin = self.insert_pt.x }) else font.textSizeEx(txt[0..end], .{ .tab_origin = self.insert_pt.x });
         }
 
         self.newline = Font.trailingHardBreakLen(txt[0..end]) > 0;
@@ -1759,17 +1785,17 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
                             // what we already shaped above -- re-measure
                             // by summing already-computed advances instead
                             // of reshaping.
-                            s = st.measureUpToByteOffset(cw.gpa, ink_end) catch font.textSizeEx(txt[0..ink_end], .{});
+                            s = st.measureUpToByteOffset(cw.gpa, ink_end) catch font.textSizeEx(txt[0..ink_end], .{ .tab_origin = self.insert_pt.x });
                         } else {
                             // Rare: the break search's lookahead crossed
                             // past what was shaped. Fall back to a single
                             // reshape for this fragment (`shaped` no longer
                             // matches `end` so downstream reuse is skipped).
                             shaped = null;
-                            s = font.textSizeEx(txt[0..ink_end], .{});
+                            s = font.textSizeEx(txt[0..ink_end], .{ .tab_origin = self.insert_pt.x });
                         }
                     } else {
-                        s = font.textSizeEx(txt[0..ink_end], .{});
+                        s = font.textSizeEx(txt[0..ink_end], .{ .tab_origin = self.insert_pt.x });
                     }
                     break :blk; // this part will fit
                 }
@@ -1784,7 +1810,7 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
                 if (self.overflow_wrap == .normal) {
                     end = nextLineBreakOpportunity(dvui.currentWindow().lifo(), txt, end, self.line_break, self.word_break) orelse txt.len;
                     shaped = null;
-                    s = font.textSizeEx(txt[0..end], .{});
+                    s = font.textSizeEx(txt[0..end], .{ .tab_origin = self.insert_pt.x });
                 }
                 // else fall through -> character break
             }
@@ -1796,13 +1822,13 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
             // retreat to the previous break opportunity until it fits (or no
             // earlier break exists -- an unbreakable run, left to overflow).
             if (line_is_mixed) {
-                s = font.textSizeEx(txt[0..end], .{});
+                s = font.textSizeEx(txt[0..end], .{ .tab_origin = self.insert_pt.x });
                 const at_line_start = !(linewidth < container_width or self.insert_pt.x > linestart);
                 while (at_line_start and s.w > width and end > 0) {
                     const prev = lastLineBreakOpportunity(dvui.currentWindow().lifo(), txt, end, self.line_break, self.word_break) orelse break;
                     if (prev == 0 or prev >= end) break;
                     end = prev;
-                    s = font.textSizeEx(txt[0..end], .{});
+                    s = font.textSizeEx(txt[0..end], .{ .tab_origin = self.insert_pt.x });
                 }
                 self.newline = Font.trailingHardBreakLen(txt[0..end]) > 0;
             }
@@ -1811,7 +1837,7 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
             // - we are boxed in too much by corner widgets
             // - we aren't starting at the left edge
             // both mean dropping to next line will give us more space
-            if (s.w > width and (linewidth < container_width or self.insert_pt.x > linestart)) {
+            if (s.w > width and (linewidth < container_width or self.insert_pt.x > linestart) and !self.onLastLine()) {
                 self.checkAscent();
                 self.line += 1;
                 self.insert_pt.y += self.current_line_height;
@@ -1853,6 +1879,19 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
             self.current_line_ascent = ascent;
         }
 
+        if (self.onLastLine() and ((end < txt.len and !self.newline) or s.w > width)) {
+            end = font.ellipsisCut(txt, width, .{ .base_direction = self.baseDir(), .tab_origin = self.insert_pt.x });
+            self.newline = false;
+            self.clamped = true;
+            shaped = null;
+            if (font.textSizeExShaped(cw.gpa, cw.arena(), txt[0..end], .{ .base_direction = self.baseDir(), .tab_origin = self.insert_pt.x }) catch null) |res| {
+                s = res.size;
+                if (!res.shaped.line.isMixedDirection()) shaped = res.shaped;
+            } else {
+                s = font.textSizeEx(txt[0..end], .{ .tab_origin = self.insert_pt.x });
+            }
+        }
+
         if (shaped) |*st| {
             // A shape running past the fragment can't be sliced from the
             // leading end of an RTL run -- that is the wrong end, and the
@@ -1866,6 +1905,7 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
                 if (font.textSizeExShaped(cw.gpa, cw.arena(), txt, .{
                     .item = .{ .start = 0, .end = end },
                     .base_direction = self.baseDir(),
+                    .tab_origin = self.insert_pt.x,
                 }) catch null) |res| {
                     if (!res.shaped.line.isMixedDirection()) {
                         shaped = res.shaped;
@@ -1895,6 +1935,29 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
             .newline_pt = .{ .x = 0, .y = self.insert_pt.y + self.current_line_height },
         }) catch {};
         self.line_maybe_rtl = self.line_maybe_rtl or opentype.unicode.Bidi.mayNeedReorder(txt[0..end]);
+
+        if (self.clamped) {
+            // The ellipsis is a fragment of its own so selection and copy
+            // never see it, but it joins the line's bidi pass and lands at
+            // the logical end.
+            var ef = self.line_frags.getLast();
+            ef.text = font.ellipsis();
+            ef.size = font.textSizeEx(ef.text, .{});
+            ef.shaped = null;
+            ef.action = .none;
+            ef.bytes_seen += end;
+            ef.x += s.w;
+            ef.ellipsis = true;
+            self.line_frags.append(cw.arena(), ef) catch {};
+            self.flushLine();
+            self.insert_pt.x += s.w + ef.size.w;
+            self.current_line_width += s.w + ef.size.w;
+            const size = self.data().options.padSize(.{ .w = self.current_line_width, .h = self.insert_pt.y + s.h });
+            self.data().min_size.w = @max(self.data().min_size.w, size.w + width_after);
+            self.data().min_size.h = @max(self.data().min_size.h, size.h);
+            self.bytes_seen += txt.len;
+            break :text_loop;
+        }
 
         // The line closes right here, so place and draw it before the layout
         // half moves on: lineBreak() below mutates the same selection state
@@ -1976,16 +2039,22 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
 /// RTL paragraph starts at the right edge, so an empty line's caret belongs
 /// there rather than at x=0.
 fn penX(self: *TextLayoutWidget) f32 {
-    if (self.baseDir() != .rtl) return self.insert_pt.x;
     if (self.insert_pt.x == 0) {
         const avail = self.data().contentRect().w;
-        return if (avail == 0) 0 else avail - 1;
+        const factor = self.alignFactor();
+        return if (avail == 0 or factor == 0) 0 else @min(avail * factor, avail - 1);
     }
-    // The line was right-aligned after the pen moved, so `insert_pt.x` is a
-    // width rather than a position.
+    // The line was aligned after the pen moved, so `insert_pt.x` is a width
+    // rather than a position.
     // ponytail: the left edge, not the logical end, on a mixed line -- this
     // is the fallback for a caret no fragment claimed.
-    return self.line_left_x orelse self.insert_pt.x;
+    if (self.baseDir() == .rtl) return self.line_left_x orelse self.insert_pt.x;
+    return self.insert_pt.x + self.line_shift;
+}
+
+fn onLastLine(self: *const TextLayoutWidget) bool {
+    const max = self.max_lines orelse return false;
+    return self.line + 1 >= max;
 }
 
 /// Base direction in force right now: what this paragraph's first strong
@@ -2056,6 +2125,7 @@ fn reshapeWithNeighbourContext(frags: []Fragment, base_direction: opentype.unico
         const res = f.font.textSizeExShaped(cw.gpa, cw.arena(), ctx, .{
             .item = .{ .start = lead.len, .end = lead.len + f.text.len },
             .base_direction = base_direction,
+            .tab_origin = f.x,
         }) catch continue orelse continue;
         frags[i].render_shaped = res.shaped;
         frags[i].size.w = res.size.w;
@@ -2136,21 +2206,34 @@ fn assignVisualX(arena: std.mem.Allocator, pieces: []const opentype.unicode.Bidi
     }
 }
 
-/// Right-aligns the line when the paragraph reads right to left. UAX #9
-/// places runs relative to a line origin but says nothing about where that
-/// origin is; for an RTL paragraph it belongs at the right edge, so the line
-/// starts where the reader starts. `TextLayoutWidget` has no general
-/// text-align option -- this is base direction only, not a style knob.
-fn alignLineToBaseDirection(self: *TextLayoutWidget, frags: []Fragment) void {
-    if (self.baseDir() != .rtl or frags.len == 0) return;
+/// Share of a line's free space that goes before it: 0 left, 1 right.
+/// UAX #9 places runs relative to a line origin but says nothing about
+/// where that origin is; `.start` puts it where the paragraph's reader
+/// starts, the right edge of an RTL one.
+fn alignFactor(self: *const TextLayoutWidget) f32 {
+    const rtl = self.baseDir() == .rtl;
+    return switch (self.text_align) {
+        .left => 0,
+        .right => 1,
+        .center => 0.5,
+        .start => if (rtl) 1 else 0,
+        .end => if (rtl) 0 else 1,
+    };
+}
+
+fn alignLine(self: *TextLayoutWidget, frags: []Fragment) void {
+    self.line_shift = 0;
+    const factor = self.alignFactor();
+    if (factor == 0 or frags.len == 0) return;
     var right = frags[0].x;
     for (frags) |f| right = @max(right, f.x + f.size.w);
     // Same fallback the layout half uses: a widget that hasn't been shown yet
     // has no content rect to align against, so leave the line where it is.
     const avail = self.data().contentRect().w;
-    const shift = avail - right;
+    const shift = (avail - right) * factor;
     if (avail == 0 or shift <= 0) return;
     for (frags) |*f| f.x += shift;
+    self.line_shift = shift;
 }
 
 /// Places the buffered line in visual order, then draws it in logical order so
@@ -2185,7 +2268,7 @@ fn flushLine(self: *TextLayoutWidget) void {
     // digits take an even level above it and the neutrals between them the
     // odd base level, so `line_maybe_rtl` alone is not the whole gate.
     if (self.line_maybe_rtl or self.baseDir() == .rtl) self.reorderLineVisual();
-    self.alignLineToBaseDirection(self.line_frags.items);
+    self.alignLine(self.line_frags.items);
     self.line_end_byte = lineEndByte(self.line_frags.items);
     var left = self.line_frags.items[0].x;
     for (self.line_frags.items) |f| left = @min(left, f.x);
@@ -2241,6 +2324,8 @@ const Fragment = struct {
     rtl: bool = false,
     /// Pen origin after this fragment closes its line; only read when `newline`.
     newline_pt: Point,
+    /// `max_lines` marker: drawn, but holds none of the widget's text.
+    ellipsis: bool = false,
 };
 
 /// Where the caret sits after `prefix_w` of the fragment's *logical* text.
@@ -2284,6 +2369,14 @@ fn shapeableLen(text: []const u8) usize {
 
 fn emitFragment(self: *TextLayoutWidget, f: Fragment, index: usize) void {
     const cw = dvui.currentWindow();
+    if (f.ellipsis) {
+        const r: Rect = .{ .x = f.x, .y = f.y + (f.max_ascent - f.ascent), .w = f.size.w, .h = f.size.h };
+        const text_col = f.options.color(.text).split();
+        dvui.renderText(.{ .font = f.font, .text = f.text, .rs = self.screenRectScale(r), .color = text_col.color, .gradient = text_col.gradient }) catch |err| {
+            dvui.logError(@src(), err, "Failed to render ellipsis", .{});
+        };
+        return;
+    }
     var shaped = f.shaped;
     // How many leading glyphs of
     // `shaped` (if any) correspond to `f.text`, for reuse by
@@ -3926,6 +4019,79 @@ test "e2e: a wrapped RTL line places its caret on the pen, not on an ink width" 
         // pen one lands on the glyph boundary the renderer drew.
         try std.testing.expectApproxEqAbs(ref.shaped.caretOffset(k * 2), x - left, 0.5);
     }
+}
+
+test "text_align: right and center offsets; end follows an RTL base to the left" {
+    var t = try dvui.testing.init(.{ .window_size = .{ .w = 400, .h = 200 } });
+    defer t.deinit();
+
+    const fns = struct {
+        var text_align: TextAlign = .start;
+        var dir: opentype.unicode.Bidi.ParagraphDirection = .auto;
+        var caret_x: f32 = 0;
+        var avail: f32 = 0;
+        var text_w: f32 = 0;
+
+        fn frame() !dvui.App.Result {
+            var tl = dvui.textLayout(@src(), .{ .text_align = text_align, .base_direction = dir }, .{ .expand = .horizontal });
+            tl.addText("abc", .{});
+            avail = tl.data().contentRect().w;
+            text_w = tl.data().options.fontGet().textSize("abc").w;
+            tl.addTextDone(.{});
+            // The cursor starts at byte 0: the left edge of the text.
+            caret_x = tl.cursor_rect.x;
+            tl.deinit();
+            return .ok;
+        }
+    };
+
+    fns.text_align = .right;
+    try dvui.testing.settle(fns.frame);
+    try std.testing.expectApproxEqAbs(fns.avail - fns.text_w, fns.caret_x, 1);
+
+    fns.text_align = .center;
+    try dvui.testing.settle(fns.frame);
+    try std.testing.expectApproxEqAbs((fns.avail - fns.text_w) / 2, fns.caret_x, 1);
+
+    fns.text_align = .end;
+    fns.dir = .rtl;
+    try dvui.testing.settle(fns.frame);
+    try std.testing.expect(@abs(fns.caret_x) < 0.01);
+}
+
+test "max_lines: lays out no further than the last line" {
+    var t = try dvui.testing.init(.{ .window_size = .{ .w = 400, .h = 400 } });
+    defer t.deinit();
+
+    const fns = struct {
+        var max_lines: ?usize = null;
+        var height: f32 = 0;
+        var clamped = false;
+        var bytes_seen: usize = 0;
+
+        fn frame() !dvui.App.Result {
+            var tl = dvui.textLayout(@src(), .{ .max_lines = max_lines }, .{ .min_size_content = .width(120), .max_size_content = .width(120) });
+            tl.addText("one two three four five six seven eight nine ten eleven twelve thirteen", .{});
+            tl.addText(" fourteen", .{});
+            tl.addTextDone(.{});
+            height = tl.data().min_size.h;
+            clamped = tl.clamped;
+            bytes_seen = tl.bytes_seen;
+            tl.deinit();
+            return .ok;
+        }
+    };
+
+    try dvui.testing.settle(fns.frame);
+    const full_height = fns.height;
+    try std.testing.expect(!fns.clamped);
+
+    fns.max_lines = 2;
+    try dvui.testing.settle(fns.frame);
+    try std.testing.expect(fns.clamped);
+    try std.testing.expect(fns.height < full_height);
+    // Clamped text still counts toward byte offsets, so selection past it stays sane.
+    try std.testing.expectEqual("one two three four five six seven eight nine ten eleven twelve thirteen fourteen".len, fns.bytes_seen);
 }
 
 test "base_direction: an RTL base right-aligns a line holding no RTL character" {

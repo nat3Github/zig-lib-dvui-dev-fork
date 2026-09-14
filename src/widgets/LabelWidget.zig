@@ -19,8 +19,8 @@ pub const InitOptions = struct {
     align_x: f32 = 0,
     align_y: f32 = 0,
 
-    /// Replace the end of text with "..." if it would be truncated.  Ignored
-    /// if text is rotated (for now).
+    /// Replace the end of text with an ellipsis if it would be truncated.
+    /// Ignored if text is rotated (for now).
     ellipsize: bool = true,
 
     sel_start: ?usize = null,
@@ -154,15 +154,16 @@ pub fn draw(self: *LabelWidget) void {
         // this is only about horizontal direction
         var lineRect = dvui.placeIn(self.data().contentRect(), tsize, .none, label_gravity);
 
-        const ellip = "...";
         // give ourselves a fraction of a pixel extra for floating point innacurracies:
         // - a lot of times the content Rect is sized based on the text width
         if (rot == 0.0 and self.init_options.ellipsize and tsize.w > (self.data().contentRect().w + 0.001)) {
             self.ellipsized = true;
-            const esize = self.data().options.fontGet().textSize(ellip);
-            var endi: usize = 0;
-            tsize = self.data().options.fontGet().textSizeEx(line, .{ .max_width = self.data().contentRect().w - esize.w, .end_idx = &endi });
-            line = line[0..endi];
+            const font = self.data().options.fontGet();
+            const cut = font.ellipsisCut(line, self.data().contentRect().w, .{});
+            // Shaped as one run so bidi puts the ellipsis at the logical end,
+            // which is the left of an RTL line.
+            line = std.mem.concat(dvui.currentWindow().arena(), u8, &.{ line[0..cut], font.ellipsis() }) catch line[0..cut];
+            tsize = font.textSize(line);
             lineRect = dvui.placeIn(self.data().contentRect(), tsize, .none, .{ .x = 0, .y = 0 });
         }
 
@@ -213,19 +214,6 @@ pub fn draw(self: *LabelWidget) void {
         }) catch |err| {
             dvui.logError(@src(), err, "Failed to render text: {s}", .{line});
         };
-
-        if (self.ellipsized) {
-            r.x += liners.r.w;
-            dvui.renderText(.{
-                .font = self.data().options.fontGet(),
-                .text = ellip,
-                .rs = .{ .r = r, .s = rs.s },
-                .color = text_col.color,
-                .gradient = text_col.gradient,
-            }) catch |err| {
-                dvui.logError(@src(), err, "Failed to render ellipses after text: {s}", .{line});
-            };
-        }
 
         r.y += rs.s * tsize.h;
         line_start += line_slice.len + 1; // account for newline

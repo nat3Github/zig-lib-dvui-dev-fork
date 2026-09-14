@@ -15,6 +15,19 @@ var break_line_break: @FieldType(TextLayoutWidget.InitOptions, "line_break") = .
 var break_word_break: @FieldType(TextLayoutWidget.InitOptions, "word_break") = .normal;
 var break_overflow_wrap: @FieldType(TextLayoutWidget.InitOptions, "overflow_wrap") = .anywhere;
 var bidi_direction: @FieldType(TextLayoutWidget.InitOptions, "base_direction") = .auto;
+var overflow_width: f32 = 220;
+var overflow_ellipsis = true;
+var overflow_lines: f32 = 2;
+var align_choice: TextLayoutWidget.TextAlign = .start;
+var feature_family_choice: ?usize = null;
+var feature_liga = true;
+var feature_tnum = false;
+var feature_onum = false;
+var feature_zero = false;
+var feature_smcp = false;
+var feature_frac = false;
+var tab_size: f32 = 8;
+var tab_entry_filled = false;
 var variable_font_registered = false;
 /// Registered stack alias, first entry in the family dropdown below.
 const demo_stack_alias = "Demo Stack (Aleo + Noto KR)";
@@ -202,7 +215,118 @@ pub fn layoutText() void {
     multiScript();
     lineBreaking();
     bidi();
+    textOverflow();
+    textAlign();
+    fontFeatures();
+    tabSize();
     styling();
+}
+
+fn textOverflow() void {
+    dvui.label(@src(), "Text Overflow", .{}, .{ .font = .theme(.title) });
+    {
+        var hbox = dvui.box(@src(), .{ .dir = .horizontal }, .{});
+        defer hbox.deinit();
+        _ = dvui.sliderEntry(@src(), "width: {d:0}", .{ .value = &overflow_width, .min = 40, .max = 600, .interval = 1 }, .{ .gravity_y = 0.5 });
+        _ = dvui.checkbox(@src(), &overflow_ellipsis, "ellipsis", .{ .gravity_y = 0.5 });
+        _ = dvui.sliderEntry(@src(), "max lines: {d:0}", .{ .value = &overflow_lines, .min = 1, .max = 5, .interval = 1 }, .{ .gravity_y = 0.5 });
+    }
+    const box_opts: dvui.Options = .{ .min_size_content = .width(overflow_width), .max_size_content = .width(overflow_width), .border = Rect.all(1) };
+
+    // Single lines: the ellipsis lands at the logical end, left on RTL lines.
+    const lines = [_][]const u8{
+        "A single line of Latin text, too long for its box.",
+        "שורה אחת בעברית שארוכה מדי בשביל התיבה שלה.",
+        "سطر واحد بالعربية أطول من أن يتسع له صندوقه.",
+    };
+    for (lines, 0..) |line, i| {
+        dvui.labelNoFmt(@src(), line, .{ .ellipsize = overflow_ellipsis }, box_opts.override(.{ .id_extra = i }));
+    }
+
+    var tl = dvui.textLayout(@src(), .{ .max_lines = if (overflow_ellipsis) @intFromFloat(overflow_lines) else null }, box_opts);
+    defer tl.deinit();
+    tl.addText("A paragraph clamped to max lines: it keeps wrapping until the last allowed line, ", .{});
+    tl.addText("which ends in an ellipsis instead of spilling out of the box. ", .{ .color_text = .fromHex("d75f5f") });
+    tl.addText("עברית באמצע הפסקה כדי לראות את השבירה.", .{});
+}
+
+fn textAlign() void {
+    dvui.label(@src(), "Text Align", .{}, .{ .font = .theme(.title) });
+    {
+        var hbox = dvui.box(@src(), .{ .dir = .horizontal }, .{});
+        defer hbox.deinit();
+        inline for (@typeInfo(TextLayoutWidget.TextAlign).@"enum".fields, 0..) |field, i| {
+            const value: TextLayoutWidget.TextAlign = @enumFromInt(field.value);
+            if (dvui.radio(@src(), align_choice == value, field.name, .{ .id_extra = i })) align_choice = value;
+        }
+    }
+
+    // start/end flip with each paragraph's direction; left/right/center don't.
+    var tl = dvui.textLayout(@src(), .{ .text_align = align_choice }, .{ .min_size_content = .width(360), .max_size_content = .width(360), .border = Rect.all(1) });
+    defer tl.deinit();
+    tl.addText("An English paragraph that wraps over a few lines, so every line shows where the alignment puts it.\n", .{});
+    tl.addText("פסקה בעברית שנשברת לכמה שורות, כך שכל שורה מראה לאן היישור מזיז אותה.\n", .{});
+    tl.addText("Short line\n", .{});
+    tl.addText("שורה קצרה", .{});
+}
+
+fn fontFeatures() void {
+    dvui.label(@src(), "Font Features", .{}, .{ .font = .theme(.title) });
+    const families = familyChoices();
+    const choice = feature_family_choice orelse blk: {
+        // The system UI font carries most of these features (SF: tnum, zero, smcp, frac).
+        var default: usize = 0;
+        for (families, 0..) |f, i| {
+            if (std.mem.eql(u8, f, "System Font")) default = i;
+        }
+        feature_family_choice = default;
+        break :blk default;
+    };
+    {
+        var hbox = dvui.box(@src(), .{ .dir = .horizontal }, .{});
+        defer hbox.deinit();
+        var picked = choice;
+        if (dvui.dropdown(@src(), families, .{ .choice = &picked }, .{}, .{ .gravity_y = 0.5 })) feature_family_choice = picked;
+        _ = dvui.checkbox(@src(), &feature_liga, "liga", .{ .gravity_y = 0.5 });
+        _ = dvui.checkbox(@src(), &feature_tnum, "tnum", .{ .gravity_y = 0.5 });
+        _ = dvui.checkbox(@src(), &feature_onum, "onum", .{ .gravity_y = 0.5 });
+        _ = dvui.checkbox(@src(), &feature_zero, "zero", .{ .gravity_y = 0.5 });
+        _ = dvui.checkbox(@src(), &feature_smcp, "smcp", .{ .gravity_y = 0.5 });
+        _ = dvui.checkbox(@src(), &feature_frac, "frac", .{ .gravity_y = 0.5 });
+    }
+
+    const plain = dvui.Font.init(families[feature_family_choice.?]).withSize(20);
+    const featured = plain
+        .withFeature("liga", feature_liga)
+        .withFeature("tnum", feature_tnum)
+        .withFeature("onum", feature_onum)
+        .withFeature("zero", feature_zero)
+        .withFeature("smcp", feature_smcp)
+        .withFeature("frac", feature_frac);
+    const sample = "office affluent fjord  Small Caps  1/2 3/4\n1111.11\n9999.00\n";
+
+    var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal });
+    defer tl.deinit();
+    tl.addText("default:\n", .{});
+    tl.addText(sample, .{ .font = plain });
+    tl.addText("with features:\n", .{});
+    tl.addText(sample, .{ .font = featured });
+}
+
+fn tabSize() void {
+    dvui.label(@src(), "Tab Size", .{}, .{ .font = .theme(.title) });
+    _ = dvui.sliderEntry(@src(), "tab size: {d:0}", .{ .value = &tab_size, .min = 0, .max = 16, .interval = 1 }, .{});
+    const font = dvui.Font.theme(.body).withTabSize(@intFromFloat(tab_size));
+    const sample = "name\tqty\tprice\napple\t3\t1.20\nwatermelon\t12\t4.50\n\tindented\tby a tab";
+
+    dvui.labelNoFmt(@src(), sample, .{}, .{ .font = font, .border = Rect.all(1) });
+
+    var te = dvui.textEntry(@src(), .{ .multiline = true }, .{ .font = font, .min_size_content = .{ .w = 400, .h = 90 } });
+    defer te.deinit();
+    if (!tab_entry_filled) {
+        te.textSet(sample, false);
+        tab_entry_filled = true;
+    }
 }
 
 fn styling() void {
@@ -359,14 +483,7 @@ fn familyChoices() []const []const u8 {
         family_choices_buf[0] = demo_stack_alias;
         const generics = dvui.Font.generic_families;
         for (generics, 0..) |g, i| family_choices_buf[1 + i] = g;
-        var head = 1 + generics.len;
-        // CoreText hides the system UI font from
-        // CTFontManagerCopyAvailableFontFamilyNames, so SF never shows
-        // up below -- but "System Font" still resolves by name.
-        if (@import("builtin").os.tag.isDarwin()) {
-            family_choices_buf[head] = "System Font";
-            head += 1;
-        }
+        const head = 1 + generics.len;
         const system = dvui.Font.systemFamilies(
             family_choices_buf[head..],
             &family_names_storage,
