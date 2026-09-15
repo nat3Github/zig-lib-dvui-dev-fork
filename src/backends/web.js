@@ -671,6 +671,20 @@ export class Dvui {
                     );
                 }
             },
+            wasm_textureUpdateSubRect: (id, pixels, tex_width, x, y, w, h) => {
+                const entry = this.textureEntry(id);
+                if (entry === null || w === 0 || h === 0) return;
+                // WebGL1 lacks UNPACK_ROW_LENGTH, so repack the rect rows tightly.
+                const rowBytes = w * 4;
+                const pixelData = new Uint8Array(rowBytes * h);
+                for (let row = 0; row < h; row++) {
+                    const src = this.bytesFromPointer(pixels + ((y + row) * tex_width + x) * 4, rowBytes);
+                    pixelData.set(src, row * rowBytes);
+                }
+                this.gl.bindTexture(this.gl.TEXTURE_2D, entry[0]);
+                this.gl.texSubImage2D(this.gl.TEXTURE_2D, 0, x, y, w, h, this.gl.RGBA, this.gl.UNSIGNED_BYTE, pixelData);
+                this.gl.bindTexture(this.gl.TEXTURE_2D, null);
+            },
             wasm_textureDestroy: (id) => {
                 //console.log("deleting texture " + id);
                 const entry = this.textureEntry(id);

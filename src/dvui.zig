@@ -604,9 +604,10 @@ pub fn addFont(name: []const u8, ttf_bytes: []const u8, ttf_bytes_allocator: ?st
 ///
 /// A family in the list may itself be an alias, registered before or after
 /// this one; nested aliases expand in place, up to `Font.Cache.max_alias_depth`
-/// levels deep (deeper nesting, e.g. a cycle, is cut off with a warning).
+/// levels deep and `Font.Cache.max_alias_expansions` expansions (past that,
+/// e.g. a cycle, is cut off with a warning).
 ///
-/// Only affects text shaped after this call, so register at startup.
+/// Re-registering an alias replaces its list for all text from then on.
 ///
 /// Only valid between `Window.begin` and `Window.end`.
 pub fn addFontFamily(alias: []const u8, families: []const []const u8) std.mem.Allocator.Error!void {

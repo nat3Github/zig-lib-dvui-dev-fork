@@ -2114,9 +2114,9 @@ fn reshapeWithNeighbourContext(frags: []Fragment, base_direction: opentype.unico
     for (frags, 0..) |f, i| {
         // A different font is a different shaping run: its glyphs would be
         // context in the wrong typeface, and nothing joins across it anyway.
-        const font_hash = f.font.hash();
-        const before = if (i > 0 and frags[i - 1].font.hash() == font_hash) contextTail(frags[i - 1].text) else "";
-        const after = if (i + 1 < frags.len and frags[i + 1].font.hash() == font_hash) contextHead(frags[i + 1].text) else "";
+        const font_key = f.font.cacheKey();
+        const before = if (i > 0 and std.meta.eql(frags[i - 1].font.cacheKey(), font_key)) contextTail(frags[i - 1].text) else "";
+        const after = if (i + 1 < frags.len and std.meta.eql(frags[i + 1].font.cacheKey(), font_key)) contextHead(frags[i + 1].text) else "";
         const lead = if (stickyBoundary(before, f.text)) before else "";
         const trail = if (stickyBoundary(f.text, after)) after else "";
         if (lead.len == 0 and trail.len == 0) continue;

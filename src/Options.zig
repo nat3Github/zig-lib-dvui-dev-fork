@@ -477,7 +477,7 @@ pub fn hash(self: *const Options) u64 {
     if (self.color_border) |col| hasher.update(asBytes(&col));
 
     const font = self.fontGet();
-    hasher.update(asBytes(&font.hash()));
+    hasher.update(&font.cacheKey().bytes);
 
     if (self.tab_index) |ti| hasher.update(asBytes(&ti));
     hasher.update(asBytes(&self.idExtra()));

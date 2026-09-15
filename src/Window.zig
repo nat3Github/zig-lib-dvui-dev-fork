@@ -448,7 +448,7 @@ pub fn addFont(self: *Self, name: []const u8, ttf_bytes: []const u8, ttf_bytes_a
     var entry = try dvui.Font.Cache.Entry.init(self.gpa, ttf_bytes, 0, &.{}, font);
     // Try and cache the entry since the work is already done. An already
     // cached entry is kept: text shaped earlier this frame may still point at it.
-    const slot = self.fonts.cache.getOrPut(self.gpa, font.hash()) catch null;
+    const slot = self.fonts.cache.getOrPut(self.gpa, font.cacheKey()) catch null;
     if (slot == null or slot.?.found_existing) {
         entry.deinit(self.gpa, self.backend);
     } else if (self.gpa.create(dvui.Font.Cache.Entry)) |boxed| {

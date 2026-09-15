@@ -15,7 +15,7 @@ android {
 
         externalNativeBuild {
             cmake {
-                arguments '-DANDROID_STL=c++_shared', '-DANDROID_PLATFORM=android-34'
+                arguments '-DANDROID_STL=c++_shared', '-DANDROID_PLATFORM=android-34', '-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON'
                 abiFilters 'arm64-v8a'
             }
         }
@@ -42,6 +42,22 @@ android {
     }
 }
 
+// builds the zig static lib into src/main/c/prebuilt/<abi>/ before CMake links it
+def localProps = new Properties()
+def localPropsFile = rootProject.file('local.properties')
+if (localPropsFile.exists()) localPropsFile.withInputStream { localProps.load(it) }
+// GUI-launched Android Studio often lacks the shell PATH, so allow zig=<path> in local.properties
+def zigExe = localProps.getProperty('zig') ?: project.findProperty('zig') ?: 'zig'
+
+['Debug': 'Debug', 'Release': 'ReleaseFast'].each { variant, optimize ->
+    def zigTask = tasks.register("zigBuild${variant}", Exec) {
+        workingDir file('../../zig-project')
+        executable zigExe
+        args 'build', 'lib', "-Doptimize=${optimize}", "-Dandroid_ndk=${android.ndkDirectory}"
+    }
+    tasks.matching { it.name == "pre${variant}Build" }.configureEach { dependsOn zigTask }
+}
+
 dependencies {
-    implementation files('libs/SDL3-3.4.0.aar')
+    implementation files('libs/SDL3-3.4.16.aar')
 }

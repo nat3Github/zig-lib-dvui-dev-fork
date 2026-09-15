@@ -266,6 +266,10 @@ pub fn renderText(opts: TextOptions) Backend.GenericError!void {
         var seg_end = seg_start + 1;
         while (seg_end < glyph_limit and line.entryForGlyph(fallback_entry, seg_end) == fce) seg_end += 1;
 
+        // Place every glyph before fetching the atlas, or a first-seen glyph
+        // misses this frame's upload and gets UVs from the pre-growth size.
+        for (line.buffer.info.items[seg_start..seg_end]) |info| _ = fce.glyphInfoGet(cw.gpa, info.codepoint) catch {};
+
         const texture_atlas = fce.getTextureAtlas(cw.gpa, cw.backend) catch |err| switch (err) {
             error.OutOfMemory => |e| return e,
             else => {

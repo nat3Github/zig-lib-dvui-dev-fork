@@ -32,8 +32,14 @@ pub fn TrackingAutoHashMap(
 
         const Self = @This();
 
-        pub const HashMap = std.HashMapUnmanaged(K, Tracked(V), if (K == []const u8) std.hash_map.StringContext else std.hash_map.AutoContext(K), std.hash_map.default_max_load_percentage);
-        pub const RetainHashMap = std.HashMapUnmanaged(K, retainToken, if (K == []const u8) std.hash_map.StringContext else std.hash_map.AutoContext(K), std.hash_map.default_max_load_percentage);
+        const Context = if (K == []const u8)
+            std.hash_map.StringContext
+        else if (@typeInfo(K) == .@"struct" and @hasDecl(K, "Context"))
+            K.Context
+        else
+            std.hash_map.AutoContext(K);
+        pub const HashMap = std.HashMapUnmanaged(K, Tracked(V), Context, std.hash_map.default_max_load_percentage);
+        pub const RetainHashMap = std.HashMapUnmanaged(K, retainToken, Context, std.hash_map.default_max_load_percentage);
 
         pub const Entry = struct {
             key_ptr: *K,

@@ -37,7 +37,7 @@ const CommonSdl = struct {
 };
 
 fn addAndroidLibC(
-    mod: *std.Build.Module,
+    mod: anytype,
     opts: DvuiModuleOptions,
 ) void {
     if (opts.android_include_path) |include_path| {
@@ -52,6 +52,14 @@ fn addAndroidLibC(
 
         mod.addSystemIncludePath(include_path.path(opts.b, arch_specific_path));
         mod.addSystemIncludePath(include_path);
+        if (@TypeOf(mod) == *std.Build.Step.TranslateC) {
+            // aro can't parse bionic's nullability-on-array params or clang-only FORTIFY wrappers
+            mod.defineCMacro("_Nonnull", "");
+            mod.defineCMacro("_Nullable", "");
+            mod.defineCMacro("_Null_unspecified", "");
+            mod.defineCMacro("__clang_analyzer__", "1");
+            mod.defineCMacro("__ANDROID_MIN_SDK_VERSION__", opts.b.fmt("{d}", .{opts.target.result.os.version_range.linux.android}));
+        }
     } else {
         @panic("Can't build for android without android_include_path");
     }
@@ -107,11 +115,12 @@ pub fn linkSdl3(
                 .sanitize_c = sdl3_sanitize_c,
             });
         if (sdl3_dep) |sdl3| {
+            sdl_translate_c.addIncludePath(sdl3.artifact("SDL3").getEmittedIncludeTree());
             if (opts.target.result.abi.isAndroid()) {
                 sdl_mod.addIncludePath(sdl3.artifact("SDL3").getEmittedIncludeTree());
                 addAndroidLibC(sdl_mod, opts);
+                addAndroidLibC(sdl_translate_c, opts);
             } else {
-                sdl_translate_c.addIncludePath(sdl3.artifact("SDL3").getEmittedIncludeTree());
                 sdl_mod.linkLibrary(sdl3.artifact("SDL3"));
             }
             if (opts.target.result.os.tag == .ios) {
@@ -1380,6 +1389,7 @@ pub fn addDvuiModule(
         .link_libc = libc,
     });
     if (libc) dvui_translate_c.defineCMacro("DVUI_USE_LIBC", "1");
+    if (target.result.abi.isAndroid()) addAndroidLibC(dvui_translate_c, opts);
     // NOTE: iOS cross-compiles have no native sysroot, so dvui_mod (which directly compiles
     // C sources, e.g. vendor/stb/*.c below) needs libc headers like stdio.h passed explicitly.
     const dvui_mod_needs_ios_sysroot = target.result.os.tag == .ios;

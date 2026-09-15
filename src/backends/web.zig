@@ -50,6 +50,7 @@ pub const wasm = if (!builtin.is_test) struct {
     pub extern "dvui" fn wasm_textureClearTarget(u32) void;
     pub extern "dvui" fn wasm_textureRead(texture: u32, pixels_out: [*]u8, width: u32, height: u32) void;
     pub extern "dvui" fn wasm_renderTarget(u32) void;
+    pub extern "dvui" fn wasm_textureUpdateSubRect(texture: u32, pixels: [*]const u8, tex_width: u32, x: u32, y: u32, w: u32, h: u32) void;
     pub extern "dvui" fn wasm_textureDestroy(u32) void;
     pub extern "dvui" fn wasm_renderGeometry(texture: u32, index_ptr: [*]const u8, index_len: usize, vertex_ptr: [*]const u8, vertex_len: usize, sizeof_vertex: u8, offset_pos: u8, offset_col: u8, offset_uv: u8, clip: u8, x: i32, y: i32, w: i32, h: i32) void;
 
@@ -111,6 +112,7 @@ pub const wasm = if (!builtin.is_test) struct {
     pub fn wasm_textureClearTarget(_: u32) void {}
     pub fn wasm_textureRead(_: u32, _: [*]u8, _: u32, _: u32) void {}
     pub fn wasm_renderTarget(_: u32) void {}
+    pub fn wasm_textureUpdateSubRect(_: u32, _: [*]const u8, _: u32, _: u32, _: u32, _: u32, _: u32) void {}
     pub fn wasm_textureDestroy(_: u32) void {}
     pub fn wasm_renderGeometry(_: u32, _: [*]const u8, _: usize, _: [*]const u8, _: usize, _: u8, _: u8, _: u8, _: u8, _: u8, _: i32, _: i32, _: i32, _: i32) void {}
 
@@ -736,6 +738,10 @@ pub fn renderTarget(_: *WebBackend, texture: ?dvui.TextureTarget) !void {
 
 pub fn textureReadTarget(_: *WebBackend, texture: dvui.TextureTarget, pixels_out: [*]u8) !void {
     wasm.wasm_textureRead(@intCast(@intFromPtr(texture.ptr)), pixels_out, texture.width, texture.height);
+}
+
+pub fn textureUpdateSubRect(_: *WebBackend, texture: dvui.Texture, pixels: [*]const u8, x: u32, y: u32, w: u32, h: u32) !void {
+    wasm.wasm_textureUpdateSubRect(@intCast(@intFromPtr(texture.ptr)), pixels, texture.width, x, y, w, h);
 }
 
 pub fn textureDestroy(_: *WebBackend, texture: dvui.Texture) void {
