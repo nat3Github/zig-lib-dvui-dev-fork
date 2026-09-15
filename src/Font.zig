@@ -1023,6 +1023,7 @@ pub const Cache = struct {
         if (source.bytes.len == 0) {
             // Dropped by `reset()` while unused; only sources with a path are.
             const path = source.path orelse return .{ null, null };
+            if (system_font_backend == null) return .{ null, null };
             source.bytes = std.Io.Dir.cwd().readFileAlloc(dvui.io, path, source.allocator.?, .limited(system_font_size_limit)) catch return .{ null, null };
         }
 
