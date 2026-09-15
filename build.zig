@@ -85,13 +85,13 @@ pub fn linkSdl3(
         const cross_win_msvc = opts.target.result.os.tag == .windows and
             opts.target.result.abi == .msvc and
             opts.b.graph.host.result.os.tag != .windows;
-        // NOTE: iOS builds compile a static lib that Xcode's own linker (not zig) links
-        // together with this dependency's separately-built libSDL3.a. UBSan's runtime
+        // NOTE: iOS/Android builds compile a static lib that Xcode's/the NDK's own linker
+        // (not zig) links together with this dependency's separately-built libSDL3.a. UBSan's runtime
         // (__ubsan_handle_*) only gets bundled into the artifact zig itself produces as a
         // final binary, so a plain sanitize_c default (full in Debug) leaves libSDL3.a with
         // unresolved symbols at that link step. Every other target links through zig itself,
-        // which bundles ubsan into the one binary, so this is iOS-only.
-        const sdl3_sanitize_c: ?std.zig.SanitizeC = if (opts.target.result.os.tag == .ios) .off else null;
+        // which bundles ubsan into the one binary.
+        const sdl3_sanitize_c: ?std.zig.SanitizeC = if (opts.target.result.os.tag == .ios or opts.target.result.abi.isAndroid()) .off else null;
         const sdl3_dep = if (cross_win_msvc)
             opts.b.lazyDependency("sdl3", .{
                 .target = opts.target,
@@ -1400,7 +1400,7 @@ pub fn addDvuiModule(
         .optimize = optimize,
         // NOTE: see sdl3_sanitize_c in linkSdl3 -- same ubsan-runtime-not-bundled issue for
         // the C sources this module compiles directly (e.g. vendor/stb/*.c below).
-        .sanitize_c = if (target.result.os.tag == .ios) .off else null,
+        .sanitize_c = if (target.result.os.tag == .ios or target.result.abi.isAndroid()) .off else null,
         .imports = &.{
             .{
                 .name = "dvui-c",

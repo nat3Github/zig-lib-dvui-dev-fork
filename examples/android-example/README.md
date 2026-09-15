@@ -10,7 +10,7 @@
 
 ### Zig side
 Nothing to do: the gradle build runs `zig build lib` (Debug for debug, ReleaseFast for release) with Android Studio's NDK.
-`zig` must be on the PATH Android Studio sees; otherwise add `zig=<path to zig>` to `android-project/local.properties` (e.g. `zig=/opt/homebrew/bin/zig`, or `zig=C\\:\\zig\\zig.exe` on Windows).
+`zig` must be on the PATH Android Studio sees. If it isn't (common on macOS when launched from the Dock), add `zig=<path to zig>` to your user-level `~/.gradle/gradle.properties` (Windows: `%USERPROFILE%\.gradle\gradle.properties`).
 
 To build the lib by hand, in `zig-project`: `zig build lib -Dandroid_ndk=<android_sdk>/ndk/<version>` (or set `ANDROID_NDK_HOME`)
 - Defaults to `aarch64-linux-android`; pass `-Dtarget=x86_64-linux-android` for an x86_64 emulator

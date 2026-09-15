@@ -3,15 +3,15 @@ plugins {
 }
 
 android {
-    namespace "org.libsdl.helloworld"
-    compileSdk 35
+    namespace = "org.libsdl.helloworld"
+    compileSdk = 35
 
     defaultConfig {
-        applicationId 'org.libsdl.SDL_Helloworld'
-        minSdk 34
-        targetSdk 35
-        versionCode 1
-        versionName '1.0'
+        applicationId = 'org.libsdl.SDL_Helloworld'
+        minSdk = 34
+        targetSdk = 35
+        versionCode = 1
+        versionName = '1.0'
 
         externalNativeBuild {
             cmake {
@@ -23,37 +23,31 @@ android {
 
     externalNativeBuild {
         cmake {
-            path 'src/main/c/CMakeLists.txt'
+            path = 'src/main/c/CMakeLists.txt'
         }
     }
 
     buildTypes {
         release {
-            minifyEnabled false
+            minifyEnabled = false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }
     compileOptions {
-        sourceCompatibility JavaVersion.VERSION_1_8
-        targetCompatibility JavaVersion.VERSION_1_8
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
     }
     buildFeatures {
-        prefab true
+        prefab = true
     }
 }
 
 // builds the zig static lib into src/main/c/prebuilt/<abi>/ before CMake links it
-def localProps = new Properties()
-def localPropsFile = rootProject.file('local.properties')
-if (localPropsFile.exists()) localPropsFile.withInputStream { localProps.load(it) }
-// GUI-launched Android Studio often lacks the shell PATH, so allow zig=<path> in local.properties
-def zigExe = localProps.getProperty('zig') ?: project.findProperty('zig') ?: 'zig'
-
 ['Debug': 'Debug', 'Release': 'ReleaseFast'].each { variant, optimize ->
     def zigTask = tasks.register("zigBuild${variant}", Exec) {
         workingDir file('../../zig-project')
-        executable zigExe
-        args 'build', 'lib', "-Doptimize=${optimize}", "-Dandroid_ndk=${android.ndkDirectory}"
+        executable project.findProperty('zig') ?: 'zig'
+        args 'build', 'lib', "-Doptimize=${optimize}", "-Dandroid_ndk=${androidComponents.sdkComponents.ndkDirectory.get().asFile}"
     }
     tasks.matching { it.name == "pre${variant}Build" }.configureEach { dependsOn zigTask }
 }
