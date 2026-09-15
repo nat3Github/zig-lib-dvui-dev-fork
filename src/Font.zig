@@ -917,10 +917,8 @@ pub const Cache = struct {
         }
         var lit = self.shaped_line_cache.iterator();
         while (lit.next_resetting()) |kv| {
-            var line_key = kv.key;
             var line = kv.value;
-            self.shaped_line_bytes -= line.byteSize(line_key);
-            line_key.deinit(gpa);
+            self.shaped_line_bytes -= line.byteSize();
             line.deinit(gpa);
         }
         // Draw commands from the last frame are submitted by now, so atlas
@@ -979,10 +977,7 @@ pub const Cache = struct {
     // thrashing this.
     fn clearShapedLineCache(self: *Cache, gpa: std.mem.Allocator) void {
         var it = self.shaped_line_cache.iterator();
-        while (it.next()) |kv| {
-            kv.key_ptr.deinit(gpa);
-            kv.value_ptr.deinit(gpa);
-        }
+        while (it.next()) |kv| kv.value_ptr.deinit(gpa);
         self.shaped_line_cache.map.clearRetainingCapacity();
         self.shaped_line_bytes = 0;
     }
@@ -990,12 +985,8 @@ pub const Cache = struct {
     /// Keeps `line` for later `shapeLineText` calls with an equal `key`.
     /// Failing to allocate just leaves the line uncached.
     fn cacheShapedLine(self: *Cache, gpa: std.mem.Allocator, key: ShapedLineKey, line: *const Entry.ShapedLine, segments: []const CachedShapedLine.Segment) void {
-        var owned_key = key.dupe(gpa) catch return;
-        var value = CachedShapedLine.init(gpa, line, segments) catch {
-            owned_key.deinit(gpa);
-            return;
-        };
-        const bytes = value.byteSize(owned_key);
+        const owned_key, var value = CachedShapedLine.init(gpa, key, line, segments) catch return;
+        const bytes = value.byteSize();
         if (bytes <= max_shaped_line_bytes) {
             if (self.shaped_line_bytes + bytes > max_shaped_line_bytes) self.clearShapedLineCache(gpa);
             // Only reached after a miss or after dropping the stale entry.
@@ -1004,7 +995,6 @@ pub const Cache = struct {
                 return;
             } else |_| {}
         }
-        owned_key.deinit(gpa);
         value.deinit(gpa);
     }
 
@@ -1458,10 +1448,8 @@ pub const Cache = struct {
             // and fall through to reshape from scratch instead of silently
             // rendering with missing segments.
             if (self.shaped_line_cache.fetchRemove(cache_key)) |kv| {
-                var stale_key = kv.key;
                 var stale = kv.value;
-                self.shaped_line_bytes -= stale.byteSize(stale_key);
-                stale_key.deinit(state_gpa);
+                self.shaped_line_bytes -= stale.byteSize();
                 stale.deinit(state_gpa);
             }
         }
@@ -1680,7 +1668,8 @@ pub const Cache = struct {
     }
 
     /// Everything that changes a `shapeLineText` result. Keys stored in
-    /// `shaped_line_cache` own `text` and `features`; lookups borrow them.
+    /// `shaped_line_cache` point `text` and `features` into their value's
+    /// `CachedShapedLine.buffer`; lookups borrow the caller's.
     pub const ShapedLineKey = struct {
         font_key: Font.CacheKey,
         text: []const u8,
@@ -1725,19 +1714,6 @@ pub const Cache = struct {
                 return std.mem.eql(u8, a.text, b.text);
             }
         };
-
-        fn dupe(self: ShapedLineKey, gpa: std.mem.Allocator) std.mem.Allocator.Error!ShapedLineKey {
-            var owned = self;
-            owned.text = try gpa.dupe(u8, self.text);
-            errdefer gpa.free(owned.text);
-            owned.features = try gpa.dupe(Font.Feature, self.features);
-            return owned;
-        }
-
-        fn deinit(self: *ShapedLineKey, gpa: std.mem.Allocator) void {
-            gpa.free(self.text);
-            gpa.free(self.features);
-        }
     };
 
     /// Owned copy of a shape result kept in `shaped_line_cache`. Segments
@@ -1745,6 +1721,9 @@ pub const Cache = struct {
     /// rather than `*Entry` (see `shapeLineText`'s cache_segments comment);
     /// `materializeShapedLine` resolves them back to live pointers per hit.
     const CachedShapedLine = struct {
+        /// One allocation per cached line: backs every slice below plus the
+        /// owning key's `text` and `features`.
+        buffer: []align(buffer_alignment.toByteUnits()) u8,
         glyphs: []Glyph,
         codepoints: []u21,
         byte_offsets: []u32,
@@ -1758,45 +1737,83 @@ pub const Cache = struct {
         /// through; the rest is shaper scratch, zeroed on a hit.
         const Glyph = struct { glyph_id: u32, cluster: u32, x_advance: i32, x_offset: i32, y_offset: i32 };
 
-        fn init(gpa: std.mem.Allocator, line: *const Entry.ShapedLine, segments: []const Segment) std.mem.Allocator.Error!CachedShapedLine {
-            const glyphs = try gpa.alloc(Glyph, line.buffer.info.items.len);
-            errdefer gpa.free(glyphs);
+        const buffer_alignment: std.mem.Alignment = .fromByteUnits(@max(
+            @alignOf(Glyph),
+            @alignOf(u21),
+            @alignOf(u32),
+            @alignOf(Segment),
+            @alignOf(Font.Feature),
+        ));
+
+        /// Returns the stored copy of `key` alongside the value; both are
+        /// freed together by the value's `deinit`.
+        fn init(gpa: std.mem.Allocator, key: ShapedLineKey, line: *const Entry.ShapedLine, segments: []const Segment) std.mem.Allocator.Error!struct { ShapedLineKey, CachedShapedLine } {
+            const glyph_count = line.buffer.info.items.len;
+            var size: usize = 0;
+            try reserve(&size, Glyph, glyph_count);
+            try reserve(&size, u21, line.codepoints.len);
+            try reserve(&size, u32, line.byte_offsets.len);
+            try reserve(&size, u32, line.cluster_starts.len);
+            try reserve(&size, u32, line.cluster_ends.len);
+            try reserve(&size, Segment, segments.len);
+            try reserve(&size, Font.Feature, key.features.len);
+            try reserve(&size, u8, key.text.len);
+            const buffer = try gpa.alignedAlloc(u8, buffer_alignment, size);
+
+            // Carve in the same order as `reserve` above so offsets match.
+            var offset: usize = 0;
+            const glyphs = carve(buffer, &offset, Glyph, glyph_count);
             for (glyphs, line.buffer.info.items, line.buffer.pos.items) |*glyph, info, pos| {
                 glyph.* = .{ .glyph_id = info.codepoint, .cluster = info.cluster, .x_advance = pos.x_advance, .x_offset = pos.x_offset, .y_offset = pos.y_offset };
             }
-            const codepoints = try gpa.dupe(u21, line.codepoints);
-            errdefer gpa.free(codepoints);
-            const byte_offsets = try gpa.dupe(u32, line.byte_offsets);
-            errdefer gpa.free(byte_offsets);
-            const cluster_starts = try gpa.dupe(u32, line.cluster_starts);
-            errdefer gpa.free(cluster_starts);
-            const cluster_ends = try gpa.dupe(u32, line.cluster_ends);
-            errdefer gpa.free(cluster_ends);
-            return .{
+            const codepoints = carve(buffer, &offset, u21, line.codepoints.len);
+            @memcpy(codepoints, line.codepoints);
+            const byte_offsets = carve(buffer, &offset, u32, line.byte_offsets.len);
+            @memcpy(byte_offsets, line.byte_offsets);
+            const cluster_starts = carve(buffer, &offset, u32, line.cluster_starts.len);
+            @memcpy(cluster_starts, line.cluster_starts);
+            const cluster_ends = carve(buffer, &offset, u32, line.cluster_ends.len);
+            @memcpy(cluster_ends, line.cluster_ends);
+            const owned_segments = carve(buffer, &offset, Segment, segments.len);
+            @memcpy(owned_segments, segments);
+            const features = carve(buffer, &offset, Font.Feature, key.features.len);
+            @memcpy(features, key.features);
+            const text = carve(buffer, &offset, u8, key.text.len);
+            @memcpy(text, key.text);
+            std.debug.assert(offset == size);
+
+            var owned_key = key;
+            owned_key.text = text;
+            owned_key.features = features;
+            return .{ owned_key, .{
+                .buffer = buffer,
                 .glyphs = glyphs,
                 .codepoints = codepoints,
                 .byte_offsets = byte_offsets,
                 .cluster_starts = cluster_starts,
                 .cluster_ends = cluster_ends,
-                .segments = try gpa.dupe(Segment, segments),
-            };
+                .segments = owned_segments,
+            } };
         }
 
-        fn byteSize(self: CachedShapedLine, key: ShapedLineKey) usize {
-            return @sizeOf(ShapedLineKey) + @sizeOf(CachedShapedLine) +
-                key.text.len + std.mem.sliceAsBytes(key.features).len +
-                std.mem.sliceAsBytes(self.glyphs).len + std.mem.sliceAsBytes(self.codepoints).len +
-                std.mem.sliceAsBytes(self.byte_offsets).len + std.mem.sliceAsBytes(self.cluster_starts).len +
-                std.mem.sliceAsBytes(self.cluster_ends).len + std.mem.sliceAsBytes(self.segments).len;
+        fn reserve(size: *usize, comptime T: type, count: usize) std.mem.Allocator.Error!void {
+            const bytes = std.math.mul(usize, @sizeOf(T), count) catch return error.OutOfMemory;
+            const start = std.mem.alignForward(usize, size.*, @alignOf(T));
+            size.* = std.math.add(usize, start, bytes) catch return error.OutOfMemory;
+        }
+
+        fn carve(buffer: []align(buffer_alignment.toByteUnits()) u8, offset: *usize, comptime T: type, count: usize) []T {
+            const start = std.mem.alignForward(usize, offset.*, @alignOf(T));
+            offset.* = start + @sizeOf(T) * count;
+            return @as([*]T, @ptrCast(@alignCast(buffer[start..offset.*].ptr)))[0..count];
+        }
+
+        fn byteSize(self: CachedShapedLine) usize {
+            return @sizeOf(ShapedLineKey) + @sizeOf(CachedShapedLine) + self.buffer.len;
         }
 
         fn deinit(self: *CachedShapedLine, gpa: std.mem.Allocator) void {
-            gpa.free(self.glyphs);
-            gpa.free(self.codepoints);
-            gpa.free(self.byte_offsets);
-            gpa.free(self.cluster_starts);
-            gpa.free(self.cluster_ends);
-            gpa.free(self.segments);
+            gpa.free(self.buffer);
         }
     };
 
@@ -3080,6 +3097,32 @@ test "Cache.shapeLineText: a shaped_line_cache hit matches the fresh shape" {
         try std.testing.expectEqual(count, cw.fonts.shaped_line_cache.count());
         try expectSameShapedLine(fresh, hit);
     }
+}
+
+test "Cache.shapeLineText: a cached key owns its text and features" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    const gpa = std.testing.allocator;
+
+    try dvui.addFont("TestLatin", Source.fallback.bytes, null);
+    const cw = dvui.currentWindow();
+    const resolved = try cw.fonts.resolveStack(cw.gpa, Font.init("TestLatin"));
+
+    const text = try gpa.dupe(u8, "office fifty");
+    defer gpa.free(text);
+    const features = try gpa.dupe(Font.Feature, &.{.{ .tag = "liga".*, .value = 0 }});
+    defer gpa.free(features);
+    var fresh = try cw.fonts.shapeLineText(gpa, cw.gpa, resolved, text, null, .auto, .{ .features = features });
+    defer fresh.deinit();
+    const count = cw.fonts.shaped_line_cache.count();
+
+    @memset(text, 'x');
+    features[0] = .{ .tag = "kern".*, .value = 1 };
+    const no_liga = [_]Font.Feature{.{ .tag = "liga".*, .value = 0 }};
+    var hit = try cw.fonts.shapeLineText(gpa, cw.gpa, resolved, "office fifty", null, .auto, .{ .features = &no_liga });
+    defer hit.deinit();
+    try std.testing.expectEqual(count, cw.fonts.shaped_line_cache.count());
+    try expectSameShapedLine(fresh, hit);
 }
 
 test "Cache.ShapedLineKey: every field takes part in equality" {
