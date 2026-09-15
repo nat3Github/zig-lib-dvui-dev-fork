@@ -2006,7 +2006,8 @@ pub const Cache = struct {
             origin: @Vector(2, f32),
             /// True for color glyphs (COLR/sbix/CBDT); rendered as-is.
             is_color: bool,
-            /// Rasterized RGBA bytes (w*h*4), gpa-owned. Freed once uploaded
+            /// Rasterized bytes, gpa-owned: straight RGBA (w*h*4) when
+            /// `is_color`, coverage (w*h) otherwise. Freed once uploaded
             /// when the backend has partial uploads (`drops_uploaded_pixels`);
             /// a rebuild re-rasterizes.
             pixels: []u8,
@@ -2178,10 +2179,12 @@ pub const Cache = struct {
                 error.OutOfMemory => |e| return e,
                 else => return false,
             };
-            defer rendered.deinit(gpa);
-            if (@as(f32, @floatFromInt(rendered.bitmap.width)) != gi.w or @as(f32, @floatFromInt(rendered.bitmap.rows)) != gi.h) return false;
-            const byte_len = @as(usize, rendered.bitmap.width) * rendered.bitmap.rows * 4;
-            gi.pixels = try gpa.dupe(u8, rendered.bitmap.pixels_row_major[0..byte_len]);
+            if (@as(f32, @floatFromInt(rendered.bitmap.width)) != gi.w or @as(f32, @floatFromInt(rendered.bitmap.rows)) != gi.h) {
+                rendered.deinit(gpa);
+                return false;
+            }
+            std.debug.assert(rendered.bitmap.pixels_row_major.len == @as(usize, rendered.bitmap.width) * rendered.bitmap.rows * @as(usize, if (rendered.is_color) 4 else 1));
+            gi.pixels = rendered.bitmap.pixels_row_major;
             return true;
         }
 
@@ -2261,16 +2264,19 @@ pub const Cache = struct {
             while (row < out_h) : (row += 1) {
                 var col: u32 = 0;
                 while (col < out_w) : (col += 1) {
-                    const src = gi.pixels[(row * out_w + col) * 4 ..][0..4];
+                    const src_index = row * out_w + col;
                     const dest = (oy + row) * dst_stride + (ox + col);
-                    dst[dest] = if (gi.is_color)
+                    dst[dest] = if (gi.is_color) blk: {
                         // Renderer output is straight (non-premultiplied) alpha; PMA
                         // needs it premultiplied or edge pixels over-brighten on dark
                         // backgrounds (RGB doesn't fall off with alpha near the edge).
-                        .fromColor(.{ .r = src[0], .g = src[1], .b = src[2], .a = src[3] })
-                    else
-                        // Coverage-only: broadcast alpha as premultiplied white.
-                        .{ .r = src[3], .g = src[3], .b = src[3], .a = src[3] };
+                        const src = gi.pixels[src_index * 4 ..][0..4];
+                        break :blk .fromColor(.{ .r = src[0], .g = src[1], .b = src[2], .a = src[3] });
+                    } else blk: {
+                        // Coverage-only: broadcast coverage as premultiplied white.
+                        const coverage = gi.pixels[src_index];
+                        break :blk .{ .r = coverage, .g = coverage, .b = coverage, .a = coverage };
+                    };
                 }
             }
         }
@@ -2370,8 +2376,8 @@ pub const Cache = struct {
                         break :blk .{ .leftBearing = 0, .topBearing = 0, .w = 0, .h = 0, .origin = .{ 0, 0 }, .is_color = false, .pixels = &.{}, .uploaded = false };
                     },
                 };
-                defer rendered.deinit(gpa);
-                const byte_len = @as(usize, rendered.bitmap.width) * rendered.bitmap.rows * 4;
+                // Owned as-is: freed later with gpa.free, which needs the exact allocation length.
+                std.debug.assert(rendered.bitmap.pixels_row_major.len == @as(usize, rendered.bitmap.width) * rendered.bitmap.rows * @as(usize, if (rendered.is_color) 4 else 1));
                 break :blk .{
                     .leftBearing = @floatFromInt(rendered.bitmap.left),
                     .topBearing = @floatFromInt(rendered.bitmap.top),
@@ -2379,10 +2385,11 @@ pub const Cache = struct {
                     .h = @floatFromInt(rendered.bitmap.rows),
                     .origin = .{ 0, 0 },
                     .is_color = rendered.is_color,
-                    .pixels = try gpa.dupe(u8, rendered.bitmap.pixels_row_major[0..byte_len]),
+                    .pixels = rendered.bitmap.pixels_row_major,
                     .uploaded = false,
                 };
             };
+            errdefer gpa.free(gi.pixels);
 
             if (gi.w > 0 and gi.h > 0) {
                 gi.origin = self.placeGlyph(@intFromFloat(gi.w), @intFromFloat(gi.h));
