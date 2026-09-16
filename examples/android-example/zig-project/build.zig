@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{ .default_target = .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .android } });
+    const target = b.standardTargetOptions(.{ .default_target = .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .android, .android_api_level = 24 } });
     const optimize = b.standardOptimizeOption(.{});
 
     const android_include_path = b.option(std.Build.LazyPath, "android_include_path", "NDK sysroot/usr/include (default: derived from -Dandroid_ndk)") orelse ndkIncludePath(b);

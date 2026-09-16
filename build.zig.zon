@@ -29,10 +29,11 @@
         // target-OS switch has none; see linkSdl3 in build.zig and examples/ios-example/README.md).
         // Additive only — every other target builds identically to the plain upstream fork.
         .sdl3 = .{
-            .path = "../../lib-sdl-dev",
+            .url = "git+https://github.com/nat3Github/lib-sdl3-dev-fork.git#98300199eb2c45694c68f5e409943b06e18444d8",
+            .hash = "sdl-0.4.2+3.4.4-SDL--uvgpQHL8wJtTzC9-jv4PS90U8358YWnqYDveIvc",
             .lazy = true,
         },
-        .opentype = .{ .url = "git+https://github.com/nat3Github/zig-lib-opentype.git#77fabe368a42bde7c02857dda2297edbe2717e2b", .hash = "opentype-0.0.0-ta4c0AZwRAD1CSIz6VjyCPVuQrfFGDTyUQstK45B8Yrc" },
+        .opentype = .{ .url = "git+https://github.com/nat3Github/zig-lib-opentype.git#26966bd2cb0c4d5c560d8e6c642046e2ca9b5f67", .hash = "opentype-0.0.0-ta4c0IS_RACqmL9TvgwEQo5lxmcON5_Mexn_atq8MQ66" },
         .raylib = .{
             .url = "git+https://github.com/raysan5/raylib?ref=master#e9caf5a9811a9c1a126398795915b13ef488618e",
             .hash = "raylib-6.0.0-whq8uOmvLgUktXC94fZkRLK2dQA75X2pMwZYj2X3EZl8",
