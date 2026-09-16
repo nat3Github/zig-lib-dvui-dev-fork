@@ -109,7 +109,9 @@ pub fn linkSdl3(
             opts.b.lazyDependency("sdl3", .{
                 .target = opts.target,
                 .optimize = opts.optimize,
-                .system_include_path = opts.sdl3_system_include_path,
+                .system_include_path = if (opts.target.result.abi.isAndroid()) opts.android_include_path else opts.sdl3_system_include_path,
+                // linked into the app's JNI shared lib
+                .pic = if (opts.target.result.abi.isAndroid()) true else null,
                 .system_framework_path = opts.sdl3_system_framework_path,
                 .library_path = opts.sdl3_library_path,
                 .sanitize_c = sdl3_sanitize_c,
@@ -117,14 +119,13 @@ pub fn linkSdl3(
         if (sdl3_dep) |sdl3| {
             sdl_translate_c.addIncludePath(sdl3.artifact("SDL3").getEmittedIncludeTree());
             if (opts.target.result.abi.isAndroid()) {
-                sdl_mod.addIncludePath(sdl3.artifact("SDL3").getEmittedIncludeTree());
                 addAndroidLibC(sdl_mod, opts);
                 addAndroidLibC(sdl_translate_c, opts);
-            } else {
-                sdl_mod.linkLibrary(sdl3.artifact("SDL3"));
             }
-            if (opts.target.result.os.tag == .ios) {
-                // NOTE: published for installIosSdl3() below, so downstream doesn't need its own sdl3 dep.
+            sdl_mod.linkLibrary(sdl3.artifact("SDL3"));
+            if (opts.target.result.os.tag == .ios or opts.target.result.abi.isAndroid()) {
+                // NOTE: published for installIosSdl3() below / the android example's archive merge,
+                // so downstream doesn't need its own sdl3 dep.
                 opts.b.installArtifact(sdl3.artifact("SDL3"));
                 opts.b.addNamedLazyPath("sdl3_include", sdl3.path("include"));
             }

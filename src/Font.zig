@@ -25,6 +25,7 @@ const discovery_directwrite = opentype.discovery_directwrite;
 const discovery_android = opentype.discovery_android;
 const selectBestFontMatch = opentype.selectBestFontMatch;
 const shapeBidiParagraphWithFallback = opentype.shapeBidiParagraphWithFallback;
+const PlanCache = opentype.PlanCache;
 pub const HardBreak = opentype.HardBreak;
 pub const firstHardBreak = opentype.firstHardBreak;
 pub const trailingHardBreakLen = opentype.trailingHardBreakLen;
@@ -796,6 +797,16 @@ pub const Cache = struct {
     /// Boxed for the same reason as `cache`: a `*ResolvedStack` stays valid
     /// across later inserts (e.g. resolving a nested alias mid-build).
     resolved_stacks: dvui.TrackingAutoHashMap(Font.CacheKey, *ResolvedStack, .get_and_put, void) = .empty,
+    /// Merged cmap coverage per family stack, keyed size-independently
+    /// (`coverageCacheKey`): `FallbackStack.build` sorts every cmap range of
+    /// every family in the stack, which is the same answer at every size.
+    /// Owns the `FallbackStack` each `ResolvedStack` borrows, and outlives
+    /// `reset()` -- the same stacks recur every frame.
+    coverage_cache: std.AutoHashMapUnmanaged(u64, Cmap.FallbackStack) = .empty,
+    /// Compiled GSUB/GPOS plans, reused across shape calls (and frames) for
+    /// the same font + script + features. Holds slices into font bytes, so
+    /// `evictUnreferencedFontBytes` clears it before freeing any.
+    shaping_plans: PlanCache = .{},
     /// Full-pipeline shape results, so an unchanged widget (grid cells, static
     /// labels) doesn't rerun bidi + GSUB/GPOS every frame. Lines unused for a
     /// frame go at `reset()`; within a frame `max_shaped_line_bytes` caps it.
@@ -837,6 +848,12 @@ pub const Cache = struct {
             gpa.destroy(item.value_ptr.*);
         }
         self.resolved_stacks.deinit(gpa);
+
+        var cit = self.coverage_cache.valueIterator();
+        while (cit.next()) |fb| fb.deinit(gpa);
+        self.coverage_cache.deinit(gpa);
+
+        self.shaping_plans.deinit(gpa);
 
         self.clearShapedLineCache(gpa);
         self.shaped_line_cache.deinit(gpa);
@@ -925,7 +942,7 @@ pub const Cache = struct {
         // positions they captured can be dropped.
         var eit = self.cache.iterator();
         while (eit.next_peek()) |kv| kv.value.clearAtlasIfOversized(gpa);
-        self.evictUnreferencedFontBytes();
+        self.evictUnreferencedFontBytes(gpa);
     }
 
     /// Entries die after one unused frame, so a font shown every other frame
@@ -933,7 +950,7 @@ pub const Cache = struct {
     const evict_after_unreferenced_resets = 600;
 
     /// `findSource` reads freed bytes back from `path` on next use.
-    fn evictUnreferencedFontBytes(self: *Cache) void {
+    fn evictUnreferencedFontBytes(self: *Cache, gpa: std.mem.Allocator) void {
         for (self.database.items) |*source| {
             if (source.path == null or source.bytes.len == 0) continue;
             if (self.bytesReferenced(source.bytes)) {
@@ -943,6 +960,8 @@ pub const Cache = struct {
             source.unreferenced_resets += 1;
             if (source.unreferenced_resets < evict_after_unreferenced_resets) continue;
             source.unreferenced_resets = 0;
+            // Cached shaping plans hold slices into these bytes.
+            self.shaping_plans.clear(gpa);
             source.allocator.?.free(source.bytes);
             source.bytes = &.{};
         }
@@ -1111,7 +1130,8 @@ pub const Cache = struct {
         /// up front for coverage purposes without paying for a fallback
         /// family's Renderer init + ppem calibration until it's actually used.
         raw_fonts: []OtFont = &.{},
-        /// Merged codepoint coverage across all entries; built once per stack.
+        /// Merged codepoint coverage across all entries. Borrowed from
+        /// `Cache.coverage_cache`, which owns it -- do not free here.
         fallback: Cmap.FallbackStack = .{},
         /// Warned codepoint blocks (cp >> 8) to suppress duplicate warnings.
         logged_missing: std.AutoHashMapUnmanaged(u21, void) = .empty,
@@ -1126,7 +1146,6 @@ pub const Cache = struct {
             gpa.free(self.raw_fonts);
             gpa.free(self.entry_keys);
             gpa.free(self.family_fonts);
-            self.fallback.deinit(gpa);
             self.logged_missing.deinit(gpa);
         }
 
@@ -1174,6 +1193,19 @@ pub const Cache = struct {
         for (list) |entry| self.flattenAliasStack(flattened, entry.apply(font), depth + 1);
     }
 
+    /// Size-independent identity of a family stack: the same families at a
+    /// different size cover exactly the same codepoints, so they share one
+    /// `coverage_cache` entry.
+    fn coverageCacheKey(names: []const Font) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        for (names) |family_font| {
+            var k = family_font.cacheKey();
+            @memset(k.bytes[NAME_MAX_LEN..][0..4], 0); // size
+            hasher.update(&k.bytes);
+        }
+        return hasher.final();
+    }
+
     /// Load families and cache merged coverage per stack. Only the primary
     /// family (index 0) gets a full calibrated `Entry` here -- fallback
     /// families are parsed just enough to read their cmap coverage; a full
@@ -1204,6 +1236,9 @@ pub const Cache = struct {
         errdefer state_gpa.free(family_fonts);
         const raw_fonts = try state_gpa.alloc(OtFont, names.len);
         errdefer state_gpa.free(raw_fonts);
+        const coverage_key = coverageCacheKey(names);
+        const cached_coverage = self.coverage_cache.get(coverage_key);
+
         const per_entry_ranges = try state_gpa.alloc([]Cmap.Range, names.len);
         defer state_gpa.free(per_entry_ranges);
 
@@ -1229,13 +1264,18 @@ pub const Cache = struct {
 
             if (count == 1) _ = try self.getOrCreate(state_gpa, family_font); // primary family is virtually always needed
 
+            if (cached_coverage != null) continue;
             const cmap_data = raw_fonts[count - 1].tableData(.{ 'c', 'm', 'a', 'p' }) orelse &.{};
             per_entry_ranges[ranges_count] = try Cmap.coverageRanges(cmap_data, state_gpa);
             ranges_count += 1;
         }
 
-        var fallback = try Cmap.FallbackStack.build(state_gpa, per_entry_ranges);
-        errdefer fallback.deinit(state_gpa);
+        const fallback = cached_coverage orelse blk: {
+            var built = try Cmap.FallbackStack.build(state_gpa, per_entry_ranges[0..ranges_count]);
+            errdefer built.deinit(state_gpa);
+            try self.coverage_cache.put(state_gpa, coverage_key, built);
+            break :blk built;
+        };
         const boxed = try state_gpa.create(ResolvedStack);
         errdefer state_gpa.destroy(boxed);
         boxed.* = .{ .font_key = font_key, .entry_keys = entry_keys, .family_fonts = family_fonts, .raw_fonts = raw_fonts, .fallback = fallback };
@@ -1556,7 +1596,9 @@ pub const Cache = struct {
 
         if (decoded.codepoints.len > 0 and fonts_list.items.len > 0) {
             // Bidi outer, font fallback inner, so visual reordering crosses font boundaries.
-            const shaped = shapeBidiParagraphWithFallback(output, fonts_list.items, decoded.codepoints, base_direction, &.{}, &.{}, style.features, item_cp) catch |err| switch (err) {
+            // state_gpa backs the plan cache: `output` may be a frame arena,
+            // and a cached plan has to outlive the call that built it.
+            const shaped = shapeBidiParagraphWithFallback(output, fonts_list.items, decoded.codepoints, base_direction, &.{}, &.{}, style.features, item_cp, .{ .cache = &self.shaping_plans, .state_allocator = state_gpa }) catch |err| switch (err) {
                 error.OutOfMemory => |e| return e,
                 else => BidiFallbackResult{ .buffer = Buffer.init(output), .font_indices = &.{} },
             };
@@ -1875,7 +1917,9 @@ pub const Cache = struct {
         const block: u21 = codepoint >> 8;
         if (resolved.logged_missing.get(block) != null) return;
         resolved.logged_missing.put(gpa, block, {}) catch {};
-        dvui.log.warn("Font: no entry covers codepoint block U+{X:0>4}xx (e.g. U+{X:0>4}), falling back to entry 0 (.notdef)", .{ block, codepoint });
+        // debug, not warn: this runs inside shaping, and on the web backend
+        // every emitted log line costs a console flush in the hot path.
+        dvui.log.debug("Font: no entry covers codepoint block U+{X:0>4}xx (e.g. U+{X:0>4}), falling back to entry 0 (.notdef)", .{ block, codepoint });
     }
 
     pub fn textSizeRawShaped(
@@ -2082,12 +2126,13 @@ pub const Cache = struct {
             return buf[0..n];
         }
 
-        fn measuredCapHeight(renderer: *Renderer, gpa: std.mem.Allocator, glyph_id: u16) ?f32 {
-            // scratch uses lifo; output uses gpa to avoid lifo ordering violation.
-            const rendered = renderer.renderGlyph(glyph_id, .{}, dvui.currentWindow().lifo(), gpa) catch return null;
-            defer rendered.deinit(gpa);
-            if (rendered.bitmap.rows == 0) return null;
-            return @floatFromInt(rendered.bitmap.rows);
+        /// Measures, rather than rasterizes: the calibration below only ever
+        /// looked at the bitmap's row count, which is the grid-fit box the
+        /// rasterizer computes before any scan conversion.
+        fn measuredCapHeight(renderer: *Renderer, glyph_id: u16) ?f32 {
+            const bounds = renderer.glyphBounds(glyph_id, .{}, dvui.currentWindow().lifo()) catch return null;
+            if (bounds.rows == 0) return null;
+            return @floatFromInt(bounds.rows);
         }
 
         /// Load font, calibrating ppem so rendered M height matches font.size.
@@ -2131,7 +2176,7 @@ pub const Cache = struct {
             var em_height = ppem;
             if (m_glyph_id != 0) probe: {
                 // Measure M height, correct ppem if it overshoots font.size.
-                const probe_h = measuredCapHeight(&renderer, gpa, m_glyph_id) orelse break :probe;
+                const probe_h = measuredCapHeight(&renderer, m_glyph_id) orelse break :probe;
                 if (probe_h <= 0) break :probe;
                 const ratio = probe_h / ppem;
                 const corrected = @max(min_pixel_size, font.size / ratio);
@@ -2142,7 +2187,7 @@ pub const Cache = struct {
                 renderer.deinit(gpa);
                 renderer = corrected_renderer;
                 ppem = corrected;
-                em_height = measuredCapHeight(&renderer, gpa, m_glyph_id) orelse ppem;
+                em_height = measuredCapHeight(&renderer, m_glyph_id) orelse ppem;
             }
 
             const scale_f = ppem / units_per_em_f;
@@ -2354,12 +2399,18 @@ pub const Cache = struct {
             const row_pixels = try gpa.alloc(dvui.Color.PMA, @as(usize, self.atlas_width) * needed_height);
             defer gpa.free(row_pixels);
 
-            var it = self.glyphs.valueIterator();
-            while (it.next()) |gi| {
+            var it = self.glyphs.iterator();
+            while (it.next()) |kv| {
+                const gi = kv.value_ptr;
                 if (gi.uploaded) continue;
                 const out_w: u32 = @intFromFloat(gi.w);
                 const out_h: u32 = @intFromFloat(gi.h);
                 if (out_w == 0 or out_h == 0) {
+                    gi.uploaded = true;
+                    continue;
+                }
+                // `glyphInfoGet` only measured the glyph; rasterize it now.
+                if (!try self.restorePixels(gpa, kv.key_ptr.*, gi)) {
                     gi.uploaded = true;
                     continue;
                 }
@@ -2377,28 +2428,28 @@ pub const Cache = struct {
         pub fn glyphInfoGet(self: *Entry, gpa: std.mem.Allocator, glyph_id: u32) std.mem.Allocator.Error!GlyphInfo {
             if (self.glyphs.get(glyph_id)) |gi| return gi;
 
+            // Measure only: layout and atlas placement need the box, not the
+            // coverage. `restorePixels` rasterizes on the way to the GPU, so a
+            // glyph that is measured but never drawn is never scan-converted.
             var gi: GlyphInfo = blk: {
-                const rendered = self.renderer.renderGlyph(@intCast(glyph_id), .{}, dvui.currentWindow().lifo(), gpa) catch |err| switch (err) {
+                const bounds = self.renderer.glyphBounds(@intCast(glyph_id), .{}, dvui.currentWindow().lifo()) catch |err| switch (err) {
                     error.OutOfMemory => |e| return e,
                     else => {
                         dvui.log.warn("Font.Cache.Entry.glyphInfoGet() opentype render error {any} font {s} glyph {d}\n", .{ err, self.name, glyph_id });
                         break :blk .{ .leftBearing = 0, .topBearing = 0, .w = 0, .h = 0, .origin = .{ 0, 0 }, .is_color = false, .pixels = &.{}, .uploaded = false };
                     },
                 };
-                // Owned as-is: freed later with gpa.free, which needs the exact allocation length.
-                std.debug.assert(rendered.bitmap.pixels_row_major.len == @as(usize, rendered.bitmap.width) * rendered.bitmap.rows * @as(usize, if (rendered.is_color) 4 else 1));
                 break :blk .{
-                    .leftBearing = @floatFromInt(rendered.bitmap.left),
-                    .topBearing = @floatFromInt(rendered.bitmap.top),
-                    .w = @floatFromInt(rendered.bitmap.width),
-                    .h = @floatFromInt(rendered.bitmap.rows),
+                    .leftBearing = @floatFromInt(bounds.left),
+                    .topBearing = @floatFromInt(bounds.top),
+                    .w = @floatFromInt(bounds.width),
+                    .h = @floatFromInt(bounds.rows),
                     .origin = .{ 0, 0 },
-                    .is_color = rendered.is_color,
-                    .pixels = rendered.bitmap.pixels_row_major,
+                    .is_color = bounds.is_color,
+                    .pixels = &.{},
                     .uploaded = false,
                 };
             };
-            errdefer gpa.free(gi.pixels);
 
             if (gi.w > 0 and gi.h > 0) {
                 gi.origin = self.placeGlyph(@intFromFloat(gi.w), @intFromFloat(gi.h));

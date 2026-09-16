@@ -4,9 +4,8 @@
     - https://developer.android.com/studio/projects/install-ndk
 
 ### Android Side
-1. Download the latest android zip (called something similar to `SDL3-devel-<version>-android.zip`) from the [SDL releases](https://github.com/libsdl-org/SDL/releases) 
-1. Extract and move the `.aar` to `android-project/app/libs/`
-1. Update `android-project/app/build.gradle` to reflect the version of the `.aar`. The line should be at the end and is `implementation files('libs/SDL3-3.4.0.aar')`
+Nothing to download: SDL is built from source by the zig build and linked into `libsdl_hello.a`.
+The SDL Java glue in `app/src/main/java/org/libsdl/app/` is copied from SDL's `android-project` and must match the SDL version dvui pins (currently 3.4.4), or the app crashes on launch with a JNI error.
 
 ### Zig side
 Nothing to do: the gradle build runs `zig build lib` (Debug for debug, ReleaseFast for release) with Android Studio's NDK.

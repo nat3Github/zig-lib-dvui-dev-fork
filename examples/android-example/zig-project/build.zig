@@ -7,12 +7,13 @@ pub fn build(b: *std.Build) void {
 
     const android_include_path = b.option(std.Build.LazyPath, "android_include_path", "NDK sysroot/usr/include (default: derived from -Dandroid_ndk)") orelse ndkIncludePath(b);
 
-    const dvui = b.dependency("dvui", .{
+    const dvui_dep = b.dependency("dvui", .{
         .target = target,
         .optimize = optimize,
         .backend = .sdl3,
         .android_include_path = android_include_path,
-    }).module("dvui_sdl3");
+    });
+    const dvui = dvui_dep.module("dvui_sdl3");
 
     const mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -34,10 +35,15 @@ pub fn build(b: *std.Build) void {
             .x86_64 => "x86_64",
             else => @panic("unsupported android arch"),
         };
+        // zig's static-lib output doesn't bundle linked static libs; flatten SDL3 in so the NDK link sees one archive
+        const merge = b.addSystemCommand(&.{ b.graph.zig_exe, "ar", "qcL" });
+        const merged = merge.addOutputFileArg("libsdl_hello.a");
+        merge.addFileArg(sdl_hello_lib.getEmittedBin());
+        merge.addFileArg(dvui_dep.artifact("SDL3").getEmittedBin());
         // zig-out/../../android-project: drops the lib where the gradle CMake build expects it
-        const install = b.addInstallArtifact(sdl_hello_lib, .{ .dest_dir = .{ .override = .{
+        const install = b.addInstallFileWithDir(merged, .{
             .custom = b.fmt("../../android-project/app/src/main/c/prebuilt/{s}", .{android_abi}),
-        } } });
+        }, "libsdl_hello.a");
         b.step("lib", "Build the lib into android-project").dependOn(&install.step);
     }
 

@@ -15,7 +15,7 @@ android {
 
         externalNativeBuild {
             cmake {
-                arguments '-DANDROID_STL=c++_shared', '-DANDROID_PLATFORM=android-34', '-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON'
+                arguments '-DANDROID_STL=none', '-DANDROID_PLATFORM=android-34', '-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON'
                 abiFilters 'arm64-v8a'
             }
         }
@@ -37,9 +37,6 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    buildFeatures {
-        prefab = true
-    }
 }
 
 // builds the zig static lib into src/main/c/prebuilt/<abi>/ before CMake links it
@@ -47,11 +44,9 @@ android {
     def zigTask = tasks.register("zigBuild${variant}", Exec) {
         workingDir file('../../zig-project')
         executable project.findProperty('zig') ?: 'zig'
-        args 'build', 'lib', "-Doptimize=${optimize}", "-Dandroid_ndk=${androidComponents.sdkComponents.ndkDirectory.get().asFile}"
+        // local opentype checkout wins over dvui's URL pin, when present
+        def opentype = file('../../../../../opentype')
+        args = ['build', 'lib', "-Doptimize=${optimize}", "-Dandroid_ndk=${androidComponents.sdkComponents.ndkDirectory.get().asFile}"] + (opentype.exists() ? ["--fork=${opentype}"] : [])
     }
     tasks.matching { it.name == "pre${variant}Build" }.configureEach { dependsOn zigTask }
-}
-
-dependencies {
-    implementation files('libs/SDL3-3.4.16.aar')
 }
