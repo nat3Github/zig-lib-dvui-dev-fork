@@ -1392,14 +1392,22 @@ pub const Cache = struct {
             gpa.free(bytes);
             return service.fontFailed(gpa, font);
         };
-        parsed.deinit(gpa);
+        gpa.free(parsed.table_records);
+        // Keep the decompressed sfnt, not the wOF2 bytes: every later
+        // Entry.init reparses the source, and reset evicts entries after a
+        // frame unused, so storing the compressed form pays Brotli again on
+        // each reopen.
+        const source_bytes = if (parsed.owned_data) blk: {
+            gpa.free(bytes);
+            break :blk parsed.data;
+        } else bytes;
         self.database.append(gpa, .{
             .family = webFallbackFamily(font).family,
-            .bytes = bytes,
+            .bytes = source_bytes,
             .allocator = gpa,
             .display_family = array(service.set.fonts[font].name),
         }) catch {
-            gpa.free(bytes);
+            gpa.free(source_bytes);
             return service.fontFailed(gpa, font);
         };
         service.fontLoaded(font);
