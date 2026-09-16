@@ -1922,6 +1922,19 @@ pub const Cache = struct {
         dvui.log.debug("Font: no entry covers codepoint block U+{X:0>4}xx (e.g. U+{X:0>4}), falling back to entry 0 (.notdef)", .{ block, codepoint });
     }
 
+    /// Seeds the growing measurement window from the memoized "M" advance
+    /// rather than a fixed 64 bytes: every grow re-shapes the whole window
+    /// from scratch, so a first guess far below the real break point costs
+    /// full extra bidi+GSUB+GPOS passes. "M" is near the widest glyph, so
+    /// mixed text fits well past the raw estimate -- over-seeding only costs
+    /// shaped bytes, under-seeding costs another shape.
+    fn initialMeasureWindow(resolved: *const ResolvedStack, mwidth: f32, newline_idx: usize) usize {
+        const m_advance = if (resolved.m_size) |m| m.w else 0;
+        if (!(m_advance > 0) or !std.math.isFinite(mwidth)) return @min(newline_idx, 64);
+        const estimate = @min(@as(f32, @floatFromInt(newline_idx)), @max(0, mwidth / m_advance * 2 + 8));
+        return @min(newline_idx, @max(16, @as(usize, @intFromFloat(estimate))));
+    }
+
     pub fn textSizeRawShaped(
         self: *Cache,
         output: std.mem.Allocator,
@@ -1941,7 +1954,7 @@ pub const Cache = struct {
         // growing measurement window (and its max_width break search) is
         // both unnecessary and wrong -- the context beyond the window is
         // exactly what it was asked to shape against.
-        var window: usize = if (opts.max_width != null and opts.item == null) @min(newline_idx, 64) else newline_idx;
+        var window: usize = if (opts.max_width != null and opts.item == null) initialMeasureWindow(resolved, mwidth, newline_idx) else newline_idx;
 
         while (true) {
             var line = try self.shapeLineText(output, state_gpa, resolved, text[0..window], opts.item, opts.base_direction, style);
@@ -2021,7 +2034,7 @@ pub const Cache = struct {
             }
 
             line.deinit();
-            window = @min(newline_idx, window * 2);
+            window = @min(newline_idx, window * 4);
         }
     }
 
@@ -2876,6 +2889,28 @@ test "an RTL run's logical prefix measures monotonically, and width maps back to
         var end: usize = undefined;
         _ = font.textSizeEx(txt, .{ .max_width = w, .end_idx = &end, .end_metric = .nearest });
         try std.testing.expectEqual(off, end);
+    }
+}
+
+test "a wrapped fragment breaks at the same place however the measurement window is seeded" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+
+    const font: Font = .find(.{ .family = "Vera", .size = 16 });
+    // Long enough that the growing window takes several rounds to reach the
+    // break: a mis-seeded window shows up here as a break that fits badly or
+    // moves backwards as the allowed width grows.
+    const txt = "The quick brown fox jumps over the lazy dog, and then keeps running past the second and third fence before it finally stops.";
+
+    var prev_end: usize = 0;
+    var width: f32 = 40;
+    while (width <= 400) : (width += 37) {
+        var end: usize = undefined;
+        const fit = font.textSizeEx(txt, .{ .max_width = width, .end_idx = &end, .end_metric = .before });
+        try std.testing.expect(end > 0);
+        try std.testing.expect(fit.w <= width);
+        try std.testing.expect(end >= prev_end);
+        prev_end = end;
     }
 }
 
