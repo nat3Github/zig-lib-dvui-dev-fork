@@ -21,7 +21,7 @@ pub fn applets() void {
     if (tabs.addTabLabel(active_tab.* == 4, "uv_rect", .{})) {
         active_tab.* = 4;
     }
-    if (tabs.addTabLabel(active_tab.* == 4, "blur", .{})) {
+    if (tabs.addTabLabel(active_tab.* == 5, "blur", .{})) {
         active_tab.* = 5;
     }
 
@@ -535,6 +535,8 @@ pub fn uvRect() void {
 /// Showcase for `dvui.BlurBackdrop`: a cached, dual-Kawase-blurred backdrop
 /// standing in for CSS `backdrop-filter: blur(radius_px)`
 pub fn blur() void {
+    frostedWindows();
+
     const stage = dvui.box(@src(), .{}, .{ .min_size_content = .{ .w = 300, .h = 250 } });
     defer stage.deinit();
 
@@ -568,6 +570,139 @@ pub fn blur() void {
         defer fw.deinit();
         backdrop.draw();
         dvui.label(@src(), "backdrop-filter: blur()", .{}, .{ .color_text = .white, .gravity_x = 0.5, .gravity_y = 0.5 });
+    }
+}
+
+/// Perf test for frosted (backdrop-blurred) floating windows using the
+/// *replay* approach: when a frosted window is rendered at the end of the
+/// frame, the queued draw commands of every subwindow below it are replayed
+/// into an offscreen target and blurred. No backend readback involved.
+///
+/// Limitation: the main (non-floating) window draws immediately during build,
+/// so it has no queue to replay and never shows up in the blur.
+const Frost = struct {
+    const max = 8;
+    var open: [max]bool = @splat(false);
+    var every_frame: bool = true;
+    var continuous: bool = true;
+    var radius: f32 = 12;
+
+    /// Accumulated during this frame's render, shown next frame.
+    var acc: Stats = .{};
+    var last: Stats = .{};
+    /// Set while replaying, so frosted windows lower in the stack just draw
+    /// their (already fresh this frame) blur instead of capturing again.
+    var replaying: bool = false;
+
+    const Stats = struct {
+        captures: u32 = 0,
+        cmds: usize = 0,
+        ns: u64 = 0,
+    };
+
+    const Job = struct {
+        backdrop: *dvui.BlurBackdrop,
+        sw_id: dvui.Id,
+        capture: bool,
+
+        fn draw(ctx: ?*anyopaque) void {
+            const self: *Job = @ptrCast(@alignCast(ctx orelse return));
+            if (!replaying and self.capture) {
+                const cw = dvui.currentWindow();
+                const stack = cw.subwindows.stack.items;
+                var idx: usize = 0;
+                while (idx < stack.len and stack[idx].id != self.sw_id) idx += 1;
+
+                const queues = cw.lifo().alloc([]const dvui.RenderCommand, idx * 2) catch return;
+                defer cw.lifo().free(queues);
+                for (stack[0..idx], 0..) |*sw, i| {
+                    queues[i * 2] = sw.render_cmds.items;
+                    queues[i * 2 + 1] = sw.render_cmds_after.items;
+                    acc.cmds += sw.render_cmds.items.len + sw.render_cmds_after.items.len;
+                }
+
+                const start = cw.backend.nanoTime();
+                replaying = true;
+                self.backdrop.capture(queues);
+                replaying = false;
+                acc.ns += @intCast(cw.backend.nanoTime() - start);
+                acc.captures += 1;
+            }
+            self.backdrop.draw();
+        }
+    };
+};
+
+fn frostedWindows() void {
+    Frost.last = Frost.acc;
+    Frost.acc = .{};
+    // Queue the base window too, so frosted windows can replay it. Takes
+    // effect next frame, so force a capture on the frame it flips on.
+    const cw = dvui.currentWindow();
+    const base_deferred = cw.defer_base_rendering;
+    // ponytail: stays on if you leave the tab with windows open (same output, costlier); "close all" resets it.
+    cw.defer_base_rendering = std.mem.indexOfScalar(bool, &Frost.open, true) != null;
+    if (Frost.continuous) dvui.refresh(null, @src(), null);
+
+    {
+        var hbox = dvui.box(@src(), .{ .dir = .horizontal }, .{});
+        defer hbox.deinit();
+        if (dvui.button(@src(), "open frosted window", .{}, .{})) {
+            for (&Frost.open) |*o| if (!o.*) {
+                o.* = true;
+                break;
+            };
+        }
+        if (dvui.button(@src(), "close all", .{}, .{})) Frost.open = @splat(false);
+    }
+    _ = dvui.checkbox(@src(), &Frost.every_frame, "recapture every frame (worst case)", .{});
+    _ = dvui.checkbox(@src(), &Frost.continuous, "continuous redraw", .{});
+    _ = dvui.sliderEntry(@src(), "frost radius: {d:0.1}", .{ .value = &Frost.radius, .min = 2, .max = 20 }, .{});
+
+    const ft = dvui.currentWindow().frameTiming();
+    const ms = 1.0 / @as(f64, std.time.ns_per_ms);
+    dvui.label(@src(), "captures {d}  replayed cmds {d}  capture {d:0.2}ms", .{ Frost.last.captures, Frost.last.cmds, @as(f64, @floatFromInt(Frost.last.ns)) * ms }, .{});
+    dvui.label(@src(), "build {d:0.2}ms  render {d:0.2}ms  total {d:0.2}ms", .{
+        @as(f64, @floatFromInt(ft.build_ns)) * ms,
+        @as(f64, @floatFromInt(ft.render_ns)) * ms,
+        @as(f64, @floatFromInt(ft.total_ns)) * ms,
+    }, .{});
+
+    for (&Frost.open, 0..) |*open, i| {
+        if (!open.*) continue;
+        var fw = dvui.floatingWindow(@src(), .{ .open_flag = open }, .{
+            .id_extra = i,
+            .background = false,
+            .min_size_content = .{ .w = 260, .h = 160 },
+        });
+        defer fw.deinit();
+
+        // Queued first, so the blur is drawn under the window's content.
+        const backdrop = dvui.BlurBackdrop.get(@src());
+        backdrop.radius_px = Frost.radius;
+        // The embedded box carries the window's styling (finalized corners, margin).
+        const box_wd = fw.layout.?.data();
+        const brs = box_wd.borderRectScale();
+        const rect = brs.r;
+        const corners = box_wd.options.cornersGet().scale(brs.s, dvui.CornerRect);
+        backdrop.corners = corners;
+        var hasher = dvui.fnv.init();
+        hasher.update(std.mem.asBytes(&rect));
+        hasher.update(std.mem.asBytes(&Frost.radius));
+        const h = hasher.final();
+        const job = cw.arena().create(Frost.Job) catch return;
+        job.* = .{
+            .backdrop = backdrop,
+            .sw_id = fw.data().id,
+            .capture = Frost.every_frame or !base_deferred or backdrop.small == null or h != backdrop.last_hash,
+        };
+        backdrop.last_hash = h;
+        backdrop.rect = rect;
+        dvui.deferRender(job, Frost.Job.draw);
+        rect.fill(corners.scale(1, dvui.CornerRect.Physical), .{ .color = .{ .color = dvui.Color.white.opacity(0.12) } });
+
+        fw.dragAreaSet(dvui.windowHeader("frosted", "", open));
+        dvui.label(@src(), "frosted window {d}", .{i}, .{ .gravity_x = 0.5, .gravity_y = 0.5 });
     }
 }
 

@@ -153,6 +153,9 @@ _lifo_arena: std.heap.ArenaAllocator,
 /// Used to allocate widgets with a fixed location
 _widget_stack: WidgetStack,
 render_target: dvui.RenderTarget = .{ .texture = null, .offset = .{} },
+/// Queue the base window's draws (like floating windows do) instead of drawing
+/// them immediately, so a `deferRender` hook can replay them. Read in `begin`.
+defer_base_rendering: bool = false,
 end_rendering_done: bool = false,
 
 /// See `InitOptions.open_flag`
@@ -1330,6 +1333,7 @@ pub fn begin(
     }
 
     self.end_rendering_done = false;
+    self.render_target.rendering = !self.defer_base_rendering;
     self.render_stats = .{};
     self.cursor_requested = null;
     self.text_input_rect = null;
@@ -1567,6 +1571,7 @@ pub fn renderCommands(self: *Self, queue: []const dvui.RenderCommand) !void {
             .triangles => |t| {
                 try dvui.renderTriangles(t.tri, t.tex);
             },
+            .custom => |cu| cu.draw(cu.ctx),
         }
     }
 }
@@ -1654,13 +1659,15 @@ pub fn endRendering(self: *Self, opts: endOptions) void {
         self.renderCommands(sw.render_cmds.items) catch |err| {
             dvui.logError(@src(), err, "Failed to render commands for subwindow {x}", .{sw.id});
         };
-        // Set to empty because it's allocated on the arena and will be freed there
-        sw.render_cmds = .empty;
-
         self.renderCommands(sw.render_cmds_after.items) catch |err| {
             dvui.logError(@src(), err, "Failed to render commands after for subwindow {x}", .{sw.id});
         };
-        // Set to empty because it's allocated on the arena and will be freed there
+    }
+    // Cleared only after all subwindows rendered, so a `deferRender` hook can
+    // still see (and replay) the queues of the subwindows below it.
+    // Set to empty because it's allocated on the arena and will be freed there
+    for (self.subwindows.stack.items) |*sw| {
+        sw.render_cmds = .empty;
         sw.render_cmds_after = .empty;
     }
 

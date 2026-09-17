@@ -41,6 +41,8 @@ const BlurBackdrop = @This();
 rect: Rect.Physical = .{},
 /// CSS `backdrop-filter: blur(radius_px)`-equivalent blur strength.
 radius_px: f32 = 16,
+/// Rounds the drawn blur. Physical pixels.
+corners: dvui.CornerRect = .{},
 /// Cached small texture, redrawn as-is on non-dirty frames.
 small: ?Texture = null,
 /// True until the next `deinit` runs a real capture.
@@ -128,8 +130,14 @@ pub fn deinit(self: *BlurBackdrop) void {
     // painted right over content already drawn early by an immediate
     // replay - the bracketed content (e.g. a checkerboard background)
     // vanishing behind the enclosing window every dirty frame.
-    const cmds = sw.render_cmds.items[self.cmd_start..];
+    self.capture(&.{sw.render_cmds.items[self.cmd_start..]});
+}
 
+/// Replay `queues` (in order) clipped to `self.rect` into an offscreen target,
+/// blur it and store the result in `small`. Always captures, ignores `dirty`.
+/// Used by `deinit`, and directly by callers replaying other subwindows' queues.
+pub fn capture(self: *BlurBackdrop, queues: []const []const dvui.RenderCommand) void {
+    const cw = dvui.currentWindow();
     var r = self.rect;
     if (r.empty()) return;
     // enlarge to pixel boundaries, same as Picture.start
@@ -166,7 +174,7 @@ pub fn deinit(self: *BlurBackdrop) void {
     const full_target = dvui.textureCreateTarget(.{ .width = @intFromFloat(r.w), .height = @intFromFloat(r.h) }) catch return;
     const prev1 = dvui.renderTarget(.{ .texture = full_target, .offset = r.topLeft() });
     defer _ = dvui.renderTarget(prev1);
-    cw.renderCommands(cmds) catch {};
+    for (queues) |q| cw.renderCommands(q) catch {};
 
     var cur = dvui.textureFromTarget(full_target) catch return; // destroys full_target
 
@@ -282,7 +290,7 @@ pub fn deinit(self: *BlurBackdrop) void {
 /// so that content paints over it.
 pub fn draw(self: *BlurBackdrop) void {
     const tex = self.small orelse return;
-    dvui.renderTexture(tex, .{ .r = self.rect }, .{}) catch {};
+    dvui.renderTexture(tex, .{ .r = self.rect }, .{ .corners = self.corners }) catch {};
 }
 
 /// Release the cached GPU texture. Never called directly by user code -

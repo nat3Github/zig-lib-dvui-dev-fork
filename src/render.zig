@@ -59,8 +59,28 @@ pub const RenderCommand = struct {
             tri: Triangles,
             tex: ?Texture,
         },
+        /// Code run when the queue is replayed, with rendering immediate. See `deferRender`.
+        custom: Custom,
+    };
+
+    pub const Custom = struct {
+        ctx: ?*anyopaque,
+        draw: *const fn (ctx: ?*anyopaque) void,
     };
 };
+
+/// Queue `draw` to run when the current subwindow's commands are replayed, or
+/// run it now if rendering is immediate. `ctx` must outlive the frame.
+///
+/// Only valid between `Window.begin`and `Window.end`.
+pub fn deferRender(ctx: ?*anyopaque, draw: *const fn (ctx: ?*anyopaque) void) void {
+    const cw = dvui.currentWindow();
+    if (!cw.render_target.rendering) {
+        cw.addRenderCommand(.{ .custom = .{ .ctx = ctx, .draw = draw } }, false);
+        return;
+    }
+    draw(ctx);
+}
 
 /// Rendered `Triangles` taking in to account the current clip rect
 /// and deferred rendering through render targets.
