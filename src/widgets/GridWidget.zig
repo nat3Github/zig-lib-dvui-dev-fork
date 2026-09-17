@@ -512,8 +512,17 @@ pub const CellWidget = struct {
         const editing = dvui.dataGet(null, id, "__editing", bool) orelse false;
 
         if (!editing) {
+            // Hand our height cap down: the text layout ends on a whole line
+            // with an ellipsis instead of being sheared by the cell's clip.
+            var tl_opts = opts;
+            const cap = self.data().options.max_size_contentGet().h;
+            if (cap < dvui.max_float_safe) {
+                const pad = dvui.TextLayoutWidget.defaults.override(opts).paddingGet();
+                tl_opts.max_size_content = .height(@max(0, cap - pad.y - pad.h));
+            }
+
             var tl: dvui.TextLayoutWidget = undefined;
-            tl.init(src, .{ .process_events_in_deinit = false }, opts);
+            tl.init(src, .{ .process_events_in_deinit = false }, tl_opts);
             // specifically not calling touchEditing or processEvents
             tl.addText(init_opts.text, .{});
             tl.deinit();
@@ -1508,4 +1517,32 @@ pub fn deinit(self: *GridWidget) void {
     self.data().minSizeSetAndRefresh();
     self.data().minSizeReportToParent();
     dvui.parentReset(self.data().id, self.data().parent);
+}
+
+test "cell height cap: text ends on a whole line instead of overflowing the cell" {
+    var t = try dvui.testing.init(.{ .window_size = .{ .w = 600, .h = 400 } });
+    defer t.deinit();
+
+    const fns = struct {
+        var max_h: f32 = 60;
+        var cell_min_h: f32 = 0;
+
+        fn frame() !dvui.App.Result {
+            var g: GridWidget = undefined;
+            g.init(@src(), .{}, .{ .expand = .horizontal });
+            {
+                const c = g.cell(.{ .col = 0, .row = 0 }, .{ .max_size_content = .size(.{ .w = 200, .h = max_h }) });
+                _ = c.editable(.{ .text = "Cell 1 5 Hello this is a bunch of text that we are going to add to one cell to show text wrapping and auto sizing changes." }, .{});
+                cell_min_h = c.data().min_size.h;
+                c.deinit();
+            }
+            g.deinit();
+            return .ok;
+        }
+    };
+
+    try dvui.testing.settle(fns.frame);
+    // Without the cap handed down, the layout asks for its full ~102px and the
+    // cell clips a line through the middle.
+    try std.testing.expect(fns.cell_min_h <= fns.max_h);
 }

@@ -1868,7 +1868,7 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
             // - we are boxed in too much by corner widgets
             // - we aren't starting at the left edge
             // both mean dropping to next line will give us more space
-            if (s.w > width and (linewidth < container_width or self.insert_pt.x > linestart) and !self.onLastLine()) {
+            if (s.w > width and (linewidth < container_width or self.insert_pt.x > linestart) and !self.onLastLine(line_height, msize.h)) {
                 self.checkAscent();
                 self.line += 1;
                 self.insert_pt.y += self.current_line_height;
@@ -1910,7 +1910,7 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
             self.current_line_ascent = ascent;
         }
 
-        if (self.onLastLine() and ((end < txt.len and !self.newline) or s.w > width)) {
+        if (self.onLastLine(line_height, msize.h) and ((end < txt.len and !self.newline) or s.w > width)) {
             end = font.ellipsisCut(txt, width, .{ .base_direction = self.baseDir(), .tab_origin = self.insert_pt.x });
             self.newline = false;
             self.clamped = true;
@@ -2083,9 +2083,20 @@ fn penX(self: *TextLayoutWidget) f32 {
     return self.insert_pt.x + self.line_shift;
 }
 
-fn onLastLine(self: *const TextLayoutWidget) bool {
-    const max = self.max_lines orelse return false;
-    return self.line + 1 >= max;
+fn onLastLine(self: *TextLayoutWidget, line_height: f32, text_height: f32) bool {
+    if (self.max_lines) |max| {
+        if (self.line + 1 >= max) return true;
+    }
+
+    // Height-capped: end on the last line that fits whole, otherwise the clip
+    // shears the next one through the middle of the glyphs.  The cap comes
+    // from max_size_content and never from the rect we were given, which is
+    // fed by our own min size and would ratchet us down a line per frame.
+    // A trailing line reserves text_height, matching the min size below.
+    if (self.cache_layout) return false;
+    const avail = self.data().options.max_size_contentGet().h;
+    if (avail >= dvui.max_float_safe) return false;
+    return self.insert_pt.y + line_height + text_height > avail + 0.01;
 }
 
 /// Base direction in force right now: what this paragraph's first strong
@@ -4281,4 +4292,44 @@ test "e2e: an RTL line ending in a newline keeps its shape" {
     };
 
     try dvui.testing.settle(fns.frame);
+}
+
+test "height cap: ellipsize the last whole line instead of shearing the next" {
+    var t = try dvui.testing.init(.{ .window_size = .{ .w = 400, .h = 400 } });
+    defer t.deinit();
+
+    const fns = struct {
+        var max_h: ?f32 = null;
+        var clamped = false;
+        var height: f32 = 0;
+        var cap_h: f32 = 0;
+        var lines: usize = 0;
+
+        fn frame() !dvui.App.Result {
+            var tl = dvui.textLayout(@src(), .{}, .{
+                .min_size_content = .width(120),
+                .max_size_content = if (max_h) |h| .size(.{ .w = 120, .h = h }) else .width(120),
+            });
+            tl.addText("one two three four five six seven eight nine ten eleven twelve", .{});
+            tl.addTextDone(.{});
+            clamped = tl.clamped;
+            height = tl.data().min_size.h;
+            cap_h = tl.data().options.max_sizeGet().h;
+            lines = tl.line + 1;
+            tl.deinit();
+            return .ok;
+        }
+    };
+
+    try dvui.testing.settle(fns.frame);
+    try std.testing.expect(!fns.clamped);
+    const full_lines = fns.lines;
+
+    fns.max_h = 60;
+    try dvui.testing.settle(fns.frame);
+    try std.testing.expect(fns.clamped);
+    try std.testing.expect(fns.lines < full_lines);
+    // The cap is a content height, so the widget may still be that much plus
+    // its own padding -- what must not happen is a line hanging past it.
+    try std.testing.expect(fns.height <= fns.cap_h);
 }
