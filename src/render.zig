@@ -199,7 +199,7 @@ pub fn renderText(opts: TextOptions) Backend.GenericError!void {
         // into self.cache while lazily materializing fallback-family
         // entries, which can grow/rehash the map and invalidate any *Entry
         // captured beforehand.
-        fallback_entry = cw.fonts.stackEntry(resolved, 0) orelse return error.OutOfMemory;
+        fallback_entry = try cw.fonts.primaryEntry(cw.gpa, resolved);
         fallback_ascent = fallback_entry.ascent;
         if (opts.font.line_height_factor < 1.0) {
             fallback_ascent = @round(fallback_ascent * opts.font.line_height_factor);

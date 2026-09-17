@@ -765,7 +765,7 @@ pub fn textSizeExShaped(self: Font, state_gpa: std.mem.Allocator, output: std.me
     // shapeLineText, which can insert into self.cache while lazily
     // materializing fallback-family entries -- that can grow/rehash the map
     // and invalidate any *Entry captured beforehand.
-    const fallback_entry = cw.fonts.stackEntry(resolved, 0) orelse {
+    const fallback_entry = cw.fonts.primaryEntry(state_gpa, resolved) catch {
         result.line.deinit();
         return null;
     };
@@ -1206,20 +1206,16 @@ pub const Cache = struct {
         return hasher.final();
     }
 
-    /// Load families and cache merged coverage per stack. Only the primary
-    /// family (index 0) gets a full calibrated `Entry` here -- fallback
-    /// families are parsed just enough to read their cmap coverage; a full
-    /// `Entry` (Renderer + ppem calibration) for them is only built lazily
-    /// in `shapeLineText`, the first time some shaped text actually needs
-    /// glyphs from that family.
+    /// Load families and cache merged coverage per stack. No family gets a
+    /// full calibrated `Entry` here -- every family is parsed just enough to
+    /// read its cmap coverage; a full `Entry` (Renderer + ppem calibration)
+    /// is built lazily, in `shapeLineText` the first time shaped text needs
+    /// glyphs from that family, or via `primaryEntry` for the callers that
+    /// need stack metrics. Coverage-only callers (`ellipsis`, `sizeM` past
+    /// its first call) then never build one at all.
     pub fn resolveStack(self: *Cache, state_gpa: std.mem.Allocator, font: Font) std.mem.Allocator.Error!*ResolvedStack {
         const font_key = font.cacheKey();
-        if (self.resolved_stacks.get(font_key)) |existing| {
-            // Re-touch the primary family to recreate it if evicted by reset;
-            // fallback families re-materialize lazily on next use.
-            _ = try self.getOrCreate(state_gpa, existing.family_fonts[0]);
-            return existing;
-        }
+        if (self.resolved_stacks.get(font_key)) |existing| return existing;
 
         var flattened: FlattenedAliasStack = .{};
         self.flattenAliasStack(&flattened, font, 0);
@@ -1262,8 +1258,6 @@ pub const Cache = struct {
 
             count += 1;
 
-            if (count == 1) _ = try self.getOrCreate(state_gpa, family_font); // primary family is virtually always needed
-
             if (cached_coverage != null) continue;
             const cmap_data = raw_fonts[count - 1].tableData(.{ 'c', 'm', 'a', 'p' }) orelse &.{};
             per_entry_ranges[ranges_count] = try Cmap.coverageRanges(cmap_data, state_gpa);
@@ -1285,7 +1279,16 @@ pub const Cache = struct {
         return boxed;
     }
 
-    /// Entry at stack index; null if evicted by reset.
+    /// The stack's primary (index 0) `Entry`, built on demand. Every caller
+    /// needing stack metrics (ascent, line height) goes through this rather
+    /// than `resolveStack` building one up front, so a stack that is only
+    /// ever asked about coverage never pays for a Renderer + calibration.
+    pub fn primaryEntry(self: *Cache, state_gpa: std.mem.Allocator, resolved: *const ResolvedStack) std.mem.Allocator.Error!*Entry {
+        if (self.stackEntry(resolved, 0)) |existing| return existing;
+        return self.getOrCreate(state_gpa, resolved.family_fonts[0]);
+    }
+
+    /// Entry at stack index; null if evicted by reset or not yet built.
     pub fn stackEntry(self: *Cache, resolved: *const ResolvedStack, index: u8) ?*Entry {
         if (index >= resolved.entry_keys.len) return null;
         return if (self.cache.getPtr(resolved.entry_keys[index])) |p| p.* else null;
@@ -1946,7 +1949,9 @@ pub const Cache = struct {
     ) std.mem.Allocator.Error!Entry.MeasureResult {
         const mwidth = opts.max_width orelse dvui.max_float_safe;
         const snap = if (dvui.current_window) |cw| cw.snap_to_pixels else true;
-        const default_height: f32 = if (self.stackEntry(resolved, 0)) |fe| fe.height else 0;
+        // Materialized before shaping: every line's height starts from the
+        // primary's, whether or not any glyph ends up assigned to it.
+        const default_height: f32 = if (self.primaryEntry(state_gpa, resolved)) |fe| fe.height else |_| 0;
 
         const hard_break = firstHardBreak(text);
         const newline_idx = if (hard_break) |hb| hb.start else text.len;
@@ -2193,12 +2198,10 @@ pub const Cache = struct {
                 if (probe_h <= 0) break :probe;
                 const ratio = probe_h / ppem;
                 const corrected = @max(min_pixel_size, font.size / ratio);
-                const corrected_renderer = Renderer.init(gpa, dvui.currentWindow().lifo(), parsed_font, corrected, .{ .hint_glyf = true, .user_coords = user_coords }) catch |err| {
+                renderer.setPpem(gpa, dvui.currentWindow().lifo(), corrected, .{ .hint_glyf = true, .user_coords = user_coords }) catch |err| {
                     dvui.log.warn("Font.Cache.Entry.init() opentype renderer error {any} font {s}\n", .{ err, fname });
                     return Error.FontError;
                 };
-                renderer.deinit(gpa);
-                renderer = corrected_renderer;
                 ppem = corrected;
                 em_height = measuredCapHeight(&renderer, m_glyph_id) orelse ppem;
             }
@@ -2686,7 +2689,7 @@ test "tab stops: a tab reaches the next multiple of tab_size spaces from the lin
     const cw = dvui.currentWindow();
     const font: Font = .find(.{ .family = "Vera", .size = 24 });
     const resolved = try cw.fonts.resolveStack(cw.gpa, font);
-    const entry = cw.fonts.stackEntry(resolved, 0).?;
+    const entry = try cw.fonts.primaryEntry(cw.gpa, resolved);
 
     var space = try cw.fonts.shapeLineText(gpa, gpa, resolved, " ", null, .auto, .{});
     defer space.deinit();
@@ -2777,7 +2780,7 @@ test "smoke: shape + measure + rasterize against embedded Vera.ttf" {
     const font: Font = .find(.{ .family = "Vera", .size = 24 });
     const cw = dvui.currentWindow();
     const resolved = try cw.fonts.resolveStack(cw.gpa, font);
-    const entry = cw.fonts.stackEntry(resolved, 0).?;
+    const entry = try cw.fonts.primaryEntry(cw.gpa, resolved);
 
     try std.testing.expect(entry.ascent > 0);
     try std.testing.expect(entry.height > 0);
