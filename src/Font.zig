@@ -329,6 +329,9 @@ pub const Source = struct {
     stretch: Stretch = .normal,
 
     bytes: []const u8, // ttf bytes
+    /// Set when `bytes` is a mapping of the font file rather than a heap
+    /// copy; released by `destroy`, not by `allocator`.
+    memory_map: ?std.Io.File.MemoryMap = null,
     /// If not null, this will be used to free ttf_bytes.
     allocator: ?std.mem.Allocator = null,
     /// Face index into `bytes` when it's a .ttc collection (OS font
@@ -376,10 +379,22 @@ pub const Source = struct {
         return .{ .family = self.family, .weight = self.weight, .style = self.style, .stretch = self.stretch };
     }
 
+    /// Drops `bytes` alone, leaving the rest of the `Source` usable so
+    /// `findSource` can map them back in from `path`.
+    pub fn releaseBytes(self: *Source) void {
+        if (self.memory_map) |*mm| {
+            mm.destroy(dvui.io);
+            self.memory_map = null;
+        } else if (self.allocator) |alloc| {
+            alloc.free(self.bytes);
+        }
+        self.bytes = &.{};
+    }
+
     pub fn deinit(self: *Source) void {
         defer self.* = undefined;
+        self.releaseBytes();
         if (self.allocator) |alloc| {
-            alloc.free(self.bytes);
             if (self.path) |p| alloc.free(p);
         }
     }
@@ -436,18 +451,29 @@ pub const WebFallbackOptions = struct {
     base_url: []const u8 = if (web_fallback_enabled) opentype.discovery_web_fallback.default_base_url else "",
 };
 
-/// One face of a system font file, assembled as a standalone sfnt. Reads
-/// only that face's tables rather than the whole file, which for a
-/// multi-face collection is most of the bytes (Songti.ttc is 67MB across 8
-/// faces; one face is 3.3MB).
+/// The whole font file, mapped. Only the pages actually parsed and
+/// rasterized fault in, so drawing a line of CJK out of a 55MB face costs
+/// the few pages its glyphs sit on instead of a 53MB read -- measured on
+/// STHeiti Light.ttc, 7.4ms warm / 128ms cold down to 0.05ms. That also
+/// makes subsetting the face pointless: a collection's other faces and
+/// every `sbix` strike we never touch cost nothing but address space.
 ///
-/// Colour-bitmap strikes are left behind too: Apple Color Emoji's face is
-/// 180MB, 179MB of it `sbix`, and only one strike is ever rasterized.
-/// `Entry.init` reads that strike back once it knows the ppem.
-fn readFaceSubset(gpa: std.mem.Allocator, path: []const u8, face_index: u32) ?[]const u8 {
+/// `createMemoryMap` allocates and reads instead where mapping is
+/// unavailable, which is the old behaviour minus the subsetting; no target
+/// with a discovery backend takes that path today.
+///
+/// The mapping outlives the descriptor, so the file is closed right away.
+/// It is `MAP.SHARED`: a font file truncated underneath us faults on
+/// access rather than returning short data.
+fn mapFaceFile(path: []const u8) ?std.Io.File.MemoryMap {
     const file = std.Io.Dir.cwd().openFile(dvui.io, path, .{}) catch return null;
     defer file.close(dvui.io);
-    return opentype.parsing.Font.readFaceAsStandaloneSfnt(gpa, dvui.io, file, face_index, .{ .drop_sbix = true }) catch null;
+    const size = (file.stat(dvui.io) catch return null).size;
+    return file.createMemoryMap(dvui.io, .{
+        .len = std.math.cast(usize, size) orelse return null,
+        .protection = .{ .read = true },
+        .populate = false,
+    }) catch null;
 }
 
 /// The CSS generic family keywords "serif", "sans-serif", "monospace" and
@@ -533,14 +559,14 @@ fn discoverSystemFont(gpa: std.mem.Allocator, font: Font) ?Source {
         .{ &path_storage, gpa },
     ) orelse return null;
 
-    const loaded: struct { bytes: []const u8, collection_index: u32, path: ?[]const u8 = null } = switch (match.handle) {
+    const loaded: struct { bytes: []const u8, collection_index: u32, path: ?[]const u8 = null, map: ?std.Io.File.MemoryMap = null } = switch (match.handle) {
         .path => |p| blk: {
             const path = gpa.dupe(u8, p.path) catch return null;
-            const bytes = readFaceSubset(gpa, p.path, p.font_index) orelse {
+            const mm = mapFaceFile(p.path) orelse {
                 gpa.free(path);
                 return null;
             };
-            break :blk .{ .bytes = bytes, .collection_index = p.font_index, .path = path };
+            break :blk .{ .bytes = mm.memory, .collection_index = p.font_index, .path = path, .map = mm };
         },
         .memory => |m| .{ .bytes = gpa.dupe(u8, m.bytes) catch return null, .collection_index = m.font_index },
         .url => return null, // web-only handle; native discovery backends never return one
@@ -552,6 +578,7 @@ fn discoverSystemFont(gpa: std.mem.Allocator, font: Font) ?Source {
         .style = font.style,
         .stretch = font.stretch,
         .bytes = loaded.bytes,
+        .memory_map = loaded.map,
         .allocator = gpa,
         .collection_index = loaded.collection_index,
         .path = loaded.path,
@@ -974,8 +1001,7 @@ pub const Cache = struct {
             source.unreferenced_resets = 0;
             // Cached shaping plans hold slices into these bytes.
             self.shaping_plans.clear(gpa);
-            source.allocator.?.free(source.bytes);
-            source.bytes = &.{};
+            source.releaseBytes();
         }
     }
 
@@ -1055,7 +1081,9 @@ pub const Cache = struct {
             // Dropped by `reset()` while unused; only sources with a path are.
             const path = source.path orelse return .{ null, null };
             if (system_font_backend == null) return .{ null, null };
-            source.bytes = readFaceSubset(source.allocator.?, path, source.collection_index) orelse return .{ null, null };
+            const mm = mapFaceFile(path) orelse return .{ null, null };
+            source.memory_map = mm;
+            source.bytes = mm.memory;
         }
 
         if (source.weight.value == font.weight.value and source.style == font.style and source.stretch.value == font.stretch.value) {
@@ -1381,19 +1409,21 @@ pub const Cache = struct {
         if (self.findSource(synthetic).@"0" != null) return synthetic; // already loaded
 
         const path = state_gpa.dupe(u8, p.path) catch return null;
-        const bytes = readFaceSubset(state_gpa, p.path, p.font_index) orelse {
+        var mm = mapFaceFile(p.path) orelse {
             state_gpa.free(path);
             return null;
         };
+        const bytes = mm.memory;
         self.database.append(state_gpa, .{
             .family = array(family_name),
             .bytes = bytes,
+            .memory_map = mm,
             .allocator = state_gpa,
             .collection_index = p.font_index,
             .display_family = readDisplayFamilyName(state_gpa, bytes, p.font_index),
             .path = path,
         }) catch {
-            state_gpa.free(bytes);
+            mm.destroy(dvui.io);
             state_gpa.free(path);
             return null;
         };
@@ -2060,9 +2090,10 @@ pub const Cache = struct {
         parsed_font: OtFont,
         renderer: Renderer,
         /// The one `sbix` strike this size needs, read from the source file
-        /// because `readFaceSubset` drops the table. Owned here;
+        /// for a face whose own bytes carry no `sbix` table. Owned here;
         /// `renderer.sbix_data` points into it. Null for a font that has no
-        /// `sbix`, or whose bytes didn't come from a file we can re-read.
+        /// `sbix`, whose bytes didn't come from a file we can re-read, or --
+        /// the usual case now -- that is mapped and so already has the table.
         sbix_strike: ?[]const u8,
         height: f32, // ascender - descender
         ascent: f32, // ascender
@@ -2212,7 +2243,13 @@ pub const Cache = struct {
             // The probe may then correct ppem; one strike is scaled to
             // whatever ppem ends up being, the same as a full strike list
             // would be, so the pick does not need revisiting.
-            const sbix_strike = loadSbixStrike(gpa, source, ppem);
+            // A mapped face carries its whole `sbix` table already, and only
+            // the strike actually rasterized faults in -- re-reading one
+            // strike would copy megabytes to replace what's already there.
+            const sbix_strike = if (parsed_font.tableData(.{ 's', 'b', 'i', 'x' }) != null)
+                null
+            else
+                loadSbixStrike(gpa, source, ppem);
             errdefer if (sbix_strike) |strike| gpa.free(strike);
             if (sbix_strike) |strike| renderer.sbix_data = strike;
 
@@ -3660,4 +3697,63 @@ test "caret stops inside a ligature sit at the font's GDEF caret" {
     try std.testing.expectApproxEqAbs((x2 - x0) * 300.0 / 601.0, x1 - x0, 0.01);
     try std.testing.expectEqual(@as(usize, 1), res.shaped.byteAtOffset(x1));
     try std.testing.expectEqual(@as(usize, 1), res.shaped.byteAtOffset(x1 + 1));
+}
+
+// TEMP repro (revert): the web target's emoji path end to end -- the web
+// fallback registers Noto Color Emoji, shaping must route U+1F600 to it, and
+// the glyph must measure as a non-empty colour bitmap rather than tofu.
+test "web emoji repro: a registered Noto Color Emoji covers U+1F600" {
+    if (!web_fallback_enabled) return error.SkipZigTest;
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    const gpa = std.testing.allocator;
+    const cw = dvui.currentWindow();
+    cw.fonts.web_fallback = .{};
+
+    try dvui.addFont("ReproLatin", Source.fallback.bytes, null);
+
+    // The emoji is uncovered by the Latin primary, so the first ask queues a
+    // fetch and renders tofu until the font arrives.
+    try std.testing.expect(cw.fonts.webFallbackFont(cw.gpa, 0x1F600) == null);
+    cw.fonts.processWebFallback(cw.gpa, gpa);
+    const service = &cw.fonts.web_fallback.?;
+    var pending: ?u16 = null;
+    for (service.font_states, 0..) |state, i| {
+        if (state == .pending and std.mem.startsWith(u8, service.set.fonts[i].name, "Noto Color Emoji")) {
+            pending = @intCast(i);
+            break;
+        }
+    }
+    const font_index = pending orelse {
+        std.debug.print("\nno Noto Color Emoji slice was requested for U+1F600\n", .{});
+        return error.TestUnexpectedResult;
+    };
+    std.debug.print("\nrequested slice: {s}\n", .{service.set.fonts[font_index].name});
+
+    cw.fonts.webFallbackLoaded(cw.gpa, font_index, try cw.gpa.dupe(u8, @embedFile("fonts/EmojiRepro.ttf")));
+
+    const arrived = cw.fonts.webFallbackFont(cw.gpa, 0x1F600) orelse {
+        std.debug.print("emoji font did not register after arriving (parse failed?)\n", .{});
+        return error.TestUnexpectedResult;
+    };
+    try std.testing.expect(cw.fonts.findSource(arrived).@"0" != null);
+
+    const font: Font = .find(.{ .family = "ReproLatin", .size = 20 });
+    const resolved = try cw.fonts.resolveStack(cw.gpa, font);
+    var line = try cw.fonts.shapeLineText(gpa, cw.gpa, resolved, "\u{1F600}", null, .auto, .{});
+    defer line.deinit();
+
+    const primary = try cw.fonts.primaryEntry(cw.gpa, resolved);
+    std.debug.print("glyphs shaped: {d}\n", .{line.buffer.info.items.len});
+    try std.testing.expect(line.buffer.info.items.len > 0);
+
+    for (line.buffer.info.items, 0..) |info, gidx| {
+        const entry = line.entryForGlyph(primary, gidx);
+        const gi = try entry.glyphInfoGet(cw.gpa, info.codepoint);
+        std.debug.print("glyph {d}: gid {d} entry {s} {d}x{d} is_color {}\n", .{ gidx, info.codepoint, entry.name, gi.w, gi.h, gi.is_color });
+        try std.testing.expect(entry != primary); // tofu would come from the primary
+        try std.testing.expect(info.codepoint != 0); // .notdef == tofu
+        try std.testing.expect(gi.w > 0 and gi.h > 0);
+        try std.testing.expect(gi.is_color);
+    }
 }
