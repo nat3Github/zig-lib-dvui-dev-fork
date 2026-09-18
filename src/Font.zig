@@ -436,7 +436,19 @@ pub const WebFallbackOptions = struct {
     base_url: []const u8 = if (web_fallback_enabled) opentype.discovery_web_fallback.default_base_url else "",
 };
 
-const system_font_size_limit = 256 * 1024 * 1024; // needed for big emoji fonts (Apple Color Emoji.ttc is ~180MB)
+/// One face of a system font file, assembled as a standalone sfnt. Reads
+/// only that face's tables rather than the whole file, which for a
+/// multi-face collection is most of the bytes (Songti.ttc is 67MB across 8
+/// faces; one face is 3.3MB).
+///
+/// Colour-bitmap strikes are left behind too: Apple Color Emoji's face is
+/// 180MB, 179MB of it `sbix`, and only one strike is ever rasterized.
+/// `Entry.init` reads that strike back once it knows the ppem.
+fn readFaceSubset(gpa: std.mem.Allocator, path: []const u8, face_index: u32) ?[]const u8 {
+    const file = std.Io.Dir.cwd().openFile(dvui.io, path, .{}) catch return null;
+    defer file.close(dvui.io);
+    return opentype.parsing.Font.readFaceAsStandaloneSfnt(gpa, dvui.io, file, face_index, .{ .drop_sbix = true }) catch null;
+}
 
 /// The CSS generic family keywords "serif", "sans-serif", "monospace" and
 /// "system-ui", usable as a `Font` family anywhere a real family name is. The
@@ -524,7 +536,7 @@ fn discoverSystemFont(gpa: std.mem.Allocator, font: Font) ?Source {
     const loaded: struct { bytes: []const u8, collection_index: u32, path: ?[]const u8 = null } = switch (match.handle) {
         .path => |p| blk: {
             const path = gpa.dupe(u8, p.path) catch return null;
-            const bytes = std.Io.Dir.cwd().readFileAlloc(dvui.io, p.path, gpa, .limited(system_font_size_limit)) catch {
+            const bytes = readFaceSubset(gpa, p.path, p.font_index) orelse {
                 gpa.free(path);
                 return null;
             };
@@ -1043,7 +1055,7 @@ pub const Cache = struct {
             // Dropped by `reset()` while unused; only sources with a path are.
             const path = source.path orelse return .{ null, null };
             if (system_font_backend == null) return .{ null, null };
-            source.bytes = std.Io.Dir.cwd().readFileAlloc(dvui.io, path, source.allocator.?, .limited(system_font_size_limit)) catch return .{ null, null };
+            source.bytes = readFaceSubset(source.allocator.?, path, source.collection_index) orelse return .{ null, null };
         }
 
         if (source.weight.value == font.weight.value and source.style == font.style and source.stretch.value == font.stretch.value) {
@@ -1104,12 +1116,12 @@ pub const Cache = struct {
 
         const boxed = try state_gpa.create(Entry);
         errdefer state_gpa.destroy(boxed);
-        boxed.* = Entry.init(state_gpa, source.bytes, source.collection_index, source.pinnedAxes(), font) catch |err| blk: {
+        boxed.* = Entry.init(state_gpa, &source, font) catch |err| blk: {
             dvui.log.err("Font {s} init got {any}, using fallback", .{ fname, err });
             // Fallback bytes under the *requested* hash, not the fallback
             // font's: callers (resolveStack/stackEntry) look this entry up by
             // the hash they asked for, and would find nothing otherwise.
-            break :blk Entry.init(state_gpa, Source.fallback.bytes, Source.fallback.collection_index, &.{}, font) catch return error.OutOfMemory;
+            break :blk Entry.init(state_gpa, &Source.fallback, font) catch return error.OutOfMemory;
         };
         entry.value_ptr.* = boxed;
         //log.debug("- size {d} ascent {d} height {d}", .{ font.size, entry.ascent, entry.height });
@@ -1369,7 +1381,7 @@ pub const Cache = struct {
         if (self.findSource(synthetic).@"0" != null) return synthetic; // already loaded
 
         const path = state_gpa.dupe(u8, p.path) catch return null;
-        const bytes = std.Io.Dir.cwd().readFileAlloc(dvui.io, p.path, state_gpa, .limited(system_font_size_limit)) catch {
+        const bytes = readFaceSubset(state_gpa, p.path, p.font_index) orelse {
             state_gpa.free(path);
             return null;
         };
@@ -2047,6 +2059,11 @@ pub const Cache = struct {
         name: []const u8, // gpa
         parsed_font: OtFont,
         renderer: Renderer,
+        /// The one `sbix` strike this size needs, read from the source file
+        /// because `readFaceSubset` drops the table. Owned here;
+        /// `renderer.sbix_data` points into it. Null for a font that has no
+        /// `sbix`, or whose bytes didn't come from a file we can re-read.
+        sbix_strike: ?[]const u8,
         height: f32, // ascender - descender
         ascent: f32, // ascender
         em_height: f32, // measured M height
@@ -2153,14 +2170,28 @@ pub const Cache = struct {
             return @floatFromInt(bounds.rows);
         }
 
+        /// The `sbix` strike for `ppem`, re-read from the file `source` came
+        /// from. Null unless the source has a path -- an embedded or
+        /// app-supplied font keeps whatever `sbix` its own bytes carry.
+        fn loadSbixStrike(gpa: std.mem.Allocator, source: *const Source, ppem: f32) ?[]const u8 {
+            // Only discovery sets `path`, and only a target with a discovery
+            // backend has a filesystem to re-read it from (not wasm).
+            if (system_font_backend == null) return null;
+            const path = source.path orelse return null;
+            const file = std.Io.Dir.cwd().openFile(dvui.io, path, .{}) catch return null;
+            defer file.close(dvui.io);
+            const rounded: u16 = @intFromFloat(std.math.clamp(@round(ppem), 1, std.math.maxInt(u16)));
+            return opentype.parsing.Font.readSbixStrike(gpa, dvui.io, file, source.collection_index, rounded) catch null;
+        }
+
         /// Load font, calibrating ppem so rendered M height matches font.size.
-        pub fn init(gpa: std.mem.Allocator, ttf_bytes: []const u8, collection_index: u32, face_pinned: []const UserCoord, font: Font) Error!Entry {
+        pub fn init(gpa: std.mem.Allocator, source: *const Source, font: Font) Error!Entry {
             const min_pixel_size: f32 = 1;
 
             const fname = font.name(gpa);
             errdefer gpa.free(fname);
 
-            const parsed_font = parseFontOrCollection(gpa, ttf_bytes, collection_index) catch |err| {
+            const parsed_font = parseFontOrCollection(gpa, source.bytes, source.collection_index) catch |err| {
                 dvui.log.warn("Font.Cache.Entry.init() opentype parse error {any} font {s}\n", .{ err, fname });
                 return Error.FontError;
             };
@@ -2168,12 +2199,22 @@ pub const Cache = struct {
 
             var ppem = @max(min_pixel_size, font.size);
             var coords_buf: [max_user_coords]UserCoord = undefined;
-            const user_coords = effectiveUserCoords(font, face_pinned, &coords_buf);
+            const user_coords = effectiveUserCoords(font, source.pinnedAxes(), &coords_buf);
             var renderer = Renderer.init(gpa, dvui.currentWindow().lifo(), parsed_font, ppem, .{ .hint_glyf = true, .user_coords = user_coords }) catch |err| {
                 dvui.log.warn("Font.Cache.Entry.init() opentype renderer error {any} font {s}\n", .{ err, fname });
                 return Error.FontError;
             };
             errdefer renderer.deinit(gpa);
+
+            // Before the cap-height probe below: `glyphBounds` takes a
+            // different path for a font with colour bitmaps, so the strike has
+            // to be in place for the probe to measure what rendering will do.
+            // The probe may then correct ppem; one strike is scaled to
+            // whatever ppem ends up being, the same as a full strike list
+            // would be, so the pick does not need revisiting.
+            const sbix_strike = loadSbixStrike(gpa, source, ppem);
+            errdefer if (sbix_strike) |strike| gpa.free(strike);
+            if (sbix_strike) |strike| renderer.sbix_data = strike;
 
             const units_per_em_f: f32 = @floatFromInt(renderer.head.units_per_em);
 
@@ -2211,6 +2252,7 @@ pub const Cache = struct {
                 .name = fname,
                 .parsed_font = parsed_font,
                 .renderer = renderer,
+                .sbix_strike = sbix_strike,
                 .ascent = @trunc(raw_ascender * scale_f),
                 .height = (raw_ascender - raw_descender) * scale_f,
                 .em_height = em_height,
@@ -2227,6 +2269,7 @@ pub const Cache = struct {
             self.glyphs.deinit(gpa);
             self.renderer.deinit(gpa);
             self.parsed_font.deinit(gpa);
+            if (self.sbix_strike) |strike| gpa.free(strike);
             if (self.texture_atlas_cache) |tex| backend.textureDestroy(tex);
         }
 
@@ -3394,10 +3437,20 @@ test "Cache.reset: drops unreferenced discovered font bytes; findSource reads th
         .path = try cw.gpa.dupe(u8, path),
     });
     const source = &cw.fonts.database.items[cw.fonts.database.items.len - 1];
-    cw.fonts.reset(cw.gpa, cw.backend);
+    for (0..Cache.evict_after_unreferenced_resets) |_| cw.fonts.reset(cw.gpa, cw.backend);
     try std.testing.expectEqual(@as(usize, 0), source.bytes.len);
+
+    // The re-read assembles the requested face as a fresh standalone sfnt,
+    // so it matches the file's tables rather than its bytes.
     const found = cw.fonts.findSource(Font.init("DiskVera")).@"0".?;
-    try std.testing.expectEqualSlices(u8, Source.fallback.bytes, found.bytes);
+    const original = try Cache.Entry.parseFontOrCollection(cw.gpa, Source.fallback.bytes, 0);
+    defer original.deinit(cw.gpa);
+    const reread = try Cache.Entry.parseFontOrCollection(cw.gpa, found.bytes, 0);
+    defer reread.deinit(cw.gpa);
+    try std.testing.expectEqual(original.table_records.len, reread.table_records.len);
+    for (original.table_records) |record| {
+        try std.testing.expectEqualSlices(u8, original.tableData(record.tag).?, reread.tableData(record.tag).?);
+    }
 }
 
 test "Cache.loadDynamicFallback: rejects a discovered font with no rasterizable outline table" {
