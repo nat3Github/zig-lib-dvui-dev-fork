@@ -45,9 +45,7 @@ android {
     def zigTask = tasks.register("zigBuild${variant}", Exec) {
         workingDir file('../../zig-project')
         executable project.findProperty('zig') ?: 'zig'
-        // local opentype checkout wins over dvui's URL pin, when present
-        def opentype = file('../../../../../opentype')
-        args = ['build', 'lib', "-Doptimize=${optimize}", "-Dandroid_ndk=${androidComponents.sdkComponents.ndkDirectory.get().asFile}"] + (opentype.exists() ? ["--fork=${opentype}"] : [])
+        args = ['build', 'lib', "-Doptimize=${optimize}", "-Dandroid_ndk=${androidComponents.sdkComponents.ndkDirectory.get().asFile}"]
     }
     tasks.matching { it.name == "pre${variant}Build" }.configureEach { dependsOn zigTask }
 }
