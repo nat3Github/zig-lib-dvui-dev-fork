@@ -492,7 +492,7 @@ pub fn buildBackend(
             }
         },
         .testing => {
-            dvui_opts.setDefaults(.{ .libc = true,  .tiny_file_dialogs = true, .stb_image = true, .tree_sitter = true });
+            dvui_opts.setDefaults(.{ .libc = true, .tiny_file_dialogs = true, .stb_image = true, .tree_sitter = true });
             const testing_mod = b.addModule("testing", .{
                 .root_source_file = b.path("src/backends/testing.zig"),
                 .target = target,
@@ -515,15 +515,9 @@ pub fn buildBackend(
             };
             _ = addExample("testing-app", b.path("examples/app.zig"), test_dvui_and_app, example_opts, dvui_opts);
             _ = addExample("frame-dump", b.path("examples/frame-dump.zig"), false, example_opts, dvui_opts);
-            {
-                const font_bench_mod = addExample("font-bench", b.path("../dvui-dev/font-bench.zig"), false, example_opts, dvui_opts);
-                const font_bench_options = b.addOptions();
-                font_bench_options.addOption([]const u8, "variant", "opentype-integration");
-                font_bench_mod.addOptions("build_options", font_bench_options);
-            }
         },
         .proxy => {
-            dvui_opts.setDefaults(.{ .libc = true,  .tiny_file_dialogs = false, .stb_image = true, .tree_sitter = true });
+            dvui_opts.setDefaults(.{ .libc = true, .tiny_file_dialogs = false, .stb_image = true, .tree_sitter = true });
 
             const proxy_bridge_mod = b.addModule("proxy_bridge", .{
                 .root_source_file = b.path("src/backends/proxy_bridge.zig"),
@@ -546,7 +540,7 @@ pub fn buildBackend(
             linkBackend(dvui_proxy, proxy_mod);
         },
         .sdl2 => {
-            dvui_opts.setDefaults(.{ .libc = true,  .tiny_file_dialogs = true, .stb_image = true, .tree_sitter = true });
+            dvui_opts.setDefaults(.{ .libc = true, .tiny_file_dialogs = true, .stb_image = true, .tree_sitter = true });
 
             const sdl_translate_c = b.addTranslateC(.{
                 .root_source_file = b.path("src/backends/sdl2-c.h"),
@@ -647,7 +641,7 @@ pub fn buildBackend(
             // _ = addExample("sdl2-multi-win", b.path("examples/sdl-multi-win.zig"), true, example_opts, dvui_opts);
         },
         .sdl3gpu => {
-            dvui_opts.setDefaults(.{ .libc = true,  .tiny_file_dialogs = true, .stb_image = true, .tree_sitter = true });
+            dvui_opts.setDefaults(.{ .libc = true, .tiny_file_dialogs = true, .stb_image = true, .tree_sitter = true });
 
             const sdl_translate_c = b.addTranslateC(.{
                 .root_source_file = b.path("src/backends/sdl3-c.h"),
@@ -695,12 +689,12 @@ pub fn buildBackend(
         },
         .sdl3 => {
             if (target.result.abi.isAndroid()) {
-                dvui_opts.setDefaults(.{ .libc = true,  .tiny_file_dialogs = false, .stb_image = true, .tree_sitter = false });
+                dvui_opts.setDefaults(.{ .libc = true, .tiny_file_dialogs = false, .stb_image = true, .tree_sitter = false });
             } else if (target.result.os.tag == .ios) {
-                // NOTE: freetype/tiny_file_dialogs/tree_sitter have no .ios build.zig support yet.
-                dvui_opts.setDefaults(.{ .libc = true,  .tiny_file_dialogs = false, .stb_image = true, .tree_sitter = false });
+                // NOTE: tiny_file_dialogs/tree_sitter have no .ios build.zig support yet.
+                dvui_opts.setDefaults(.{ .libc = true, .tiny_file_dialogs = false, .stb_image = true, .tree_sitter = false });
             } else {
-                dvui_opts.setDefaults(.{ .libc = true,  .tiny_file_dialogs = true, .stb_image = true, .tree_sitter = true });
+                dvui_opts.setDefaults(.{ .libc = true, .tiny_file_dialogs = true, .stb_image = true, .tree_sitter = true });
             }
 
             const sdl_translate_c = b.addTranslateC(.{
@@ -819,7 +813,7 @@ pub fn buildBackend(
                 return error.IncompatibleVertexIndex;
             }
 
-            dvui_opts.setDefaults(.{ .libc = true,  .tiny_file_dialogs = true, .stb_image = false, .tree_sitter = true });
+            dvui_opts.setDefaults(.{ .libc = true, .tiny_file_dialogs = true, .stb_image = false, .tree_sitter = true });
 
             const raylib_translate_c = b.addTranslateC(.{
                 .root_source_file = b.path("src/backends/raylib-c.h"),
@@ -901,7 +895,7 @@ pub fn buildBackend(
                 return error.IncompatibleVertexIndex;
             }
 
-            dvui_opts.setDefaults(.{ .libc = dvui_opts_in.libc orelse true,  .tiny_file_dialogs = true, .stb_image = false, .tree_sitter = true });
+            dvui_opts.setDefaults(.{ .libc = dvui_opts_in.libc orelse true, .tiny_file_dialogs = true, .stb_image = false, .tree_sitter = true });
 
             const raylib_backend_mod = b.addModule("raylib_zig", .{
                 .root_source_file = b.path("src/backends/raylib-zig.zig"),
@@ -960,7 +954,7 @@ pub fn buildBackend(
                 return error.IncompatibleVertexIndex;
             }
 
-            dvui_opts.setDefaults(.{ .libc = true,  .tiny_file_dialogs = true, .stb_image = true, .tree_sitter = true });
+            dvui_opts.setDefaults(.{ .libc = true, .tiny_file_dialogs = true, .stb_image = true, .tree_sitter = true });
             if (target.result.os.tag == .windows) {
                 const dx11_mod = b.addModule("dx11", .{
                     .root_source_file = b.path("src/backends/dx11.zig"),
@@ -993,7 +987,7 @@ pub fn buildBackend(
             }
         },
         .glfw => {
-            dvui_opts.setDefaults(.{ .libc = true,  .stb_image = true, .tiny_file_dialogs = true, .tree_sitter = true });
+            dvui_opts.setDefaults(.{ .libc = true, .stb_image = true, .tiny_file_dialogs = true, .tree_sitter = true });
 
             if (dvui_opts.render_backend == .default) {
                 dvui_opts.render_backend = .opengl;
@@ -1056,7 +1050,7 @@ pub fn buildBackend(
                 return error.IncompatibleVertexIndex;
             }
 
-            dvui_opts.setDefaults(.{ .libc = false,  .tiny_file_dialogs = false, .stb_image = true, .tree_sitter = false });
+            dvui_opts.setDefaults(.{ .libc = false, .tiny_file_dialogs = false, .stb_image = true, .tree_sitter = false });
             const base_export_symbol_names = [_][]const u8{
                 "dvui_init",
                 "dvui_deinit",
@@ -1121,7 +1115,7 @@ pub fn buildBackend(
                     // no tests or checks needed, they are check above in native build
                 };
 
-                wasm_dvui_opts.setDefaults(.{ .libc = false,  .tiny_file_dialogs = false, .stb_image = true, .tree_sitter = false });
+                wasm_dvui_opts.setDefaults(.{ .libc = false, .tiny_file_dialogs = false, .stb_image = true, .tree_sitter = false });
 
                 const web_mod_wasm = b.createModule(.{
                     .root_source_file = b.path("src/backends/web.zig"),
@@ -1141,7 +1135,7 @@ pub fn buildBackend(
             }
         },
         .wio => {
-            dvui_opts.setDefaults(.{ .libc = true,  .tiny_file_dialogs = true, .stb_image = true, .tree_sitter = true });
+            dvui_opts.setDefaults(.{ .libc = true, .tiny_file_dialogs = true, .stb_image = true, .tree_sitter = true });
 
             if (dvui_opts.render_backend == .default) {
                 dvui_opts.render_backend = .opengl;
@@ -1191,7 +1185,7 @@ pub fn buildBackend(
             }
         },
         .pugl => {
-            dvui_opts.setDefaults(.{ .libc = true,  .tiny_file_dialogs = true, .stb_image = true, .tree_sitter = true });
+            dvui_opts.setDefaults(.{ .libc = true, .tiny_file_dialogs = true, .stb_image = true, .tree_sitter = true });
 
             if (dvui_opts.render_backend == .default) {
                 dvui_opts.render_backend = .opengl;
