@@ -180,9 +180,9 @@ pub fn renderText(opts: TextOptions) Backend.GenericError!void {
     // (underline/strike/selection bounds, atlas) use.
     var fallback_entry: *Font.Cache.Entry = undefined;
     var fallback_ascent: f32 = undefined;
-    var line: Font.Cache.Entry.ShapedLine = undefined;
+    var shaped_text: Font.Cache.ShapedText = undefined;
     var owns_line = false;
-    defer if (owns_line) line.deinit();
+    defer if (owns_line) shaped_text.deinit();
 
     if (opts.pre_shaped) |shaped| {
         // Already shaped once by the caller (full UAX #9 bidi + GSUB/GPOS)
@@ -190,10 +190,10 @@ pub fn renderText(opts: TextOptions) Backend.GenericError!void {
         // a second time just to draw them.
         fallback_entry = shaped.fallback;
         fallback_ascent = shaped.ascent;
-        line = shaped.line;
+        shaped_text = .{ .line = shaped.line, .entries = shaped.entries };
     } else {
         const resolved = try cw.fonts.resolveStack(cw.gpa, sized_font);
-        line = cw.fonts.shapeLineText(cw.arena(), cw.gpa, resolved, utf8_text, null, .auto, opts.font.shapeStyle(0)) catch return error.OutOfMemory;
+        shaped_text = cw.fonts.shapeLineText(cw.arena(), cw.gpa, resolved, utf8_text, null, .auto, opts.font.shapeStyle(0)) catch return error.OutOfMemory;
         owns_line = true;
         // Fetched after shapeLineText, not before: shapeLineText can insert
         // into self.cache while lazily materializing fallback-family
@@ -205,6 +205,8 @@ pub fn renderText(opts: TextOptions) Backend.GenericError!void {
             fallback_ascent = @round(fallback_ascent * opts.font.line_height_factor);
         }
     }
+
+    const line = &shaped_text.line;
 
     const color = opts.color.opacity(cw.alpha);
     const col: Color.PMA = .fromColor(color);
@@ -262,9 +264,9 @@ pub fn renderText(opts: TextOptions) Backend.GenericError!void {
 
     var seg_start: usize = 0;
     while (seg_start < glyph_limit) {
-        const fce = line.entryForGlyph(fallback_entry, seg_start);
+        const fce = shaped_text.entryForGlyph(fallback_entry, seg_start);
         var seg_end = seg_start + 1;
-        while (seg_end < glyph_limit and line.entryForGlyph(fallback_entry, seg_end) == fce) seg_end += 1;
+        while (seg_end < glyph_limit and shaped_text.entryForGlyph(fallback_entry, seg_end) == fce) seg_end += 1;
 
         // Place every glyph before fetching the atlas, or a first-seen glyph
         // misses this frame's upload and gets UVs from the pre-growth size.
@@ -309,8 +311,9 @@ pub fn renderText(opts: TextOptions) Backend.GenericError!void {
                 if (in_sel and (range.start < sel_start or range.end > sel_end)) {
                     // The selection ends inside a ligature: shade only the
                     // components it covers, at the carets the cursor uses.
-                    const a = start.x + fallback_entry.caretPenOffset(&line, @max(range.start, sel_start), snap);
-                    const b = start.x + fallback_entry.caretPenOffset(&line, @min(range.end, sel_end), snap);
+                    const metrics = shaped_text.metrics(fallback_entry, cw.gpa);
+                    const a = start.x + line.caretPenOffset(metrics, @max(range.start, sel_start), snap);
+                    const b = start.x + line.caretPenOffset(metrics, @min(range.end, sel_end), snap);
                     lo = @min(a, b);
                     hi = @max(a, b);
                 }

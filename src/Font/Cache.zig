@@ -22,7 +22,6 @@ const firstHardBreak = opentype.firstHardBreak;
 
 const Source = Font.Source;
 const FamilyEntry = Font.FamilyEntry;
-const ShapedText = Font.ShapedText;
 const WebFallback = Font.WebFallback;
 const WebFallbackOptions = Font.WebFallbackOptions;
 const web_fallback_enabled = Font.web_fallback_enabled;
@@ -35,6 +34,15 @@ const max_variations = Font.max_variations;
 const Error = Font.Error;
 
 const Cache = @This();
+
+/// Shaped-line cache, keyed by this `Cache`'s own font identity. Owns the
+/// shaping machinery that used to live here: the line cache, its byte
+/// budget, and the compiled GSUB/GPOS plans.
+const LineCache = opentype.line_cache.Cache(Font.CacheKey);
+
+/// One shaped line. Owned by `opentype`; see `ShapedText` for the
+/// `Entry`s its segments index into.
+pub const ShapedLine = opentype.ShapedLine;
 
 database: std.ArrayList(Source) = .empty,
 /// Values are `*Entry`, not `Entry`, so a `*Entry` handed out by
@@ -56,15 +64,12 @@ resolved_stacks: dvui.TrackingAutoHashMap(Font.CacheKey, *ResolvedStack, .get_an
 /// Owns the `FallbackStack` each `ResolvedStack` borrows, and outlives
 /// `reset()` -- the same stacks recur every frame.
 coverage_cache: std.AutoHashMapUnmanaged(u64, Cmap.FallbackStack) = .empty,
-/// Compiled GSUB/GPOS plans, reused across shape calls (and frames) for
-/// the same font + script + features. Holds slices into font bytes, so
-/// `evictUnreferencedFontBytes` clears it before freeing any.
-shaping_plans: PlanCache = .{},
 /// Full-pipeline shape results, so an unchanged widget (grid cells, static
 /// labels) doesn't rerun bidi + GSUB/GPOS every frame. Lines unused for a
-/// frame go at `reset()`; within a frame `max_shaped_line_bytes` caps it.
-shaped_line_cache: dvui.TrackingAutoHashMap(ShapedLineKey, CachedShapedLine, .get_and_put, void) = .empty,
-shaped_line_bytes: usize = 0,
+/// frame go at `reset()`; within a frame the cache's own byte budget caps
+/// it. Holds compiled plans pointing into font bytes, so
+/// `evictUnreferencedFontBytes` clears those before freeing any.
+line_cache: LineCache = .{},
 /// Per-codepoint memo for `discoverDynamicFallback` -- caches a system
 /// discovery lookup (or its failure, stored as `null`) so a codepoint
 /// missing from every registered family only ever triggers one OS query,
@@ -79,7 +84,7 @@ dynamic_fallback: std.AutoHashMapUnmanaged(u21, ?Font) = .empty,
 /// in `dynamic_fallback`. Not copied; must outlive the `Cache`.
 fallback_language: ?[]const u8 = null,
 /// Set by the web backend at init. A codepoint no font covers renders as
-/// tofu while its font downloads; arrival clears `shaped_line_cache`.
+/// tofu while its font downloads; arrival clears the shaped-line cache.
 web_fallback: if (web_fallback_enabled) ?WebFallback else void = if (web_fallback_enabled) null else {},
 /// Family aliases from `dvui.addFontFamily`: alias -> ordered family
 /// names, most-preferred first. Unbounded in length, unlike the family
@@ -106,10 +111,7 @@ pub fn deinit(self: *Cache, gpa: std.mem.Allocator, backend: Backend) void {
     while (cit.next()) |fb| fb.deinit(gpa);
     self.coverage_cache.deinit(gpa);
 
-    self.shaping_plans.deinit(gpa);
-
-    self.clearShapedLineCache(gpa);
-    self.shaped_line_cache.deinit(gpa);
+    self.line_cache.deinit(gpa);
 
     for (self.database.items) |*source| source.deinit();
     self.database.deinit(gpa);
@@ -163,7 +165,7 @@ pub fn addFamilyEntries(self: *Cache, gpa: std.mem.Allocator, alias: []const u8,
         gpa.destroy(item.value_ptr.*);
     }
     self.resolved_stacks.map.clearRetainingCapacity();
-    self.clearShapedLineCache(gpa);
+    self.line_cache.clear(gpa);
 }
 
 /// Past this, an entry's atlas is dropped at the next `reset()` and the
@@ -185,12 +187,7 @@ pub fn reset(self: *Cache, gpa: std.mem.Allocator, backend: Backend) void {
         stack.deinit(gpa);
         gpa.destroy(stack);
     }
-    var lit = self.shaped_line_cache.iterator();
-    while (lit.next_resetting()) |kv| {
-        var line = kv.value;
-        self.shaped_line_bytes -= line.byteSize();
-        line.deinit(gpa);
-    }
+    self.line_cache.evictUnused(gpa);
     // Draw commands from the last frame are submitted by now, so atlas
     // positions they captured can be dropped.
     var eit = self.cache.iterator();
@@ -214,7 +211,7 @@ fn evictUnreferencedFontBytes(self: *Cache, gpa: std.mem.Allocator) void {
         if (source.unreferenced_resets < evict_after_unreferenced_resets) continue;
         source.unreferenced_resets = 0;
         // Cached shaping plans hold slices into these bytes.
-        self.shaping_plans.clear(gpa);
+        self.line_cache.clearPlans(gpa);
         source.releaseBytes();
     }
 }
@@ -237,36 +234,6 @@ fn bytesReferenced(self: *Cache, bytes: []const u8) bool {
         }
     }
     return false;
-}
-
-/// Budget for `shaped_line_cache` before it is dropped wholesale. Counted
-/// in bytes, not lines: line length is caller-controlled and unbounded.
-const max_shaped_line_bytes = 16 * 1024 * 1024;
-
-// ponytail: bulk clear rather than LRU -- eviction order only matters if
-// the budget is hit routinely. Swap in an LRU if a real workload starts
-// thrashing this.
-fn clearShapedLineCache(self: *Cache, gpa: std.mem.Allocator) void {
-    var it = self.shaped_line_cache.iterator();
-    while (it.next()) |kv| kv.value_ptr.deinit(gpa);
-    self.shaped_line_cache.map.clearRetainingCapacity();
-    self.shaped_line_bytes = 0;
-}
-
-/// Keeps `line` for later `shapeLineText` calls with an equal `key`.
-/// Failing to allocate just leaves the line uncached.
-fn cacheShapedLine(self: *Cache, gpa: std.mem.Allocator, key: ShapedLineKey, line: *const Entry.ShapedLine, segments: []const CachedShapedLine.Segment) void {
-    const owned_key, var value = CachedShapedLine.init(gpa, key, line, segments) catch return;
-    const bytes = value.byteSize();
-    if (bytes <= max_shaped_line_bytes) {
-        if (self.shaped_line_bytes + bytes > max_shaped_line_bytes) self.clearShapedLineCache(gpa);
-        // Only reached after a miss or after dropping the stale entry.
-        if (self.shaped_line_cache.putNoClobber(gpa, owned_key, value)) {
-            self.shaped_line_bytes += bytes;
-            return;
-        } else |_| {}
-    }
-    value.deinit(gpa);
 }
 
 const max_family_variants = 64;
@@ -371,7 +338,7 @@ pub fn getOrCreate(self: *Cache, state_gpa: std.mem.Allocator, font: Font) std.m
 }
 
 pub const ResolvedStack = struct {
-    /// Font.cacheKey() this stack was resolved from; used as a shaped_line_cache key.
+    /// Font.cacheKey() this stack was resolved from; keys the shaped-line cache.
     font_key: Font.CacheKey = .{ .bytes = @splat(0) },
     /// Entry keys; entries themselves live in Cache.cache.
     entry_keys: []Font.CacheKey = &.{},
@@ -710,7 +677,7 @@ pub fn webFallbackLoaded(self: *Cache, gpa: std.mem.Allocator, font: u16, bytes:
         return service.fontFailed(gpa, font);
     };
     service.fontLoaded(font);
-    self.clearShapedLineCache(gpa);
+    self.line_cache.clear(gpa);
 }
 
 /// Replaces the web fallback service. Fonts fetched so far stay loaded
@@ -719,7 +686,7 @@ pub fn setWebFallback(self: *Cache, gpa: std.mem.Allocator, options: WebFallback
     if (!web_fallback_enabled) return;
     if (self.web_fallback) |*service| service.deinit(gpa);
     self.web_fallback = if (options.enabled) .{ .base_url = options.base_url } else null;
-    self.clearShapedLineCache(gpa);
+    self.line_cache.clear(gpa);
 }
 
 pub fn webFallbackFailed(self: *Cache, gpa: std.mem.Allocator, font: u16) void {
@@ -737,443 +704,182 @@ fn isKnownWebFallbackFont(service: *const WebFallback, font: u16) bool {
 /// The returned line (and per-call temporaries) come from `output`;
 /// `state_gpa` backs everything the cache keeps, so it must be the
 /// allocator later passed to `Cache.deinit`, never a frame arena.
-pub fn shapeLineText(self: *Cache, output: std.mem.Allocator, state_gpa: std.mem.Allocator, resolved: *ResolvedStack, text: []const u8, item: ?Font.ShapeItem, base_direction: opentype.unicode.Bidi.ParagraphDirection, style: Font.ShapeStyle) std.mem.Allocator.Error!Entry.ShapedLine {
-    const has_tab = std.mem.indexOfScalar(u8, text, '\t') != null;
-    const cache_key: ShapedLineKey = .{
-        .font_key = resolved.font_key,
-        .text = text,
-        .item = item,
-        .base_direction = base_direction,
-        .features = style.features,
-        // Tab-free text shapes the same wherever it starts, so it keeps one key.
-        .tab = if (has_tab) .{ .size = style.tab_size, .origin_bits = @bitCast(style.tab_origin) } else null,
-    };
-    if (self.shaped_line_cache.getPtr(cache_key)) |cached| {
-        if (try self.materializeShapedLine(output, cached)) |line| return line;
-        // A segment's font was evicted from `cache` (unused since the
-        // last reset -- e.g. scrolled out of view) since this line was
-        // cached: the cached line is now unrenderable as-is, so drop it
-        // and fall through to reshape from scratch instead of silently
-        // rendering with missing segments.
-        if (self.shaped_line_cache.fetchRemove(cache_key)) |kv| {
-            var stale = kv.value;
-            self.shaped_line_bytes -= stale.byteSize();
-            stale.deinit(state_gpa);
+/// Everything `opentype`'s line cache asks of dvui while shaping a line:
+/// coverage from the resolved stack, OS/web discovery for a codepoint
+/// nothing covers, and the per-font pixel scale tab stops need.
+///
+/// Font indices are positions in the list the shaper builds: the resolved
+/// stack first, then whatever `fontForCodepoint` answered, in the order it
+/// answered. `discovered` mirrors that tail so an index resolves back to a
+/// key without the shaper having to hand one out.
+const LineProvider = struct {
+    cache: *Cache,
+    resolved: *ResolvedStack,
+    discovered: *std.ArrayList(Discovered),
+    output: std.mem.Allocator,
+
+    const Discovered = struct { key: Font.CacheKey, font: Font };
+
+    pub fn coversCodepoint(self: LineProvider, codepoint: u21) bool {
+        return self.resolved.entryIndexFor(codepoint) != null;
+    }
+
+    pub fn fontForCodepoint(self: LineProvider, state_gpa: std.mem.Allocator, codepoint: u21) ?Font.CacheKey {
+        const found = self.cache.discoverDynamicFallback(state_gpa, codepoint) orelse
+            self.cache.webFallbackFont(state_gpa, codepoint) orelse return null;
+        // The discovery memo is keyed on codepoint alone (which family
+        // covers it is size-independent), so its result carries
+        // Font.DefaultSize -- rescale to the size the primary was asked for.
+        const sized = found.withSize(self.resolved.family_fonts[0].size);
+        const key = sized.cacheKey();
+        self.discovered.append(self.output, .{ .key = key, .font = sized }) catch return null;
+        return key;
+    }
+
+    /// Materializes the full calibrated Entry (Renderer + ppem
+    /// calibration) the first time a family is actually assigned a glyph,
+    /// so a stack family no shaped text ever needs stays unbuilt.
+    pub fn ensureFont(self: LineProvider, state_gpa: std.mem.Allocator, key: Font.CacheKey) !OtFont {
+        const font = self.fontForKey(key) orelse return error.FontUnavailable;
+        const entry = try self.cache.getOrCreate(state_gpa, font);
+        return entry.parsed_font;
+    }
+
+    pub fn hasFont(self: LineProvider, key: Font.CacheKey) bool {
+        return self.cache.cache.getPtr(key) != null;
+    }
+
+    pub fn toPixels(self: LineProvider, font_index: u16, font_units: i32) f32 {
+        const entry = self.entryForIndex(font_index) orelse return 0;
+        return entry.toPixels(font_units);
+    }
+
+    pub fn noteMissingCoverage(self: LineProvider, state_gpa: std.mem.Allocator, codepoint: u21) void {
+        logMissingCoverage(self.resolved, state_gpa, codepoint);
+    }
+
+    fn keyForIndex(self: LineProvider, font_index: u16) ?Font.CacheKey {
+        const static = self.resolved.entry_keys.len;
+        if (font_index < static) return self.resolved.entry_keys[font_index];
+        const dynamic_index = font_index - static;
+        if (dynamic_index >= self.discovered.items.len) return null;
+        return self.discovered.items[dynamic_index].key;
+    }
+
+    fn fontForKey(self: LineProvider, key: Font.CacheKey) ?Font {
+        for (self.resolved.entry_keys, self.resolved.family_fonts) |k, font| {
+            if (Font.CacheKey.Context.eql(.{}, k, key)) return font;
         }
-    }
-
-    const decoded = try Entry.decodeLine(output, text);
-    var line_codepoints = decoded.codepoints;
-    var line_byte_offsets = decoded.byte_offsets;
-    errdefer output.free(line_codepoints);
-    errdefer output.free(line_byte_offsets);
-
-    // Codepoint range matching `item`'s byte range; the shaper works in
-    // codepoint indices. Clamped to what decodeLine produced, which stops
-    // at a hard break.
-    var item_cp: ?opentype.shaping.Item = null;
-    if (item) |it| {
-        var cp_start: usize = 0;
-        while (cp_start < decoded.codepoints.len and decoded.byte_offsets[cp_start] < it.start) cp_start += 1;
-        var cp_end: usize = cp_start;
-        while (cp_end < decoded.codepoints.len and decoded.byte_offsets[cp_end] < it.end) cp_end += 1;
-        item_cp = .{ .start = cp_start, .end = cp_end };
-    }
-
-    // Fallback font stack in priority order, from the cheap parse-only
-    // fonts `resolveStack` built -- no `cache` lookup/eviction concerns
-    // since `raw_fonts` is owned by `resolved` itself, followed by
-    // dynamically discovered fonts (see below) for codepoints no
-    // registered family covers.
-    const static_fonts = resolved.entry_keys.len;
-    var fonts_list: std.ArrayList(OtFont) = .empty;
-    defer fonts_list.deinit(output);
-    var keys_list: std.ArrayList(Font.CacheKey) = .empty;
-    defer keys_list.deinit(output);
-    var family_fonts_list: std.ArrayList(Font) = .empty;
-    defer family_fonts_list.deinit(output);
-    try fonts_list.appendSlice(output, resolved.raw_fonts[0..static_fonts]);
-    try keys_list.appendSlice(output, resolved.entry_keys);
-    try family_fonts_list.appendSlice(output, resolved.family_fonts[0..static_fonts]);
-
-    // Query the OS (or the web fallback service) for each newly-uncovered
-    // codepoint, skipping any already covered by a font discovered
-    // earlier in this same line. Uncapped: a CJK web fallback font is
-    // split into ~100 slices, so a long CJK line can need dozens, and
-    // every missing codepoint must reach `webFallbackFont` to be fetched.
-    var dynamic_cmaps: std.ArrayList([]const u8) = .empty;
-    defer dynamic_cmaps.deinit(output);
-    if (static_fonts > 0) {
-        for (decoded.codepoints) |cp| {
-            if (resolved.entryIndexFor(cp) != null) continue;
-            var covered = false;
-            for (dynamic_cmaps.items) |cm| {
-                if (Cmap.lookup(cm, cp) != null) {
-                    covered = true;
-                    break;
-                }
-            }
-            if (covered) continue;
-            // discoverDynamicFallback's memo is keyed on codepoint only
-            // (which family covers it, independent of size), so its
-            // result carries Font.DefaultSize -- rescale to the size the
-            // primary font was actually requested at.
-            if (self.discoverDynamicFallback(state_gpa, cp) orelse self.webFallbackFont(state_gpa, cp)) |raw_dyn_font| {
-                const dyn_font = raw_dyn_font.withSize(resolved.family_fonts[0].size);
-                const dyn_key = dyn_font.cacheKey();
-                var already_added = false;
-                for (keys_list.items[static_fonts..]) |k| {
-                    if (std.mem.eql(u8, &k.bytes, &dyn_key.bytes)) {
-                        already_added = true;
-                        break;
-                    }
-                }
-                if (already_added) continue;
-                // state_gpa: getOrCreate inserts into self.cache, which
-                // outlives this frame -- output here may be a frame-scoped
-                // arena that resets right after this call returns.
-                const dyn_entry = try self.getOrCreate(state_gpa, dyn_font);
-                try fonts_list.append(output, dyn_entry.parsed_font);
-                try keys_list.append(output, dyn_key);
-                try family_fonts_list.append(output, dyn_font);
-                const cmap = dyn_entry.parsed_font.tableData(.{ 'c', 'm', 'a', 'p' }) orelse &.{};
-                if (cmap.len > 0) try dynamic_cmaps.append(output, cmap);
-            } else logMissingCoverage(resolved, state_gpa, cp);
+        for (self.discovered.items) |d| {
+            if (Font.CacheKey.Context.eql(.{}, d.key, key)) return d.font;
         }
+        return null;
     }
 
-    var result = Buffer.init(output);
-    errdefer result.deinit();
-    var segments: std.ArrayList(Entry.ShapedLine.EntrySegment) = .empty;
-    errdefer segments.deinit(output);
-    // Entry-hash twin of `segments`, cached in place of raw `*Entry`
-    // pointers -- `cache`'s backing array can grow/rehash across frames
-    // (loading a new bold/italic/mono variant), which would otherwise
-    // leave a persisted segment's pointer dangling.
-    var cache_segments: std.ArrayList(CachedShapedLine.Segment) = .empty;
-    errdefer cache_segments.deinit(output);
-
-    if (decoded.codepoints.len > 0 and fonts_list.items.len > 0) {
-        // Bidi outer, font fallback inner, so visual reordering crosses font boundaries.
-        // state_gpa backs the plan cache: `output` may be a frame arena,
-        // and a cached plan has to outlive the call that built it.
-        const shaped = shapeBidiParagraphWithFallback(output, fonts_list.items, decoded.codepoints, base_direction, &.{}, &.{}, style.features, item_cp, .{ .cache = &self.shaping_plans, .state_allocator = state_gpa }) catch |err| switch (err) {
-            error.OutOfMemory => |e| return e,
-            else => BidiFallbackResult{ .buffer = Buffer.init(output), .font_indices = &.{} },
-        };
-        defer output.free(shaped.font_indices);
-        result.deinit();
-        result = shaped.buffer;
-
-        // Coalesce consecutive same-font glyphs into segments, in two
-        // passes. `getOrCreate` lazily materializes the full calibrated
-        // Entry (Renderer + ppem calibration) the first time a family is
-        // actually assigned a glyph -- a stack fallback family that no
-        // shaped text ever needs never pays that cost -- but it inserts
-        // into `self.cache`, which can grow/rehash and invalidate every
-        // `*Entry` handed out earlier in the same line. So pass 1 only
-        // materializes (no pointers kept); pass 2 captures pointers only
-        // once every insertion for this line is done.
-        var g: usize = 0;
-        while (g < shaped.font_indices.len) {
-            const fi = shaped.font_indices[g];
-            var h = g + 1;
-            while (h < shaped.font_indices.len and shaped.font_indices[h] == fi) h += 1;
-            // state_gpa: see note on the dynamic-fallback getOrCreate above.
-            _ = try self.getOrCreate(state_gpa, family_fonts_list.items[fi]);
-            g = h;
-        }
-        g = 0;
-        while (g < shaped.font_indices.len) {
-            const fi = shaped.font_indices[g];
-            var h = g + 1;
-            while (h < shaped.font_indices.len and shaped.font_indices[h] == fi) h += 1;
-            const fce = try self.getOrCreate(state_gpa, family_fonts_list.items[fi]);
-            try segments.append(output, .{ .entry = fce, .glyph_start = @intCast(g), .glyph_end = @intCast(h) });
-            try cache_segments.append(output, .{ .entry_key = keys_list.items[fi], .glyph_start = @intCast(g), .glyph_end = @intCast(h) });
-            g = h;
-        }
-        if (has_tab) applyTabStops(&result, segments.items, decoded.codepoints, style);
-    }
-    result.have_positions = true;
-
-    // Rebase onto the item: from here on the line reads exactly like a
-    // shape of `text[item.start..item.end]` alone -- clusters and byte
-    // offsets relative to the item -- so every caller's byte-offset math
-    // (prefix measurement, hit testing, selection) is unchanged by the
-    // context having been there.
-    if (item_cp) |it_cp| {
-        const it = item.?;
-        const new_codepoints = try output.dupe(u21, line_codepoints[it_cp.start..it_cp.end]);
-        errdefer output.free(new_codepoints);
-        const new_offsets = try output.alloc(u32, it_cp.end - it_cp.start + 1);
-        for (new_offsets[0 .. it_cp.end - it_cp.start], line_byte_offsets[it_cp.start..it_cp.end]) |*dst, off| {
-            dst.* = off -| @as(u32, @intCast(it.start));
-        }
-        new_offsets[it_cp.end - it_cp.start] = line_byte_offsets[it_cp.end] -| @as(u32, @intCast(it.start));
-        for (result.info.items) |*info| info.cluster -= @intCast(it_cp.start);
-        output.free(line_codepoints);
-        output.free(line_byte_offsets);
-        line_codepoints = new_codepoints;
-        line_byte_offsets = new_offsets;
-    }
-
-    const cluster_tables = try result.buildClusterTables(output, line_byte_offsets);
-    errdefer output.free(cluster_tables.starts);
-    errdefer output.free(cluster_tables.ends);
-
-    const line: Entry.ShapedLine = .{
-        .allocator = output,
-        .codepoints = line_codepoints,
-        .byte_offsets = line_byte_offsets,
-        .buffer = result,
-        .cluster_starts = cluster_tables.starts,
-        .cluster_ends = cluster_tables.ends,
-        .segments = try segments.toOwnedSlice(output),
-    };
-
-    self.cacheShapedLine(state_gpa, cache_key, &line, cache_segments.items);
-    cache_segments.deinit(output);
-
-    return line;
-}
-
-/// Fonts have no real tab glyph (U+0009 is .notdef or a zero-width
-/// control), so each tab becomes the space glyph with whatever advance
-/// reaches the next stop, `tab_size` space advances apart from the line
-/// start. Stops follow the pen in reading order: an RTL line counts
-/// them from its right edge.
-/// ponytail: pen positions in a mixed-direction line are visual, so a
-/// tab inside its embedded opposite-direction run snaps off the
-/// visual pen rather than a per-run one.
-fn applyTabStops(buffer: *Buffer, segments: []const Entry.ShapedLine.EntrySegment, codepoints: []const u21, style: Font.ShapeStyle) void {
-    const rtl = buffer.isRtl();
-    var pen = style.tab_origin;
-    for (0..segments.len) |si| {
-        const seg = segments[if (rtl) segments.len - 1 - si else si];
-        const font = seg.entry.parsed_font;
-        const space_glyph = Cmap.lookup(font.tableData("cmap".*) orelse &.{}, ' ') orelse 0;
-        const space_units: i32 = blk: {
-            const hhea = opentype.parsing.Table.hhea.parse(font.tableData("hhea".*) orelse &.{}) catch break :blk 0;
-            const hmtx = font.tableData("hmtx".*) orelse break :blk 0;
-            break :blk opentype.parsing.Table.hmtx.metricForGlyph(hmtx, space_glyph, hhea.number_of_h_metrics).advance_width;
-        };
-        const space_px = seg.entry.toPixels(space_units);
-        for (seg.glyph_start..seg.glyph_end) |k| {
-            const g = if (rtl) seg.glyph_end - 1 - (k - seg.glyph_start) else k;
-            const info = &buffer.info.items[g];
-            const pos = &buffer.pos.items[g];
-            if (codepoints[info.cluster] == '\t' and space_px > 0) {
-                const stop = space_px * @as(f32, @floatFromInt(style.tab_size));
-                var next = if (stop > 0) (@floor(pen / stop) + 1) * stop else pen;
-                // CSS: a stop closer than half a space is skipped.
-                if (stop > 0 and next - pen < space_px * 0.5) next += stop;
-                info.codepoint = space_glyph;
-                pos.x_offset = 0;
-                pos.x_advance = @intFromFloat(@round((next - pen) * @as(f32, @floatFromInt(space_units)) / space_px));
-            }
-            pen += seg.entry.toPixels(pos.x_advance);
-        }
-    }
-}
-
-/// Everything that changes a `shapeLineText` result. Keys stored in
-/// `shaped_line_cache` point `text` and `features` into their value's
-/// `CachedShapedLine.buffer`; lookups borrow the caller's.
-pub const ShapedLineKey = struct {
-    font_key: Font.CacheKey,
-    text: []const u8,
-    item: ?Font.ShapeItem,
-    base_direction: opentype.unicode.Bidi.ParagraphDirection,
-    features: []const Font.Feature,
-    tab: ?Tab,
-
-    const Tab = struct { size: u8, origin_bits: u32 };
-
-    // Equality over the full key, not the hash, decides a hit: crafted
-    // text can collide any unkeyed hash, and a line shaped from other
-    // bytes carries byte offsets that index past this `text`.
-    pub const Context = struct {
-        pub fn hash(_: Context, key: ShapedLineKey) u64 {
-            var hasher = std.hash.Wyhash.init(0);
-            hasher.update(&key.font_key.bytes);
-            hasher.update(key.text);
-            if (key.item) |item| {
-                hasher.update(std.mem.asBytes(&item.start));
-                hasher.update(std.mem.asBytes(&item.end));
-            }
-            hasher.update(std.mem.asBytes(&key.base_direction));
-            for (key.features) |feature| {
-                hasher.update(&feature.tag);
-                hasher.update(std.mem.asBytes(&feature.value));
-            }
-            if (key.tab) |tab| {
-                hasher.update(std.mem.asBytes(&tab.size));
-                hasher.update(std.mem.asBytes(&tab.origin_bits));
-            }
-            return hasher.final();
-        }
-
-        pub fn eql(_: Context, a: ShapedLineKey, b: ShapedLineKey) bool {
-            // Scalar fields first: the two byte-slice compares below are
-            // the expensive half, and most probes already differ here.
-            if (a.text.len != b.text.len or a.base_direction != b.base_direction) return false;
-            if (!std.meta.eql(a.item, b.item) or !std.meta.eql(a.tab, b.tab)) return false;
-            if (a.features.len != b.features.len) return false;
-            for (a.features, b.features) |fa, fb| {
-                if (!std.meta.eql(fa, fb)) return false;
-            }
-            if (!std.mem.eql(u8, &a.font_key.bytes, &b.font_key.bytes)) return false;
-            return std.mem.eql(u8, a.text, b.text);
-        }
-    };
-};
-
-/// Owned copy of a shape result kept in `shaped_line_cache`. Segments
-/// reference fonts by `entry_hash` (stable across `cache` rehashes)
-/// rather than `*Entry` (see `shapeLineText`'s cache_segments comment);
-/// `materializeShapedLine` resolves them back to live pointers per hit.
-const CachedShapedLine = struct {
-    /// One allocation per cached line: backs every slice below plus the
-    /// owning key's `text` and `features`.
-    buffer: []align(buffer_alignment.toByteUnits()) u8,
-    glyphs: []Glyph,
-    codepoints: []u21,
-    byte_offsets: []u32,
-    cluster_starts: []u32,
-    cluster_ends: []u32,
-    segments: []Segment,
-
-    const Segment = struct { entry_key: Font.CacheKey, glyph_start: u32, glyph_end: u32 };
-
-    /// The `GlyphInfo`/`GlyphPosition` fields a shaped line is read
-    /// through; the rest is shaper scratch, zeroed on a hit.
-    const Glyph = struct { glyph_id: u32, cluster: u32, x_advance: i32, x_offset: i32, y_offset: i32 };
-
-    const buffer_alignment: std.mem.Alignment = .fromByteUnits(@max(
-        @alignOf(Glyph),
-        @alignOf(u21),
-        @alignOf(u32),
-        @alignOf(Segment),
-        @alignOf(Font.Feature),
-    ));
-
-    /// Returns the stored copy of `key` alongside the value; both are
-    /// freed together by the value's `deinit`.
-    fn init(gpa: std.mem.Allocator, key: ShapedLineKey, line: *const Entry.ShapedLine, segments: []const Segment) std.mem.Allocator.Error!struct { ShapedLineKey, CachedShapedLine } {
-        const glyph_count = line.buffer.info.items.len;
-        var size: usize = 0;
-        try reserve(&size, Glyph, glyph_count);
-        try reserve(&size, u21, line.codepoints.len);
-        try reserve(&size, u32, line.byte_offsets.len);
-        try reserve(&size, u32, line.cluster_starts.len);
-        try reserve(&size, u32, line.cluster_ends.len);
-        try reserve(&size, Segment, segments.len);
-        try reserve(&size, Font.Feature, key.features.len);
-        try reserve(&size, u8, key.text.len);
-        const buffer = try gpa.alignedAlloc(u8, buffer_alignment, size);
-
-        // Carve in the same order as `reserve` above so offsets match.
-        var offset: usize = 0;
-        const glyphs = carve(buffer, &offset, Glyph, glyph_count);
-        for (glyphs, line.buffer.info.items, line.buffer.pos.items) |*glyph, info, pos| {
-            glyph.* = .{ .glyph_id = info.codepoint, .cluster = info.cluster, .x_advance = pos.x_advance, .x_offset = pos.x_offset, .y_offset = pos.y_offset };
-        }
-        const codepoints = carve(buffer, &offset, u21, line.codepoints.len);
-        @memcpy(codepoints, line.codepoints);
-        const byte_offsets = carve(buffer, &offset, u32, line.byte_offsets.len);
-        @memcpy(byte_offsets, line.byte_offsets);
-        const cluster_starts = carve(buffer, &offset, u32, line.cluster_starts.len);
-        @memcpy(cluster_starts, line.cluster_starts);
-        const cluster_ends = carve(buffer, &offset, u32, line.cluster_ends.len);
-        @memcpy(cluster_ends, line.cluster_ends);
-        const owned_segments = carve(buffer, &offset, Segment, segments.len);
-        @memcpy(owned_segments, segments);
-        const features = carve(buffer, &offset, Font.Feature, key.features.len);
-        @memcpy(features, key.features);
-        const text = carve(buffer, &offset, u8, key.text.len);
-        @memcpy(text, key.text);
-        std.debug.assert(offset == size);
-
-        var owned_key = key;
-        owned_key.text = text;
-        owned_key.features = features;
-        return .{ owned_key, .{
-            .buffer = buffer,
-            .glyphs = glyphs,
-            .codepoints = codepoints,
-            .byte_offsets = byte_offsets,
-            .cluster_starts = cluster_starts,
-            .cluster_ends = cluster_ends,
-            .segments = owned_segments,
-        } };
-    }
-
-    fn reserve(size: *usize, comptime T: type, count: usize) std.mem.Allocator.Error!void {
-        const bytes = std.math.mul(usize, @sizeOf(T), count) catch return error.OutOfMemory;
-        const start = std.mem.alignForward(usize, size.*, @alignOf(T));
-        size.* = std.math.add(usize, start, bytes) catch return error.OutOfMemory;
-    }
-
-    fn carve(buffer: []align(buffer_alignment.toByteUnits()) u8, offset: *usize, comptime T: type, count: usize) []T {
-        const start = std.mem.alignForward(usize, offset.*, @alignOf(T));
-        offset.* = start + @sizeOf(T) * count;
-        return @as([*]T, @ptrCast(@alignCast(buffer[start..offset.*].ptr)))[0..count];
-    }
-
-    fn byteSize(self: CachedShapedLine) usize {
-        return @sizeOf(ShapedLineKey) + @sizeOf(CachedShapedLine) + self.buffer.len;
-    }
-
-    fn deinit(self: *CachedShapedLine, gpa: std.mem.Allocator) void {
-        gpa.free(self.buffer);
+    fn entryForIndex(self: LineProvider, font_index: u16) ?*Entry {
+        const key = self.keyForIndex(font_index) orelse return null;
+        return (self.cache.cache.getPtr(key) orelse return null).*;
     }
 };
 
-/// Turns a `shaped_line_cache` hit into a caller-owned `Entry.ShapedLine`,
-/// re-resolving each segment's `*Entry` from its stable hash -- `null` if
-/// any segment's font was evicted from `cache` since the line was cached
-/// (the caller reshapes from scratch rather than rendering with segments
-/// silently missing).
-fn materializeShapedLine(self: *Cache, gpa: std.mem.Allocator, cached: *const CachedShapedLine) std.mem.Allocator.Error!?Entry.ShapedLine {
-    const segments = try gpa.alloc(Entry.ShapedLine.EntrySegment, cached.segments.len);
-    errdefer gpa.free(segments);
-    for (segments, cached.segments) |*dst, seg| {
-        const entry = self.cache.getPtr(seg.entry_key) orelse {
-            gpa.free(segments);
-            return null;
-        };
-        dst.* = .{ .entry = entry.*, .glyph_start = seg.glyph_start, .glyph_end = seg.glyph_end };
-    }
+/// Shapes one line, caching the result. See `opentype.line_cache`, which
+/// owns the pipeline; this resolves dvui's fonts for it and turns the
+/// font-key list it returns back into `*Entry`s.
+///
+/// `output` may be a frame arena that resets after the call (it backs the
+/// returned line); `state_gpa` backs everything the cache keeps.
+pub fn shapeLineText(self: *Cache, output: std.mem.Allocator, state_gpa: std.mem.Allocator, resolved: *ResolvedStack, text: []const u8, item: ?Font.ShapeItem, base_direction: opentype.unicode.Bidi.ParagraphDirection, style: Font.ShapeStyle) std.mem.Allocator.Error!ShapedText {
+    var discovered: std.ArrayList(LineProvider.Discovered) = .empty;
+    defer discovered.deinit(output);
+    const provider: LineProvider = .{ .cache = self, .resolved = resolved, .discovered = &discovered, .output = output };
 
-    var buffer = Buffer.init(gpa);
-    errdefer buffer.deinit();
-    try buffer.info.resize(gpa, cached.glyphs.len);
-    try buffer.pos.resize(gpa, cached.glyphs.len);
-    for (cached.glyphs, buffer.info.items, buffer.pos.items) |glyph, *info, *pos| {
-        info.* = .{ .codepoint = glyph.glyph_id, .cluster = glyph.cluster };
-        pos.* = .{ .x_advance = glyph.x_advance, .x_offset = glyph.x_offset, .y_offset = glyph.y_offset };
-    }
-    buffer.have_positions = true;
-
-    const codepoints = try gpa.dupe(u21, cached.codepoints);
-    errdefer gpa.free(codepoints);
-    const byte_offsets = try gpa.dupe(u32, cached.byte_offsets);
-    errdefer gpa.free(byte_offsets);
-    const cluster_starts = try gpa.dupe(u32, cached.cluster_starts);
-    errdefer gpa.free(cluster_starts);
-    const cluster_ends = try gpa.dupe(u32, cached.cluster_ends);
-
-    return .{
-        .allocator = gpa,
-        .codepoints = codepoints,
-        .byte_offsets = byte_offsets,
-        .buffer = buffer,
-        .cluster_starts = cluster_starts,
-        .cluster_ends = cluster_ends,
-        .segments = segments,
+    var result = self.line_cache.shapeLine(
+        output,
+        state_gpa,
+        provider,
+        resolved.font_key,
+        resolved.raw_fonts,
+        resolved.entry_keys,
+        text,
+        if (item) |it| .{ .start = it.start, .end = it.end } else null,
+        base_direction,
+        .{ .features = style.features, .tab_size = style.tab_size, .tab_origin = style.tab_origin },
+    ) catch |err| switch (err) {
+        error.OutOfMemory => |e| return e,
     };
+    defer output.free(result.font_keys);
+    errdefer result.line.deinit();
+
+    // Resolved once here rather than per glyph: `getOrCreate` above may
+    // have grown `cache`, so every pointer is taken after the last insert.
+    const entries = try output.alloc(*Entry, result.font_keys.len);
+    errdefer output.free(entries);
+    for (entries, result.font_keys) |*slot, key| {
+        slot.* = (self.cache.getPtr(key) orelse return error.OutOfMemory).*;
+    }
+
+    return .{ .line = result.line, .entries = entries };
 }
+
+/// A shaped line together with the `Entry` its segments index into.
+pub const ShapedText = struct {
+    line: ShapedLine,
+    /// `entries[segment.font_index]` shaped that glyph range; owned by the
+    /// same allocator the line came from.
+    entries: []*Entry,
+
+    pub fn deinit(self: *ShapedText) void {
+        // The line carries the allocator both it and `entries` came from.
+        const output = self.line.allocator;
+        self.line.deinit();
+        output.free(self.entries);
+    }
+
+    /// Entry that shaped the glyph at `glyph_idx`.
+    pub fn entryForGlyph(self: ShapedText, fallback: *Entry, glyph_idx: usize) *Entry {
+        const font_index = self.line.fontIndexForGlyph(glyph_idx);
+        if (font_index >= self.entries.len) return fallback;
+        return self.entries[font_index];
+    }
+
+    /// Per-glyph metrics for `opentype`'s measurement and caret helpers,
+    /// which ask by font index rather than holding an atlas pointer.
+    pub const Metrics = struct {
+        entries: []const *Entry,
+        fallback: *Entry,
+        state_gpa: std.mem.Allocator,
+
+        fn entry(self: Metrics, font_index: u16) *Entry {
+            if (font_index >= self.entries.len) return self.fallback;
+            return self.entries[font_index];
+        }
+
+        pub fn glyphInfoGet(self: Metrics, gpa: std.mem.Allocator, font_index: u16, glyph_id: u32) !Entry.GlyphInfo {
+            return self.entry(font_index).glyphInfoGet(gpa, glyph_id);
+        }
+
+        pub fn toPixels(self: Metrics, font_index: u16, font_units: i32) f32 {
+            return self.entry(font_index).toPixels(font_units);
+        }
+
+        pub fn ascent(self: Metrics, font_index: u16) f32 {
+            return self.entry(font_index).ascent;
+        }
+
+        pub fn height(self: Metrics, font_index: u16) f32 {
+            return self.entry(font_index).height;
+        }
+
+        pub fn gdefTable(self: Metrics, font_index: u16) ?[]const u8 {
+            return self.entry(font_index).parsed_font.tableData("GDEF".*);
+        }
+    };
+
+    pub fn metrics(self: ShapedText, fallback: *Entry, state_gpa: std.mem.Allocator) Metrics {
+        return .{ .entries = self.entries, .fallback = fallback, .state_gpa = state_gpa };
+    }
+};
+
 
 /// Warns once per uncovered codepoint block (`codepoint >> 8`).
 fn logMissingCoverage(resolved: *ResolvedStack, gpa: std.mem.Allocator, codepoint: u21) void {
@@ -1198,6 +904,12 @@ fn initialMeasureWindow(resolved: *const ResolvedStack, mwidth: f32, newline_idx
     return @min(newline_idx, @max(16, @as(usize, @intFromFloat(estimate))));
 }
 
+/// A measured line and the shape it was measured from.
+pub const MeasureResult = struct {
+    size: Size,
+    shaped: ShapedText,
+};
+
 pub fn textSizeRawShaped(
     self: *Cache,
     output: std.mem.Allocator,
@@ -1206,7 +918,7 @@ pub fn textSizeRawShaped(
     text: []const u8,
     opts: Font.TextSizeOptions,
     style: Font.ShapeStyle,
-) std.mem.Allocator.Error!Entry.MeasureResult {
+) std.mem.Allocator.Error!MeasureResult {
     const mwidth = opts.max_width orelse dvui.max_float_safe;
     const snap = if (dvui.current_window) |cw| cw.snap_to_pixels else true;
     // Materialized before shaping: every line's height starts from the
@@ -1222,8 +934,9 @@ pub fn textSizeRawShaped(
     var window: usize = if (opts.max_width != null and opts.item == null) initialMeasureWindow(resolved, mwidth, newline_idx) else newline_idx;
 
     while (true) {
-        var line = try self.shapeLineText(output, state_gpa, resolved, text[0..window], opts.item, opts.base_direction, style);
-        errdefer line.deinit();
+        var shaped = try self.shapeLineText(output, state_gpa, resolved, text[0..window], opts.item, opts.base_direction, style);
+        errdefer shaped.deinit();
+        const line = &shaped.line;
 
         // Refetched after shapeLineText, not hoisted above the loop:
         // shapeLineText can insert into self.cache while lazily
@@ -1242,7 +955,7 @@ pub fn textSizeRawShaped(
         var nearest_break = false;
 
         for (line.buffer.info.items, line.buffer.pos.items, 0..) |info, pos, gidx| {
-            const fce = line.entryForGlyph(fallback_entry orelse break, gidx);
+            const fce = shaped.entryForGlyph(fallback_entry orelse break, gidx);
             const gi = try fce.glyphInfoGet(state_gpa, info.codepoint);
             const off_x = fce.toPixels(pos.x_offset);
             const adv = fce.toPixels(pos.x_advance);
@@ -1283,9 +996,9 @@ pub fn textSizeRawShaped(
             // from the other end of the run.
             if (found_break and line.buffer.isRtl()) {
                 if (fallback_entry) |fe| {
-                    const fit = try fe.logicalPrefixForWidth(state_gpa, &line, mwidth, opts.end_metric, snap);
+                    const fit = try line.logicalPrefixForWidth(state_gpa, shaped.metrics(fe, state_gpa), mwidth, opts.end_metric, snap);
                     if (opts.end_idx) |endout| endout.* = fit.byte;
-                    return .{ .size = .{ .w = fit.w, .h = th }, .line = line };
+                    return .{ .size = .{ .w = fit.w, .h = th }, .shaped = shaped };
                 }
             }
             if (opts.end_idx) |endout| {
@@ -1295,13 +1008,14 @@ pub fn textSizeRawShaped(
                     if (hard_break) |hb| endout.* += hb.len;
                 }
             }
-            return .{ .size = .{ .w = tw, .h = th }, .line = line };
+            return .{ .size = .{ .w = tw, .h = th }, .shaped = shaped };
         }
 
-        line.deinit();
+        shaped.deinit();
         window = @min(newline_idx, window * 4);
     }
 }
+
 
 pub const Entry = struct {
     name: []const u8, // gpa
@@ -1334,7 +1048,7 @@ pub const Entry = struct {
     /// enough that a typical page rarely needs more than a few rows.
     const initial_atlas_width: u32 = 512;
 
-    const GlyphInfo = struct {
+    pub const GlyphInfo = struct {
         leftBearing: f32, // pen x to glyph left
         topBearing: f32, // pen y to glyph top
         w: f32, // bounding box width
@@ -1773,206 +1487,6 @@ pub const Entry = struct {
         return gi;
     }
 
-    pub const ShapedLine = struct {
-        allocator: std.mem.Allocator,
-        codepoints: []u21,
-        /// Byte offset of each codepoint, plus trailing end offset.
-        byte_offsets: []u32,
-        buffer: Buffer,
-        /// Used cluster starts/ends (byte offset ranges).
-        cluster_starts: []u32,
-        cluster_ends: []u32,
-        /// Glyph ranges per Entry; built by shapeLineText.
-        segments: []EntrySegment = &.{},
-
-        pub const EntrySegment = struct { entry: *Entry, glyph_start: u32, glyph_end: u32 };
-
-        pub fn deinit(self: *ShapedLine) void {
-            self.buffer.deinit();
-            self.allocator.free(self.codepoints);
-            self.allocator.free(self.byte_offsets);
-            self.allocator.free(self.cluster_starts);
-            self.allocator.free(self.cluster_ends);
-            self.allocator.free(self.segments);
-        }
-
-        /// Entry that shaped glyph at index; fallback for non-stack lines.
-        pub fn entryForGlyph(self: ShapedLine, fallback: *Entry, glyph_idx: usize) *Entry {
-            for (self.segments) |seg| {
-                if (glyph_idx >= seg.glyph_start and glyph_idx < seg.glyph_end) return seg.entry;
-            }
-            return fallback;
-        }
-
-        /// Byte range of cluster at glyph_idx; correct in RTL runs.
-        pub fn clusterByteRange(self: ShapedLine, glyph_idx: usize) Buffer.ByteRange {
-            return self.buffer.clusterByteRange(self.cluster_starts, self.cluster_ends, self.byte_offsets, glyph_idx);
-        }
-
-        /// Byte offset after first glyph_count glyphs; visual order, not logical.
-        pub fn byteOffsetForGlyph(self: ShapedLine, glyph_count: usize) usize {
-            return self.buffer.byteOffsetForGlyph(self.byte_offsets, glyph_count);
-        }
-
-        /// Inverse of byteOffsetForGlyph; slice shape at byte boundary without reshaping.
-        pub fn glyphLimitForByteOffset(self: ShapedLine, byte_offset: usize) usize {
-            return self.buffer.glyphLimitForByteOffset(self.byte_offsets, byte_offset);
-        }
-
-        /// Glyphs of the logical byte prefix [0, byte_offset); RTL-correct.
-        pub fn logicalPrefixGlyphs(self: ShapedLine, byte_offset: usize) Buffer.GlyphRange {
-            return self.buffer.logicalPrefixGlyphs(self.byte_offsets, byte_offset);
-        }
-
-        /// Reads right to left, so a logical prefix sits at its right edge.
-        pub fn isRtl(self: ShapedLine) bool {
-            return self.buffer.isRtl();
-        }
-
-        /// Both directions in one shape: no logical prefix of it covers a
-        /// contiguous stretch of the line, so measuring or slicing one by
-        /// byte offset is meaningless whichever end you count from.
-        pub fn isMixedDirection(self: ShapedLine) bool {
-            var saw_forward = false;
-            var saw_back = false;
-            var prev: ?u32 = null;
-            for (self.buffer.info.items) |info| {
-                if (prev) |p| {
-                    if (info.cluster > p) saw_forward = true;
-                    if (info.cluster < p) saw_back = true;
-                }
-                prev = info.cluster;
-            }
-            return saw_forward and saw_back;
-        }
-    };
-
-    /// Decode text to first newline into codepoints + byte offsets.
-    fn decodeLine(gpa: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error!struct { codepoints: []u21, byte_offsets: []u32 } {
-        var codepoints: std.ArrayList(u21) = .empty;
-        errdefer codepoints.deinit(gpa);
-        var byte_offsets: std.ArrayList(u32) = .empty;
-        errdefer byte_offsets.deinit(gpa);
-        // Upper-bound presize (codepoints/offsets <= byte count) avoids
-        // per-append growth reallocations for every shaped line.
-        try codepoints.ensureTotalCapacityPrecise(gpa, text.len);
-        try byte_offsets.ensureTotalCapacityPrecise(gpa, text.len + 1);
-
-        const hard_break_at = if (firstHardBreak(text)) |hb| hb.start else text.len;
-        var i: usize = 0;
-        while (i < text.len) {
-            if (i >= hard_break_at) break;
-            const cplen = std.unicode.utf8ByteSequenceLength(text[i]) catch break;
-            if (i + cplen > text.len) break;
-            const cp = std.unicode.utf8Decode(text[i..][0..cplen]) catch break;
-            try byte_offsets.append(gpa, @intCast(i));
-            try codepoints.append(gpa, cp);
-            i += cplen;
-        }
-        try byte_offsets.append(gpa, @intCast(i));
-
-        const cp_slice = try codepoints.toOwnedSlice(gpa);
-        errdefer gpa.free(cp_slice);
-        const off_slice = try byte_offsets.toOwnedSlice(gpa);
-        errdefer gpa.free(off_slice);
-        return .{ .codepoints = cp_slice, .byte_offsets = off_slice };
-    }
-
-    pub const MeasureResult = struct {
-        size: Size,
-        line: ShapedLine,
-    };
-
-    /// Size of the logical byte prefix [0, byte_offset) of an already
-    /// shaped line; no reshaping. In an RTL run that prefix is the
-    /// buffer's trailing glyphs, not its leading ones.
-    pub fn measureLogicalPrefix(self: *Entry, state_gpa: std.mem.Allocator, line: *const ShapedLine, byte_offset: usize, snap: bool) std.mem.Allocator.Error!Size {
-        const r = line.logicalPrefixGlyphs(byte_offset);
-        // Per-glyph entry, not opentype.measureGlyphRange: an RTL run
-        // from a fallback font must measure against that font's metrics.
-        var x: f32 = 0;
-        var minx: f32 = 0;
-        var maxx: f32 = 0;
-        var miny: f32 = 0;
-        var maxy: f32 = self.height;
-        for (line.buffer.info.items[r.start..r.end], line.buffer.pos.items[r.start..r.end], r.start..) |info, pos, gidx| {
-            const entry = line.entryForGlyph(self, gidx);
-            const gi = try entry.glyphInfoGet(state_gpa, info.codepoint);
-            const off_x = entry.toPixels(pos.x_offset);
-            const adv = entry.toPixels(pos.x_advance);
-            const adv_used = if (snap) @round(adv) else adv;
-            minx = @min(minx, x + off_x + gi.leftBearing);
-            maxx = @max(maxx, x + off_x + gi.leftBearing + gi.w);
-            maxx = @max(maxx, x + adv_used);
-            miny = @min(miny, entry.ascent - gi.topBearing);
-            maxy = @max(maxy, entry.ascent - gi.topBearing + gi.h);
-            x += adv_used;
-        }
-        return .{ .w = maxx - minx, .h = maxy - miny };
-    }
-
-    pub const PrefixFit = struct { byte: usize, w: f32 };
-
-    /// Longest logical byte prefix of `line` that fits `mwidth` (device
-    /// pixels), and its width: the inverse of `measureLogicalPrefix`, and
-    /// exact in both directions because it is found by measuring through
-    /// that same call at each cluster boundary.
-    pub fn logicalPrefixForWidth(self: *Entry, state_gpa: std.mem.Allocator, line: *const ShapedLine, mwidth: f32, end_metric: Font.EndMetric, snap: bool) std.mem.Allocator.Error!PrefixFit {
-        var best: PrefixFit = .{ .byte = 0, .w = 0 };
-        // ponytail: re-measures from the run's logical start per candidate
-        // (quadratic in glyphs), which a fragment-sized run never notices;
-        // make it incremental if whole-paragraph lines ever come through.
-        for (line.cluster_ends) |boundary| {
-            const w = (try self.measureLogicalPrefix(state_gpa, line, boundary, snap)).w;
-            if (w > mwidth) {
-                if (end_metric == .nearest and w - mwidth < mwidth - best.w) return .{ .byte = boundary, .w = w };
-                return best;
-            }
-            best = .{ .byte = boundary, .w = w };
-        }
-        return best;
-    }
-
-    /// Pen x, in device pixels from the run's left edge, of a caret
-    /// sitting after `byte_offset` logical bytes -- advances only.
-    /// `measureLogicalPrefix` answers an ink bounding box, whose
-    /// per-glyph side bearings and overhang make it non-additive: a
-    /// caret placed from it drifts off the pen positions `renderText`
-    /// actually draws the glyphs at, by a different amount per prefix.
-    pub fn caretPenOffset(self: *Entry, line: *const ShapedLine, byte_offset: usize, snap: bool) f32 {
-        const spot = line.buffer.caretSpot(line.byte_offsets, line.codepoints, byte_offset);
-        var x: f32 = 0;
-        var cluster_w: f32 = 0;
-        for (line.buffer.pos.items[0..spot.glyph_end], 0..) |pos, gidx| {
-            const adv = line.entryForGlyph(self, gidx).toPixels(pos.x_advance);
-            const used = if (snap) @round(adv) else adv;
-            if (gidx < spot.glyph_start) x += used else cluster_w += used;
-        }
-        if (spot.glyph_end == spot.glyph_start) return x;
-        const gdef = line.entryForGlyph(self, spot.glyph_start).parsed_font.tableData("GDEF".*);
-        return x + cluster_w * line.buffer.caretFraction(spot, gdef);
-    }
-
-    /// Inverse of `caretPenOffset`: the caret stop nearest pen x, one
-    /// per grapheme. Pen offsets run backwards through an RTL run's
-    /// text, so this picks by distance rather than walking until a
-    /// width is exceeded.
-    /// ponytail: quadratic in glyphs, same as `logicalPrefixForWidth`;
-    /// one click, one fragment-sized run.
-    pub fn byteAtPenOffset(self: *Entry, line: *const ShapedLine, x: f32, snap: bool) usize {
-        var best: usize = 0;
-        var best_d: f32 = @abs(self.caretPenOffset(line, 0, snap) - x);
-        var graphemes = opentype.unicode.GraphemeBreakIterator.init(line.codepoints);
-        while (graphemes.next()) |_| {
-            const boundary = line.byte_offsets[graphemes.pos];
-            const d = @abs(self.caretPenOffset(line, boundary, snap) - x);
-            if (d < best_d) {
-                best_d = d;
-                best = boundary;
-            }
-        }
-        return best;
-    }
 };
 test "Cache.buildCoverage: earlier stack entries win overlapping coverage" {
     const gpa = std.testing.allocator;
@@ -2033,21 +1547,21 @@ test "Cache.shapeLineText: mixed-script text splits glyphs by stack entry" {
     const korean_entry = cw.fonts.stackEntry(resolved, 1).?;
     try std.testing.expect(latin_entry != korean_entry);
 
-    try std.testing.expectEqual(@as(usize, 3), line.segments.len);
-    try std.testing.expectEqual(latin_entry, line.segments[0].entry);
-    try std.testing.expectEqual(korean_entry, line.segments[1].entry);
-    try std.testing.expectEqual(latin_entry, line.segments[2].entry);
+    try std.testing.expectEqual(@as(usize, 3), line.line.segments.len);
+    try std.testing.expectEqual(latin_entry, line.entries[line.line.segments[0].font_index]);
+    try std.testing.expectEqual(korean_entry, line.entries[line.line.segments[1].font_index]);
+    try std.testing.expectEqual(latin_entry, line.entries[line.line.segments[2].font_index]);
 
-    try std.testing.expectEqual(@as(u32, 0), line.segments[0].glyph_start);
-    try std.testing.expectEqual(line.segments[1].glyph_start, line.segments[0].glyph_end);
-    try std.testing.expectEqual(line.segments[2].glyph_start, line.segments[1].glyph_end);
-    try std.testing.expectEqual(@as(u32, @intCast(line.buffer.info.items.len)), line.segments[2].glyph_end);
+    try std.testing.expectEqual(@as(u32, 0), line.line.segments[0].glyph_start);
+    try std.testing.expectEqual(line.line.segments[1].glyph_start, line.line.segments[0].glyph_end);
+    try std.testing.expectEqual(line.line.segments[2].glyph_start, line.line.segments[1].glyph_end);
+    try std.testing.expectEqual(@as(u32, @intCast(line.line.buffer.info.items.len)), line.line.segments[2].glyph_end);
 
-    for (0..line.buffer.info.items.len) |gidx| {
+    for (0..line.line.buffer.info.items.len) |gidx| {
         const expected = line.entryForGlyph(latin_entry, gidx);
-        if (gidx < line.segments[0].glyph_end) {
+        if (gidx < line.line.segments[0].glyph_end) {
             try std.testing.expectEqual(latin_entry, expected);
-        } else if (gidx < line.segments[1].glyph_end) {
+        } else if (gidx < line.line.segments[1].glyph_end) {
             try std.testing.expectEqual(korean_entry, expected);
         } else {
             try std.testing.expectEqual(latin_entry, expected);
@@ -2170,37 +1684,12 @@ test "Cache.resolveStack: a diamond of aliases keeps each family once, first pos
     try std.testing.expectEqualStrings("TestKorean", resolved.family_fonts[1].familyName());
 }
 
-test "Cache.shapeLineText: shaped_line_cache stays within its byte budget under distinct-slice churn" {
-    var t = try dvui.testing.init(.{});
-    defer t.deinit();
-
-    try dvui.addFont("TestLatin", Source.fallback.bytes, null);
-    const cw = dvui.currentWindow();
-    const resolved = try cw.fonts.resolveStack(cw.gpa, Font.init("TestLatin"));
-
-    // Every slice is a distinct cache key, the way a reflowing TextLayout or
-    // the bidi retreat loop mints one per candidate prefix.
-    const text = try std.testing.allocator.alloc(u8, 32 * 1024);
-    defer std.testing.allocator.free(text);
-    @memset(text, 'a');
-    const lines_to_overflow = Cache.max_shaped_line_bytes / (text.len * @sizeOf(Cache.CachedShapedLine.Glyph)) + 4;
-    var peak_count: usize = 0;
-    for (0..lines_to_overflow) |i| {
-        _ = try std.fmt.bufPrint(text, "slice-{d}-", .{i});
-        var line = try cw.fonts.shapeLineText(std.testing.allocator, cw.gpa, resolved, text, null, .auto, .{});
-        line.deinit();
-        try std.testing.expect(cw.fonts.shaped_line_bytes <= Cache.max_shaped_line_bytes);
-        peak_count = @max(peak_count, cw.fonts.shaped_line_cache.count());
-    }
-    try std.testing.expect(cw.fonts.shaped_line_cache.count() < peak_count);
-}
-
-fn expectSameShapedLine(expected: Cache.Entry.ShapedLine, actual: Cache.Entry.ShapedLine) !void {
+fn expectSameShapedLine(expected: Cache.ShapedLine, actual: Cache.ShapedLine) !void {
     try std.testing.expectEqualSlices(u21, expected.codepoints, actual.codepoints);
     try std.testing.expectEqualSlices(u32, expected.byte_offsets, actual.byte_offsets);
     try std.testing.expectEqualSlices(u32, expected.cluster_starts, actual.cluster_starts);
     try std.testing.expectEqualSlices(u32, expected.cluster_ends, actual.cluster_ends);
-    try std.testing.expectEqualSlices(Cache.Entry.ShapedLine.EntrySegment, expected.segments, actual.segments);
+    try std.testing.expectEqualSlices(Cache.ShapedLine.Segment, expected.segments, actual.segments);
     try std.testing.expectEqual(expected.buffer.have_positions, actual.buffer.have_positions);
     try std.testing.expectEqual(expected.buffer.info.items.len, actual.buffer.info.items.len);
     for (expected.buffer.info.items, actual.buffer.info.items, expected.buffer.pos.items, actual.buffer.pos.items) |ei, ai, ep, ap| {
@@ -2235,79 +1724,12 @@ test "Cache.shapeLineText: a shaped_line_cache hit matches the fresh shape" {
     for (cases) |case| {
         var fresh = try cw.fonts.shapeLineText(gpa, cw.gpa, resolved, case.text, case.item, case.direction, case.style);
         defer fresh.deinit();
-        const count = cw.fonts.shaped_line_cache.count();
+        const count = cw.fonts.line_cache.count();
         var hit = try cw.fonts.shapeLineText(gpa, cw.gpa, resolved, case.text, case.item, case.direction, case.style);
         defer hit.deinit();
-        try std.testing.expectEqual(count, cw.fonts.shaped_line_cache.count());
-        try expectSameShapedLine(fresh, hit);
+        try std.testing.expectEqual(count, cw.fonts.line_cache.count());
+        try expectSameShapedLine(fresh.line, hit.line);
     }
-}
-
-test "Cache.shapeLineText: a cached key owns its text and features" {
-    var t = try dvui.testing.init(.{});
-    defer t.deinit();
-    const gpa = std.testing.allocator;
-
-    try dvui.addFont("TestLatin", Source.fallback.bytes, null);
-    const cw = dvui.currentWindow();
-    const resolved = try cw.fonts.resolveStack(cw.gpa, Font.init("TestLatin"));
-
-    const text = try gpa.dupe(u8, "office fifty");
-    defer gpa.free(text);
-    const features = try gpa.dupe(Font.Feature, &.{.{ .tag = "liga".*, .value = 0 }});
-    defer gpa.free(features);
-    var fresh = try cw.fonts.shapeLineText(gpa, cw.gpa, resolved, text, null, .auto, .{ .features = features });
-    defer fresh.deinit();
-    const count = cw.fonts.shaped_line_cache.count();
-
-    @memset(text, 'x');
-    features[0] = .{ .tag = "kern".*, .value = 1 };
-    const no_liga = [_]Font.Feature{.{ .tag = "liga".*, .value = 0 }};
-    var hit = try cw.fonts.shapeLineText(gpa, cw.gpa, resolved, "office fifty", null, .auto, .{ .features = &no_liga });
-    defer hit.deinit();
-    try std.testing.expectEqual(count, cw.fonts.shaped_line_cache.count());
-    try expectSameShapedLine(fresh, hit);
-}
-
-test "Cache.ShapedLineKey: every field takes part in equality" {
-    const Key = Cache.ShapedLineKey;
-    const ctx: Key.Context = .{};
-    const liga = [_]Font.Feature{.{ .tag = "liga".*, .value = 0 }};
-    const base: Key = .{ .font_key = .{ .bytes = @splat(1) }, .text = "text", .item = null, .base_direction = .auto, .features = &.{}, .tab = null };
-    try std.testing.expect(ctx.eql(base, base));
-    const variants = [_]Key{
-        blk: {
-            var k = base;
-            k.font_key.bytes[0] = 2;
-            break :blk k;
-        },
-        blk: {
-            var k = base;
-            k.text = "texu";
-            break :blk k;
-        },
-        blk: {
-            var k = base;
-            k.item = .{ .start = 0, .end = 4 };
-            break :blk k;
-        },
-        blk: {
-            var k = base;
-            k.base_direction = .rtl;
-            break :blk k;
-        },
-        blk: {
-            var k = base;
-            k.features = &liga;
-            break :blk k;
-        },
-        blk: {
-            var k = base;
-            k.tab = .{ .size = 8, .origin_bits = 0 };
-            break :blk k;
-        },
-    };
-    for (variants) |variant| try std.testing.expect(!ctx.eql(base, variant));
 }
 
 test "Cache.shapeLineText: a shaped_line_cache hit reshapes instead of dropping segments when a fallback font was evicted by reset()" {
@@ -2325,7 +1747,7 @@ test "Cache.shapeLineText: a shaped_line_cache hit reshapes instead of dropping 
 
     var line = try cw.fonts.shapeLineText(std.testing.allocator, cw.gpa, resolved, text, null, .auto, .{});
     defer line.deinit();
-    try std.testing.expectEqual(@as(usize, 3), line.segments.len);
+    try std.testing.expectEqual(@as(usize, 3), line.line.segments.len);
     const korean_key = resolved.entry_keys[1];
 
     // Simulate the Korean fragment scrolling out of view: nothing touches
@@ -2344,10 +1766,10 @@ test "Cache.shapeLineText: a shaped_line_cache hit reshapes instead of dropping 
     // Korean segment and leave the caller thinking it's Latin-only.
     var line2 = try cw.fonts.shapeLineText(std.testing.allocator, cw.gpa, resolved, text, null, .auto, .{});
     defer line2.deinit();
-    try std.testing.expectEqual(@as(usize, 3), line2.segments.len);
+    try std.testing.expectEqual(@as(usize, 3), line2.line.segments.len);
 
     const korean_entry_after = cw.fonts.stackEntry(resolved, 1).?;
-    try std.testing.expectEqual(korean_entry_after, line2.segments[1].entry);
+    try std.testing.expectEqual(korean_entry_after, line2.entries[line2.line.segments[1].font_index]);
 }
 
 test "Cache.reset: evicts resolved stacks for sizes no longer used" {
@@ -2387,11 +1809,11 @@ test "Cache.reset: evicts shaped lines unused for a frame" {
     const resolved = try cw.fonts.resolveStack(cw.gpa, Font.init("Vera"));
     var line = try cw.fonts.shapeLineText(std.testing.allocator, cw.gpa, resolved, "abc", null, .auto, .{});
     line.deinit();
-    try std.testing.expectEqual(@as(usize, 1), cw.fonts.shaped_line_cache.count());
+    try std.testing.expectEqual(@as(usize, 1), cw.fonts.line_cache.count());
     cw.fonts.reset(cw.gpa, cw.backend);
     cw.fonts.reset(cw.gpa, cw.backend);
-    try std.testing.expectEqual(@as(usize, 0), cw.fonts.shaped_line_cache.count());
-    try std.testing.expectEqual(@as(usize, 0), cw.fonts.shaped_line_bytes);
+    try std.testing.expectEqual(@as(usize, 0), cw.fonts.line_cache.count());
+    try std.testing.expectEqual(@as(usize, 0), cw.fonts.line_cache.bytes);
 }
 
 test "Cache.reset: clears an atlas grown past max_atlas_height" {
@@ -2472,10 +1894,11 @@ test "Cache.loadDynamicFallback: rejects a discovered font with no rasterizable 
     var line = try cw.fonts.shapeLineText(gpa, gpa, resolved, text, null, .auto, .{});
     defer line.deinit();
 
-    for (line.segments) |seg| {
-        const has_outlines = seg.entry.parsed_font.tableData(.{ 'g', 'l', 'y', 'f' }) != null or
-            seg.entry.parsed_font.tableData(.{ 'C', 'F', 'F', ' ' }) != null or
-            seg.entry.parsed_font.tableData(.{ 'C', 'F', 'F', '2' }) != null;
+    for (line.line.segments) |seg| {
+        const entry = line.entries[seg.font_index];
+        const has_outlines = entry.parsed_font.tableData(.{ 'g', 'l', 'y', 'f' }) != null or
+            entry.parsed_font.tableData(.{ 'C', 'F', 'F', ' ' }) != null or
+            entry.parsed_font.tableData(.{ 'C', 'F', 'F', '2' }) != null;
         try std.testing.expect(has_outlines);
     }
 }
@@ -2506,7 +1929,7 @@ test "Cache.shapeLineText: emoji next to CJK gets its own dynamic-fallback font,
     var line = try cw.fonts.shapeLineText(gpa, gpa, resolved, text, null, .auto, .{});
     defer line.deinit();
 
-    if (line.segments.len < 2) return error.SkipZigTest; // no dynamic fallback available in this environment
+    if (line.line.segments.len < 2) return error.SkipZigTest; // no dynamic fallback available in this environment
 
     // Only glyphs actually shaped against a dynamically-discovered fallback
     // font must be non-notdef -- a CJK codepoint can legitimately have no
@@ -2515,7 +1938,7 @@ test "Cache.shapeLineText: emoji next to CJK gets its own dynamic-fallback font,
     // falls back to the primary font's .notdef, which is correct, not a
     // regression.
     const primary = cw.fonts.stackEntry(resolved, 0).?;
-    for (line.buffer.info.items, 0..) |info, gidx| {
+    for (line.line.buffer.info.items, 0..) |info, gidx| {
         if (line.entryForGlyph(primary, gidx) == primary) continue;
         try std.testing.expect(info.codepoint != 0); // no glyph should be .notdef
     }
@@ -2555,5 +1978,5 @@ test "Cache web fallback: a missing codepoint is requested once and resolves to 
     cw.fonts.webFallbackLoaded(cw.gpa, font, try cw.gpa.dupe(u8, @embedFile("../fonts/NotoSansKR-Regular.ttf")));
     const arrived = cw.fonts.webFallbackFont(cw.gpa, 0xAC00).?;
     try std.testing.expect(cw.fonts.findSource(arrived).@"0" != null);
-    try std.testing.expectEqual(@as(usize, 0), cw.fonts.shaped_line_cache.count());
+    try std.testing.expectEqual(@as(usize, 0), cw.fonts.line_cache.count());
 }

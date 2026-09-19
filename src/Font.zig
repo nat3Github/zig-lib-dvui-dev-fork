@@ -620,7 +620,7 @@ pub fn sizeM(self: Font, wide: f32, tall: f32) Size {
 
     if (resolved.m_size == null) {
         var result = cw.fonts.textSizeRawShaped(cw.arena(), cw.gpa, resolved, "M", .{}, .{}) catch return .{ .w = 10, .h = 10 };
-        result.line.deinit();
+        result.shaped.deinit();
         resolved.m_size = result.size;
     }
 
@@ -754,25 +754,41 @@ pub fn textSizeEx(self: Font, text: []const u8, opts: TextSizeOptions) Size {
 /// Shape reusable across text measurement and rendering without reshaping.
 pub const ShapedText = struct {
     fallback: *Cache.Entry,
-    line: Cache.Entry.ShapedLine,
+    line: Cache.ShapedLine,
+    /// `entries[segment.font_index]` shaped that glyph range; allocated
+    /// from the same allocator as `line`.
+    entries: []*Cache.Entry,
     ss: f32,
     ascent: f32,
 
     pub fn deinit(self: *ShapedText) void {
-        self.line.deinit();
+        var shaped: Cache.ShapedText = .{ .line = self.line, .entries = self.entries };
+        shaped.deinit();
+    }
+
+    /// Entry that shaped the glyph at `glyph_idx`.
+    pub fn entryForGlyph(self: *const ShapedText, glyph_idx: usize) *Cache.Entry {
+        const font_index = self.line.fontIndexForGlyph(glyph_idx);
+        if (font_index >= self.entries.len) return self.fallback;
+        return self.entries[font_index];
+    }
+
+    /// Glyph metrics by font index, which is how `opentype` asks for them.
+    fn metrics(self: *const ShapedText, state_gpa: std.mem.Allocator) Cache.ShapedText.Metrics {
+        return .{ .entries = self.entries, .fallback = self.fallback, .state_gpa = state_gpa };
     }
 
     pub fn measureUpToByteOffset(self: *ShapedText, state_gpa: std.mem.Allocator, byte_offset: usize) std.mem.Allocator.Error!Size {
         const snap = if (dvui.current_window) |cw| cw.snap_to_pixels else true;
-        const s = try self.fallback.measureLogicalPrefix(state_gpa, &self.line, byte_offset, snap);
-        return s.scale(1.0 / self.ss, Size);
+        const s = try self.line.measureLogicalPrefix(state_gpa, self.metrics(state_gpa), byte_offset, snap);
+        return (Size{ .w = s.w, .h = s.h }).scale(1.0 / self.ss, Size);
     }
 
     /// Inverse of `measureUpToByteOffset`: which byte a caret dragged `width`
     /// along the run's logical direction lands on.
     pub fn byteOffsetForWidth(self: *ShapedText, state_gpa: std.mem.Allocator, width: f32, end_metric: Font.EndMetric) std.mem.Allocator.Error!usize {
         const snap = if (dvui.current_window) |cw| cw.snap_to_pixels else true;
-        const fit = try self.fallback.logicalPrefixForWidth(state_gpa, &self.line, width * self.ss, end_metric, snap);
+        const fit = try self.line.logicalPrefixForWidth(state_gpa, self.metrics(state_gpa), width * self.ss, end_metric, snap);
         return fit.byte;
     }
 
@@ -781,13 +797,13 @@ pub const ShapedText = struct {
     /// width, and ink is not where the pen is.
     pub fn caretOffset(self: *ShapedText, byte_offset: usize) f32 {
         const snap = if (dvui.current_window) |cw| cw.snap_to_pixels else true;
-        return self.fallback.caretPenOffset(&self.line, byte_offset, snap) / self.ss;
+        return self.line.caretPenOffset(self.metrics(dvui.currentWindow().gpa), byte_offset, snap) / self.ss;
     }
 
     /// Inverse of `caretOffset`.
     pub fn byteAtOffset(self: *ShapedText, x: f32) usize {
         const snap = if (dvui.current_window) |cw| cw.snap_to_pixels else true;
-        return self.fallback.byteAtPenOffset(&self.line, x * self.ss, snap);
+        return self.line.byteAtPenOffset(self.metrics(dvui.currentWindow().gpa), x * self.ss, snap);
     }
 };
 
@@ -818,7 +834,7 @@ pub fn textSizeExShaped(self: Font, state_gpa: std.mem.Allocator, output: std.me
     // materializing fallback-family entries -- that can grow/rehash the map
     // and invalidate any *Entry captured beforehand.
     const fallback_entry = cw.fonts.primaryEntry(state_gpa, resolved) catch {
-        result.line.deinit();
+        result.shaped.deinit();
         return null;
     };
 
@@ -830,7 +846,7 @@ pub fn textSizeExShaped(self: Font, state_gpa: std.mem.Allocator, output: std.me
 
     return .{
         .size = result.size.scale(1.0 / ss, Size),
-        .shaped = .{ .fallback = fallback_entry, .line = result.line, .ss = ss, .ascent = ascent },
+        .shaped = .{ .fallback = fallback_entry, .line = result.shaped.line, .entries = result.shaped.entries, .ss = ss, .ascent = ascent },
     };
 }
 
@@ -851,8 +867,8 @@ test "tab stops: a tab reaches the next multiple of tab_size spaces from the lin
 
     var space = try cw.fonts.shapeLineText(gpa, gpa, resolved, " ", null, .auto, .{});
     defer space.deinit();
-    const space_glyph = space.buffer.info.items[0].codepoint;
-    const space_px = entry.toPixels(space.buffer.pos.items[0].x_advance);
+    const space_glyph = space.line.buffer.info.items[0].codepoint;
+    const space_px = entry.toPixels(space.line.buffer.pos.items[0].x_advance);
 
     const cases = [_]struct { text: []const u8, origin: f32, stop: f32 }{
         .{ .text = "\tb", .origin = 0, .stop = 4 },
@@ -865,8 +881,8 @@ test "tab stops: a tab reaches the next multiple of tab_size spaces from the lin
         var line = try cw.fonts.shapeLineText(gpa, gpa, resolved, c.text, null, .auto, .{ .tab_size = 4, .tab_origin = c.origin });
         defer line.deinit();
         const tab = std.mem.indexOfScalar(u8, c.text, '\t').?;
-        try std.testing.expectEqual(space_glyph, line.buffer.info.items[tab].codepoint);
-        try std.testing.expectApproxEqAbs(c.stop * space_px - c.origin, entry.caretPenOffset(&line, c.text.len - 1, false), 1);
+        try std.testing.expectEqual(space_glyph, line.line.buffer.info.items[tab].codepoint);
+        try std.testing.expectApproxEqAbs(c.stop * space_px - c.origin, line.line.caretPenOffset(line.metrics(entry, gpa), c.text.len - 1, false), 1);
     }
 }
 
@@ -885,8 +901,8 @@ test "features: liga off splits a ligature, tnum evens out digit advances" {
     const no_liga_font = aleo.withFeature("liga", false);
     var no_liga = try cw.fonts.shapeLineText(gpa, gpa, aleo_stack, "office", null, .auto, no_liga_font.shapeStyle(0));
     defer no_liga.deinit();
-    try std.testing.expectEqual(5, liga.buffer.info.items.len);
-    try std.testing.expectEqual(6, no_liga.buffer.info.items.len);
+    try std.testing.expectEqual(5, liga.line.buffer.info.items.len);
+    try std.testing.expectEqual(6, no_liga.line.buffer.info.items.len);
 
     const dys: Font = .find(.{ .family = "OpenDyslexic", .size = 24 });
     const dys_stack = try cw.fonts.resolveStack(cw.gpa, dys);
@@ -895,8 +911,8 @@ test "features: liga off splits a ligature, tnum evens out digit advances" {
     const tnum_font = dys.withFeature("tnum", true);
     var tabular = try cw.fonts.shapeLineText(gpa, gpa, dys_stack, "17", null, .auto, tnum_font.shapeStyle(0));
     defer tabular.deinit();
-    const p = proportional.buffer.pos.items;
-    const tn = tabular.buffer.pos.items;
+    const p = proportional.line.buffer.pos.items;
+    const tn = tabular.line.buffer.pos.items;
     try std.testing.expect(p[0].x_advance != p[1].x_advance);
     try std.testing.expectEqual(tn[0].x_advance, tn[1].x_advance);
 }
@@ -948,21 +964,21 @@ test "smoke: shape + measure + rasterize against embedded Vera.ttf" {
     var line = try cw.fonts.shapeLineText(gpa, gpa, resolved, "Hello, world! fi ffi", null, .auto, .{});
     defer line.deinit();
 
-    try std.testing.expect(line.buffer.info.items.len > 0);
-    std.debug.print("shaped {d} glyphs from {d} codepoints\n", .{ line.buffer.info.items.len, line.codepoints.len });
-    for (line.buffer.info.items) |info| {
+    try std.testing.expect(line.line.buffer.info.items.len > 0);
+    std.debug.print("shaped {d} glyphs from {d} codepoints\n", .{ line.line.buffer.info.items.len, line.line.codepoints.len });
+    for (line.line.buffer.info.items) |info| {
         try std.testing.expect(info.codepoint != 0);
     }
 
     var end_idx: usize = 0;
     var result = try cw.fonts.textSizeRawShaped(gpa, gpa, resolved, "Hello, world!", .{ .end_idx = &end_idx }, .{});
-    defer result.line.deinit();
+    defer result.shaped.deinit();
     std.debug.print("measured size w={d} h={d} end_idx={d}\n", .{ result.size.w, result.size.h, end_idx });
     try std.testing.expect(result.size.w > 0);
     try std.testing.expect(result.size.h > 0);
     try std.testing.expectEqual(@as(usize, "Hello, world!".len), end_idx);
 
-    const gi = try entry.glyphInfoGet(gpa, line.buffer.info.items[0].codepoint);
+    const gi = try entry.glyphInfoGet(gpa, line.line.buffer.info.items[0].codepoint);
     std.debug.print("glyph0 w={d} h={d} left={d} top={d} is_color={}\n", .{ gi.w, gi.h, gi.leftBearing, gi.topBearing, gi.is_color });
     try std.testing.expect(gi.w > 0);
     try std.testing.expect(gi.h > 0);
@@ -980,7 +996,7 @@ test "sizeM: memoized result matches a fresh textSizeRawShaped(\"M\") call" {
     const resolved = try cw.fonts.resolveStack(cw.gpa, font.withSize(font.size * ss));
 
     var reference = try cw.fonts.textSizeRawShaped(gpa, gpa, resolved, "M", .{}, .{});
-    defer reference.line.deinit();
+    defer reference.shaped.deinit();
 
     const expected = reference.size.scale(1.0 / ss, Size);
 
@@ -1006,21 +1022,21 @@ test "smoke: bidi/RTL text shapes without crashing" {
 
     var line = try cw.fonts.shapeLineText(gpa, gpa, resolved, "abc \u{0627}\u{0644}\u{0633}\u{0644}\u{0627}\u{0645} xyz", null, .auto, .{});
     defer line.deinit();
-    try std.testing.expect(line.buffer.info.items.len > 0);
+    try std.testing.expect(line.line.buffer.info.items.len > 0);
     // Latin around an Arabic run: the line holds both directions at once, so
     // no byte prefix of it is a contiguous stretch of the line and
     // `TextLayoutWidget` has to reshape each wrapped line's own byte-range.
-    try std.testing.expect(line.isMixedDirection());
+    try std.testing.expect(line.line.isMixedDirection());
 
     // One direction, either one, keeps the shape sliceable by byte offset.
     var ltr = try cw.fonts.shapeLineText(gpa, gpa, resolved, "Hello, world!", null, .auto, .{});
     defer ltr.deinit();
-    try std.testing.expect(!ltr.isMixedDirection());
-    try std.testing.expect(!ltr.isRtl());
+    try std.testing.expect(!ltr.line.isMixedDirection());
+    try std.testing.expect(!ltr.line.isRtl());
 
     var rtl = try cw.fonts.shapeLineText(gpa, gpa, resolved, "\u{05e9}\u{05dc}\u{05d5}\u{05dd}", null, .auto, .{});
     defer rtl.deinit();
-    try std.testing.expect(!rtl.isMixedDirection());
+    try std.testing.expect(!rtl.line.isMixedDirection());
 }
 
 test "an RTL run's logical prefix measures monotonically, and width maps back to it" {
@@ -1087,9 +1103,9 @@ test "measureLogicalPrefix: glyphs from a fallback font measure with that font's
 
     const text = "AB\u{AC00}\u{AC01}CD";
     var whole = try cw.fonts.textSizeRawShaped(std.testing.allocator, std.testing.allocator, resolved, text, .{}, .{});
-    defer whole.line.deinit();
+    defer whole.shaped.deinit();
     const latin_entry = cw.fonts.stackEntry(resolved, 0).?;
-    const prefix = try latin_entry.measureLogicalPrefix(std.testing.allocator, &whole.line, text.len, true);
+    const prefix = try whole.shaped.line.measureLogicalPrefix(std.testing.allocator, whole.shaped.metrics(latin_entry, std.testing.allocator), text.len, true);
     try std.testing.expectApproxEqAbs(whole.size.w, prefix.w, 0.01);
 }
 
@@ -1161,7 +1177,7 @@ test "caret pen offsets step one glyph at a time through an RTL run" {
         // Each step gives back exactly one glyph's advance -- the run's
         // rightmost, since an RTL prefix grows leftwards from there.
         const g = res.shaped.line.buffer.info.items.len - off / 2;
-        const entry = res.shaped.line.entryForGlyph(res.shaped.fallback, g);
+        const entry = res.shaped.entryForGlyph(g);
         const step = @round(entry.toPixels(res.shaped.line.buffer.pos.items[g].x_advance)) / res.shaped.ss;
         try std.testing.expectApproxEqAbs(step, prev - x, 0.01);
         try std.testing.expectEqual(off, res.shaped.byteAtOffset(x));
