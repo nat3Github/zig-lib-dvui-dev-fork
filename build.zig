@@ -37,7 +37,7 @@ const CommonSdl = struct {
 };
 
 fn addAndroidLibC(
-    mod: *std.Build.Module,
+    mod: anytype,
     opts: DvuiModuleOptions,
 ) void {
     if (opts.android_include_path) |include_path| {
@@ -52,6 +52,14 @@ fn addAndroidLibC(
 
         mod.addSystemIncludePath(include_path.path(opts.b, arch_specific_path));
         mod.addSystemIncludePath(include_path);
+        if (@TypeOf(mod) == *std.Build.Step.TranslateC) {
+            // aro can't parse bionic's nullability-on-array params or clang-only FORTIFY wrappers
+            mod.defineCMacro("_Nonnull", "");
+            mod.defineCMacro("_Nullable", "");
+            mod.defineCMacro("_Null_unspecified", "");
+            mod.defineCMacro("__clang_analyzer__", "1");
+            mod.defineCMacro("__ANDROID_MIN_SDK_VERSION__", opts.b.fmt("{d}", .{opts.target.result.os.version_range.linux.android}));
+        }
     } else {
         @panic("Can't build for android without android_include_path");
     }
@@ -77,13 +85,13 @@ pub fn linkSdl3(
         const cross_win_msvc = opts.target.result.os.tag == .windows and
             opts.target.result.abi == .msvc and
             opts.b.graph.host.result.os.tag != .windows;
-        // NOTE: iOS builds compile a static lib that Xcode's own linker (not zig) links
-        // together with this dependency's separately-built libSDL3.a. UBSan's runtime
+        // NOTE: iOS/Android builds compile a static lib that Xcode's/the NDK's own linker
+        // (not zig) links together with this dependency's separately-built libSDL3.a. UBSan's runtime
         // (__ubsan_handle_*) only gets bundled into the artifact zig itself produces as a
         // final binary, so a plain sanitize_c default (full in Debug) leaves libSDL3.a with
         // unresolved symbols at that link step. Every other target links through zig itself,
-        // which bundles ubsan into the one binary, so this is iOS-only.
-        const sdl3_sanitize_c: ?std.zig.SanitizeC = if (opts.target.result.os.tag == .ios) .off else null;
+        // which bundles ubsan into the one binary.
+        const sdl3_sanitize_c: ?std.zig.SanitizeC = if (opts.target.result.os.tag == .ios or opts.target.result.abi.isAndroid()) .off else null;
         const sdl3_dep = if (cross_win_msvc)
             opts.b.lazyDependency("sdl3", .{
                 .target = opts.target,
@@ -101,21 +109,23 @@ pub fn linkSdl3(
             opts.b.lazyDependency("sdl3", .{
                 .target = opts.target,
                 .optimize = opts.optimize,
-                .system_include_path = opts.sdl3_system_include_path,
+                .system_include_path = if (opts.target.result.abi.isAndroid()) opts.android_include_path else opts.sdl3_system_include_path,
+                // linked into the app's JNI shared lib
+                .pic = if (opts.target.result.abi.isAndroid()) true else null,
                 .system_framework_path = opts.sdl3_system_framework_path,
                 .library_path = opts.sdl3_library_path,
                 .sanitize_c = sdl3_sanitize_c,
             });
         if (sdl3_dep) |sdl3| {
+            sdl_translate_c.addIncludePath(sdl3.artifact("SDL3").getEmittedIncludeTree());
             if (opts.target.result.abi.isAndroid()) {
-                sdl_mod.addIncludePath(sdl3.artifact("SDL3").getEmittedIncludeTree());
                 addAndroidLibC(sdl_mod, opts);
-            } else {
-                sdl_translate_c.addIncludePath(sdl3.artifact("SDL3").getEmittedIncludeTree());
-                sdl_mod.linkLibrary(sdl3.artifact("SDL3"));
+                addAndroidLibC(sdl_translate_c, opts);
             }
-            if (opts.target.result.os.tag == .ios) {
-                // NOTE: published for installIosSdl3() below, so downstream doesn't need its own sdl3 dep.
+            sdl_mod.linkLibrary(sdl3.artifact("SDL3"));
+            if (opts.target.result.os.tag == .ios or opts.target.result.abi.isAndroid()) {
+                // NOTE: published for installIosSdl3() below / the android example's archive merge,
+                // so downstream doesn't need its own sdl3 dep.
                 opts.b.installArtifact(sdl3.artifact("SDL3"));
                 opts.b.addNamedLazyPath("sdl3_include", sdl3.path("include"));
             }
@@ -1351,6 +1361,7 @@ pub fn addDvuiModule(
         .link_libc = libc,
     });
     if (libc) dvui_translate_c.defineCMacro("DVUI_USE_LIBC", "1");
+    if (target.result.abi.isAndroid()) addAndroidLibC(dvui_translate_c, opts);
     // NOTE: iOS cross-compiles have no native sysroot, so dvui_mod (which directly compiles
     // C sources, e.g. vendor/stb/*.c below) needs libc headers like stdio.h passed explicitly.
     const dvui_mod_needs_ios_sysroot = target.result.os.tag == .ios;
@@ -1361,7 +1372,7 @@ pub fn addDvuiModule(
         .optimize = optimize,
         // NOTE: see sdl3_sanitize_c in linkSdl3 -- same ubsan-runtime-not-bundled issue for
         // the C sources this module compiles directly (e.g. vendor/stb/*.c below).
-        .sanitize_c = if (target.result.os.tag == .ios) .off else null,
+        .sanitize_c = if (target.result.os.tag == .ios or target.result.abi.isAndroid()) .off else null,
         .imports = &.{
             .{
                 .name = "dvui-c",
