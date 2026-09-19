@@ -294,7 +294,21 @@ pub fn format(self: *const Font, writer: *std.Io.Writer) !void {
 
 /// Fonts with equal keys use the same glyphs (same Font.Entry). Raw bytes,
 /// not a hash, so crafted family names can't collide two fonts onto one entry.
-pub const CacheKey = struct { bytes: [NAME_MAX_LEN + 3 * 4 + 1 + 1 + max_variations * 8]u8 };
+pub const CacheKey = struct {
+    bytes: [NAME_MAX_LEN + 3 * 4 + 1 + 1 + max_variations * 8]u8,
+
+    // Picked up by TrackingAutoHashMap in place of AutoContext, whose
+    // std.meta.eql compares these bytes one at a time.
+    pub const Context = struct {
+        pub fn hash(_: Context, key: CacheKey) u64 {
+            return std.hash.Wyhash.hash(0, &key.bytes);
+        }
+
+        pub fn eql(_: Context, a: CacheKey, b: CacheKey) bool {
+            return std.mem.eql(u8, &a.bytes, &b.bytes);
+        }
+    };
+};
 
 pub fn cacheKey(self: *const Font) CacheKey {
     var k: CacheKey = .{ .bytes = @splat(0) };
@@ -1219,7 +1233,7 @@ pub const Cache = struct {
         const list = self.family_aliases.get(font.familyName()) orelse {
             if (flattened.len == max_stack_families) return;
             const font_key = font.cacheKey();
-            for (flattened.slice()) |existing| if (std.meta.eql(existing.cacheKey(), font_key)) return;
+            for (flattened.slice()) |existing| if (std.mem.eql(u8, &existing.cacheKey().bytes, &font_key.bytes)) return;
             flattened.fonts[flattened.len] = font;
             flattened.len += 1;
             return;
@@ -1609,7 +1623,7 @@ pub const Cache = struct {
                     const dyn_key = dyn_font.cacheKey();
                     var already_added = false;
                     for (keys_list.items[static_fonts..]) |k| {
-                        if (std.meta.eql(k, dyn_key)) {
+                        if (std.mem.eql(u8, &k.bytes, &dyn_key.bytes)) {
                             already_added = true;
                             break;
                         }
@@ -1801,12 +1815,15 @@ pub const Cache = struct {
             }
 
             pub fn eql(_: Context, a: ShapedLineKey, b: ShapedLineKey) bool {
-                if (!std.meta.eql(a.font_key, b.font_key) or a.base_direction != b.base_direction) return false;
+                // Scalar fields first: the two byte-slice compares below are
+                // the expensive half, and most probes already differ here.
+                if (a.text.len != b.text.len or a.base_direction != b.base_direction) return false;
                 if (!std.meta.eql(a.item, b.item) or !std.meta.eql(a.tab, b.tab)) return false;
                 if (a.features.len != b.features.len) return false;
                 for (a.features, b.features) |fa, fb| {
                     if (!std.meta.eql(fa, fb)) return false;
                 }
+                if (!std.mem.eql(u8, &a.font_key.bytes, &b.font_key.bytes)) return false;
                 return std.mem.eql(u8, a.text, b.text);
             }
         };
@@ -1919,13 +1936,14 @@ pub const Cache = struct {
     /// (the caller reshapes from scratch rather than rendering with segments
     /// silently missing).
     fn materializeShapedLine(self: *Cache, gpa: std.mem.Allocator, cached: *const CachedShapedLine) std.mem.Allocator.Error!?Entry.ShapedLine {
-        for (cached.segments) |seg| {
-            if (self.cache.getPtr(seg.entry_key) == null) return null;
-        }
         const segments = try gpa.alloc(Entry.ShapedLine.EntrySegment, cached.segments.len);
         errdefer gpa.free(segments);
         for (segments, cached.segments) |*dst, seg| {
-            dst.* = .{ .entry = self.cache.getPtr(seg.entry_key).?.*, .glyph_start = seg.glyph_start, .glyph_end = seg.glyph_end };
+            const entry = self.cache.getPtr(seg.entry_key) orelse {
+                gpa.free(segments);
+                return null;
+            };
+            dst.* = .{ .entry = entry.*, .glyph_start = seg.glyph_start, .glyph_end = seg.glyph_end };
         }
 
         var buffer = Buffer.init(gpa);
@@ -3697,63 +3715,4 @@ test "caret stops inside a ligature sit at the font's GDEF caret" {
     try std.testing.expectApproxEqAbs((x2 - x0) * 300.0 / 601.0, x1 - x0, 0.01);
     try std.testing.expectEqual(@as(usize, 1), res.shaped.byteAtOffset(x1));
     try std.testing.expectEqual(@as(usize, 1), res.shaped.byteAtOffset(x1 + 1));
-}
-
-// TEMP repro (revert): the web target's emoji path end to end -- the web
-// fallback registers Noto Color Emoji, shaping must route U+1F600 to it, and
-// the glyph must measure as a non-empty colour bitmap rather than tofu.
-test "web emoji repro: a registered Noto Color Emoji covers U+1F600" {
-    if (!web_fallback_enabled) return error.SkipZigTest;
-    var t = try dvui.testing.init(.{});
-    defer t.deinit();
-    const gpa = std.testing.allocator;
-    const cw = dvui.currentWindow();
-    cw.fonts.web_fallback = .{};
-
-    try dvui.addFont("ReproLatin", Source.fallback.bytes, null);
-
-    // The emoji is uncovered by the Latin primary, so the first ask queues a
-    // fetch and renders tofu until the font arrives.
-    try std.testing.expect(cw.fonts.webFallbackFont(cw.gpa, 0x1F600) == null);
-    cw.fonts.processWebFallback(cw.gpa, gpa);
-    const service = &cw.fonts.web_fallback.?;
-    var pending: ?u16 = null;
-    for (service.font_states, 0..) |state, i| {
-        if (state == .pending and std.mem.startsWith(u8, service.set.fonts[i].name, "Noto Color Emoji")) {
-            pending = @intCast(i);
-            break;
-        }
-    }
-    const font_index = pending orelse {
-        std.debug.print("\nno Noto Color Emoji slice was requested for U+1F600\n", .{});
-        return error.TestUnexpectedResult;
-    };
-    std.debug.print("\nrequested slice: {s}\n", .{service.set.fonts[font_index].name});
-
-    cw.fonts.webFallbackLoaded(cw.gpa, font_index, try cw.gpa.dupe(u8, @embedFile("fonts/EmojiRepro.ttf")));
-
-    const arrived = cw.fonts.webFallbackFont(cw.gpa, 0x1F600) orelse {
-        std.debug.print("emoji font did not register after arriving (parse failed?)\n", .{});
-        return error.TestUnexpectedResult;
-    };
-    try std.testing.expect(cw.fonts.findSource(arrived).@"0" != null);
-
-    const font: Font = .find(.{ .family = "ReproLatin", .size = 20 });
-    const resolved = try cw.fonts.resolveStack(cw.gpa, font);
-    var line = try cw.fonts.shapeLineText(gpa, cw.gpa, resolved, "\u{1F600}", null, .auto, .{});
-    defer line.deinit();
-
-    const primary = try cw.fonts.primaryEntry(cw.gpa, resolved);
-    std.debug.print("glyphs shaped: {d}\n", .{line.buffer.info.items.len});
-    try std.testing.expect(line.buffer.info.items.len > 0);
-
-    for (line.buffer.info.items, 0..) |info, gidx| {
-        const entry = line.entryForGlyph(primary, gidx);
-        const gi = try entry.glyphInfoGet(cw.gpa, info.codepoint);
-        std.debug.print("glyph {d}: gid {d} entry {s} {d}x{d} is_color {}\n", .{ gidx, info.codepoint, entry.name, gi.w, gi.h, gi.is_color });
-        try std.testing.expect(entry != primary); // tofu would come from the primary
-        try std.testing.expect(info.codepoint != 0); // .notdef == tofu
-        try std.testing.expect(gi.w > 0 and gi.h > 0);
-        try std.testing.expect(gi.is_color);
-    }
 }
