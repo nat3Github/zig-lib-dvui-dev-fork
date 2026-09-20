@@ -26,52 +26,16 @@ pub const dvui_app: dvui.App = .{
     .deinitFn = appDeinit,
 };
 pub const main = dvui.App.main;
-// NOTE: this is a static lib (like the Android example), so zig's start.zig never runs and
-// never builds the std.process.Init dvui.App.main needs. main.c has the real C main()
-// and calls this exported symbol; hand-build the same minimal Init here.
-export fn dvui_main(argc: c_int, argv: [*][*:0]u8) callconv(.c) c_int {
-    return runDvuiMain(argc, argv) catch |err| {
-        std.log.err("dvui_main failed: {t}", .{err});
-        return 1;
-    };
-}
-
-extern "c" var environ: ?[*:null]?[*:0]u8;
-
-fn runDvuiMain(argc: c_int, argv: [*][*:0]u8) !u8 {
-    const gpa = std.heap.c_allocator;
-
-    var arena_allocator: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
-    defer arena_allocator.deinit();
-
-    const args_vector: std.process.Args.Vector = argv[0..@intCast(argc)];
-    const environ_block: std.process.Environ.Block = .{ .slice = std.mem.span(environ orelse @as([*:null]?[*:0]u8, @ptrFromInt(@alignOf(?[*:0]u8)))) };
-
-    var threaded: std.Io.Threaded = .init(gpa, .{
-        .argv0 = .init(.{ .vector = args_vector }),
-        .environ = .{ .block = environ_block },
-    });
-    defer threaded.deinit();
-
-    var environ_map = try std.process.Environ.createMap(.{ .block = environ_block }, gpa);
-    defer environ_map.deinit();
-
-    const preopens = try std.process.Preopens.init(arena_allocator.allocator());
-
-    return dvui.App.main(.{
-        .minimal = .{ .args = .{ .vector = args_vector }, .environ = .{ .block = environ_block } },
-        .arena = &arena_allocator,
-        .gpa = gpa,
-        .io = threaded.io(),
-        .environ_map = &environ_map,
-        .preopens = preopens,
-    });
+export fn dvui_main() callconv(.c) void {
+    _ = dvui.App.main() catch {};
 }
 pub const panic = dvui.App.panic;
 pub const std_options: std.Options = .{
     .logFn = dvui.App.logFn,
 };
 
+var gpa_instance = std.heap.GeneralPurposeAllocator(.{}){};
+const gpa = gpa_instance.allocator();
 
 var orig_content_scale: f32 = 1.0;
 var warn_on_quit: bool = false;
@@ -94,9 +58,7 @@ pub fn appInit(win: *dvui.Window) !void {
 }
 
 // Run as app is shutting down before dvui.Window.deinit()
-pub fn appDeinit(win: *dvui.Window) void {
-    _ = win;
-}
+pub fn appDeinit() void {}
 
 // Run each frame to do normal UI
 pub fn appFrame() !dvui.App.Result {
@@ -168,7 +130,11 @@ pub fn content() ?dvui.App.Result {
     tl2.addText("Framerate is variable and adjusts as needed for input events and animations.\n\n", .{});
     tl2.addText("Framerate is capped by vsync.\n\n", .{});
     tl2.addText("Cursor is always being set by dvui.\n\n", .{});
-            tl2.addText("Fonts are being rendered by opentype (lib-opentype-renderer).", .{});
+    if (dvui.useFreeType) {
+        tl2.addText("Fonts are being rendered by FreeType 2.", .{});
+    } else {
+        tl2.addText("Fonts are being rendered by stb_truetype.", .{});
+    }
     tl2.deinit();
 
     const label = if (dvui.Examples.show_demo_window) "Hide Demo Window" else "Show Demo Window";

@@ -1,6 +1,9 @@
-extern int dvui_main(int argc, char *argv[]);
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_main.h>
 
-// SDL's Java glue dlsym()s SDL_main from this library; SDL_main.h would only rename main to it.
-__attribute__((visibility("default"))) int SDL_main(int argc, char *argv[]) {
-    return dvui_main(argc, argv);
+extern void dvui_main();
+
+int main(int argc, char *argv[]) {
+    dvui_main();
+    return 0;
 }

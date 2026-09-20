@@ -3,20 +3,19 @@ plugins {
 }
 
 android {
-    namespace = "org.libsdl.helloworld"
-    compileSdk = 35
+    namespace "org.libsdl.helloworld"
+    compileSdk 35
 
     defaultConfig {
-        applicationId = 'org.libsdl.SDL_Helloworld'
-        // SDL needs 21, but zig's std.Io calls preadv64/pwritev64, introduced in bionic at 24
-        minSdk = 24
-        targetSdk = 35
-        versionCode = 1
-        versionName = '1.0'
+        applicationId 'org.libsdl.SDL_Helloworld'
+        minSdk 34
+        targetSdk 35
+        versionCode 1
+        versionName '1.0'
 
         externalNativeBuild {
             cmake {
-                arguments '-DANDROID_STL=none', '-DANDROID_PLATFORM=android-24', '-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON'
+                arguments '-DANDROID_STL=c++_shared', '-DANDROID_PLATFORM=android-34'
                 abiFilters 'arm64-v8a'
             }
         }
@@ -24,30 +23,25 @@ android {
 
     externalNativeBuild {
         cmake {
-            path = 'src/main/c/CMakeLists.txt'
+            path 'src/main/c/CMakeLists.txt'
         }
     }
 
     buildTypes {
         release {
-            minifyEnabled = false
+            minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_17
-        targetCompatibility = JavaVersion.VERSION_17
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+    buildFeatures {
+        prefab true
     }
 }
 
-// builds the zig static lib into src/main/c/prebuilt/<abi>/ before CMake links it
-['Debug': 'Debug', 'Release': 'ReleaseFast'].each { variant, optimize ->
-    def zigTask = tasks.register("zigBuild${variant}", Exec) {
-        workingDir file('../../zig-project')
-        executable project.findProperty('zig') ?: 'zig'
-        // local opentype checkout wins over dvui's URL pin, when present
-        def opentype = file('../../../../../opentype')
-        args = ['build', 'lib', "-Doptimize=${optimize}", "-Dandroid_ndk=${androidComponents.sdkComponents.ndkDirectory.get().asFile}"] + (opentype.exists() ? ["--fork=${opentype}"] : [])
-    }
-    tasks.matching { it.name == "pre${variant}Build" }.configureEach { dependsOn zigTask }
+dependencies {
+    implementation files('libs/SDL3-3.4.0.aar')
 }
