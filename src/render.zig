@@ -311,7 +311,7 @@ pub fn renderText(opts: TextOptions) Backend.GenericError!void {
                 if (in_sel and (range.start < sel_start or range.end > sel_end)) {
                     // The selection ends inside a ligature: shade only the
                     // components it covers, at the carets the cursor uses.
-                    const metrics = shaped_text.metrics(fallback_entry, cw.gpa);
+                    const metrics = shaped_text.metrics(fallback_entry);
                     const a = start.x + line.caretPenOffset(metrics, @max(range.start, sel_start), snap);
                     const b = start.x + line.caretPenOffset(metrics, @min(range.end, sel_end), snap);
                     lo = @min(a, b);

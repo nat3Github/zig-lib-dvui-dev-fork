@@ -191,8 +191,7 @@ Discuss yours on:
 - Raster images
   - [`stb_image`](https://github.com/nothings/stb)
 - Fonts
-  - [FreeType](https://github.com/david-vanderson/freetype/tree/zig-pkg)
-  - [`stb_truetype`](https://github.com/nothings/stb)
+  - [`zig-lib-opentype-renderer`](https://github.com/nat3Github/zig-lib-opentype-renderer)
 - Touch
   - selection draggables in text entries
   - pinch-zoom scaling

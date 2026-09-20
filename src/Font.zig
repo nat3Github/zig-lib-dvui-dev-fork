@@ -774,13 +774,13 @@ pub const ShapedText = struct {
     }
 
     /// Glyph metrics by font index, which is how `opentype` asks for them.
-    fn metrics(self: *const ShapedText, state_gpa: std.mem.Allocator) Cache.ShapedText.Metrics {
-        return .{ .entries = self.entries, .fallback = self.fallback, .state_gpa = state_gpa };
+    fn metrics(self: *const ShapedText) Cache.ShapedText.Metrics {
+        return .{ .entries = self.entries, .fallback = self.fallback };
     }
 
     pub fn measureUpToByteOffset(self: *ShapedText, state_gpa: std.mem.Allocator, byte_offset: usize) std.mem.Allocator.Error!Size {
         const snap = if (dvui.current_window) |cw| cw.snap_to_pixels else true;
-        const s = try self.line.measureLogicalPrefix(state_gpa, self.metrics(state_gpa), byte_offset, snap);
+        const s = try self.line.measureLogicalPrefix(state_gpa, self.metrics(), byte_offset, snap);
         return (Size{ .w = s.w, .h = s.h }).scale(1.0 / self.ss, Size);
     }
 
@@ -788,7 +788,7 @@ pub const ShapedText = struct {
     /// along the run's logical direction lands on.
     pub fn byteOffsetForWidth(self: *ShapedText, state_gpa: std.mem.Allocator, width: f32, end_metric: Font.EndMetric) std.mem.Allocator.Error!usize {
         const snap = if (dvui.current_window) |cw| cw.snap_to_pixels else true;
-        const fit = try self.line.logicalPrefixForWidth(state_gpa, self.metrics(state_gpa), width * self.ss, end_metric, snap);
+        const fit = try self.line.logicalPrefixForWidth(state_gpa, self.metrics(), width * self.ss, end_metric, snap);
         return fit.byte;
     }
 
@@ -797,13 +797,13 @@ pub const ShapedText = struct {
     /// width, and ink is not where the pen is.
     pub fn caretOffset(self: *ShapedText, byte_offset: usize) f32 {
         const snap = if (dvui.current_window) |cw| cw.snap_to_pixels else true;
-        return self.line.caretPenOffset(self.metrics(dvui.currentWindow().gpa), byte_offset, snap) / self.ss;
+        return self.line.caretPenOffset(self.metrics(), byte_offset, snap) / self.ss;
     }
 
     /// Inverse of `caretOffset`.
     pub fn byteAtOffset(self: *ShapedText, x: f32) usize {
         const snap = if (dvui.current_window) |cw| cw.snap_to_pixels else true;
-        return self.line.byteAtPenOffset(self.metrics(dvui.currentWindow().gpa), x * self.ss, snap);
+        return self.line.byteAtPenOffset(self.metrics(), x * self.ss, snap);
     }
 };
 
@@ -850,7 +850,7 @@ pub fn textSizeExShaped(self: Font, state_gpa: std.mem.Allocator, output: std.me
     };
 }
 
-pub const Cache = @import("Font/Cache.zig");
+pub const Cache = @import("FontCache.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
@@ -882,7 +882,7 @@ test "tab stops: a tab reaches the next multiple of tab_size spaces from the lin
         defer line.deinit();
         const tab = std.mem.indexOfScalar(u8, c.text, '\t').?;
         try std.testing.expectEqual(space_glyph, line.line.buffer.info.items[tab].codepoint);
-        try std.testing.expectApproxEqAbs(c.stop * space_px - c.origin, line.line.caretPenOffset(line.metrics(entry, gpa), c.text.len - 1, false), 1);
+        try std.testing.expectApproxEqAbs(c.stop * space_px - c.origin, line.line.caretPenOffset(line.metrics(entry), c.text.len - 1, false), 1);
     }
 }
 
@@ -959,13 +959,11 @@ test "smoke: shape + measure + rasterize against embedded Vera.ttf" {
     try std.testing.expect(entry.ascent > 0);
     try std.testing.expect(entry.height > 0);
     try std.testing.expect(entry.em_height > 0);
-    std.debug.print("ascent={d} height={d} em_height={d}\n", .{ entry.ascent, entry.height, entry.em_height });
 
     var line = try cw.fonts.shapeLineText(gpa, gpa, resolved, "Hello, world! fi ffi", null, .auto, .{});
     defer line.deinit();
 
     try std.testing.expect(line.line.buffer.info.items.len > 0);
-    std.debug.print("shaped {d} glyphs from {d} codepoints\n", .{ line.line.buffer.info.items.len, line.line.codepoints.len });
     for (line.line.buffer.info.items) |info| {
         try std.testing.expect(info.codepoint != 0);
     }
@@ -973,13 +971,11 @@ test "smoke: shape + measure + rasterize against embedded Vera.ttf" {
     var end_idx: usize = 0;
     var result = try cw.fonts.textSizeRawShaped(gpa, gpa, resolved, "Hello, world!", .{ .end_idx = &end_idx }, .{});
     defer result.shaped.deinit();
-    std.debug.print("measured size w={d} h={d} end_idx={d}\n", .{ result.size.w, result.size.h, end_idx });
     try std.testing.expect(result.size.w > 0);
     try std.testing.expect(result.size.h > 0);
     try std.testing.expectEqual(@as(usize, "Hello, world!".len), end_idx);
 
     const gi = try entry.glyphInfoGet(gpa, line.line.buffer.info.items[0].codepoint);
-    std.debug.print("glyph0 w={d} h={d} left={d} top={d} is_color={}\n", .{ gi.w, gi.h, gi.leftBearing, gi.topBearing, gi.is_color });
     try std.testing.expect(gi.w > 0);
     try std.testing.expect(gi.h > 0);
 }
@@ -1105,7 +1101,7 @@ test "measureLogicalPrefix: glyphs from a fallback font measure with that font's
     var whole = try cw.fonts.textSizeRawShaped(std.testing.allocator, std.testing.allocator, resolved, text, .{}, .{});
     defer whole.shaped.deinit();
     const latin_entry = cw.fonts.stackEntry(resolved, 0).?;
-    const prefix = try whole.shaped.line.measureLogicalPrefix(std.testing.allocator, whole.shaped.metrics(latin_entry, std.testing.allocator), text.len, true);
+    const prefix = try whole.shaped.line.measureLogicalPrefix(std.testing.allocator, whole.shaped.metrics(latin_entry), text.len, true);
     try std.testing.expectApproxEqAbs(whole.size.w, prefix.w, 0.01);
 }
 
