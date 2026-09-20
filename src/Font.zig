@@ -917,6 +917,48 @@ test "features: liga off splits a ligature, tnum evens out digit advances" {
     try std.testing.expectEqual(tn[0].x_advance, tn[1].x_advance);
 }
 
+test "ellipsisCut: nothing fits once max_width is under the ellipsis itself" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    const fns = struct {
+        fn frame() !dvui.App.Result {
+            const font = Font.theme(.body);
+            const ellipsis_w = font.textSize(font.ellipsis()).w;
+            try std.testing.expectEqual(@as(usize, 0), font.ellipsisCut("hello", ellipsis_w / 2, .{}));
+            try std.testing.expectEqual(@as(usize, 0), font.ellipsisCut("hello", 0, .{}));
+            return .ok;
+        }
+    };
+    try dvui.testing.settle(fns.frame);
+}
+
+test "line_height_factor: spaces lines apart above 1.0, shrinks line and ascent below it" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    const fns = struct {
+        fn frame() !dvui.App.Result {
+            const font = Font.theme(.body);
+            const one = font.textSize("a").h;
+            try std.testing.expectApproxEqAbs(one * 2, font.withLineHeight(1.0).textSize("a\nb").h, 0.01);
+            try std.testing.expectApproxEqAbs(one * 3, font.withLineHeight(2.0).textSize("a\nb").h, 0.01);
+            try std.testing.expectApproxEqAbs(one, font.withLineHeight(0.5).textSize("a\nb").h, 0.01);
+            try std.testing.expectApproxEqAbs(font.textHeight() * 1.5, font.withLineHeight(1.5).lineHeight(), 0.01);
+
+            var ascent: f32 = 0;
+            _ = font.textSizeEx("a", .{ .ascent_out = &ascent });
+            try std.testing.expect(ascent > 0);
+            var tall: f32 = 0;
+            _ = font.withLineHeight(2.0).textSizeEx("a", .{ .ascent_out = &tall });
+            try std.testing.expectApproxEqAbs(ascent, tall, 0.01);
+            var short: f32 = 0;
+            _ = font.withLineHeight(0.5).textSizeEx("a", .{ .ascent_out = &short });
+            try std.testing.expect(short < ascent);
+            return .ok;
+        }
+    };
+    try dvui.testing.settle(fns.frame);
+}
+
 test "ellipsisCut: widest grapheme-aligned logical prefix that fits with the ellipsis" {
     var t = try dvui.testing.init(.{});
     defer t.deinit();
@@ -1007,7 +1049,7 @@ test "sizeM: memoized result matches a fresh textSizeRawShaped(\"M\") call" {
     try std.testing.expectApproxEqAbs(expected.h * 3, second.h, 0.03);
 }
 
-test "smoke: bidi/RTL text shapes without crashing" {
+test "isMixedDirection: true only for a line that holds both directions" {
     var t = try dvui.testing.init(.{});
     defer t.deinit();
     const gpa = std.testing.allocator;
@@ -1041,14 +1083,12 @@ test "an RTL run's logical prefix measures monotonically, and width maps back to
     const gpa = std.testing.allocator;
 
     const font: Font = .find(.{ .family = "Vera", .size = 16 });
-    // Four Hebrew letters, two bytes each. Their glyphs come out right to
-    // left, so the logical prefix a caret walks over is the *last* stretch
-    // of the shape -- what a leading-glyph walk gets backwards.
+    // Hebrew: the glyphs come out right to left, so the logical prefix a
+    // caret walks over is the *last* stretch of the shape.
     const txt = "\u{05e9}\u{05dc}\u{05d5}\u{05dd}";
     var res = (try font.textSizeExShaped(dvui.currentWindow().gpa, gpa, txt, .{})).?;
     defer res.shaped.deinit();
-    // Nothing in the stack covers Hebrew on this platform.
-    if (res.shaped.line.buffer.info.items[0].codepoint == 0) return;
+    if (res.shaped.line.buffer.info.items[0].codepoint == 0) return error.SkipZigTest;
     try std.testing.expect(res.shaped.line.isRtl());
 
     var prev: f32 = -1;
@@ -1058,7 +1098,6 @@ test "an RTL run's logical prefix measures monotonically, and width maps back to
         try std.testing.expect(w > prev);
         prev = w;
 
-        // And the inverse: the width of a prefix answers with that prefix.
         var end: usize = undefined;
         _ = font.textSizeEx(txt, .{ .max_width = w, .end_idx = &end, .end_metric = .nearest });
         try std.testing.expectEqual(off, end);
@@ -1114,9 +1153,6 @@ test "TextSizeOptions.item: shapes with context but reports only the item" {
     var res = (try font.textSizeExShaped(dvui.currentWindow().gpa, gpa, "Hello", .{ .item = .{ .start = 1, .end = 3 } })).?;
     defer res.shaped.deinit();
 
-    // Only "el" produced glyphs, and the result is rebased so it reads like
-    // a standalone shape of "el": two clusters at byte 0 and 1, and the
-    // usual byte-offset math lands where a caller slicing "el" expects.
     try std.testing.expectEqual(@as(usize, 2), res.shaped.line.buffer.info.items.len);
     try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2 }, res.shaped.line.byte_offsets);
     try std.testing.expectEqual(@as(u32, 0), res.shaped.line.buffer.info.items[0].cluster);
@@ -1137,8 +1173,7 @@ test "TextSizeOptions.item: a joining neighbour changes the glyph chosen" {
     const word = "\u{0633}\u{0644}";
     var alone = (try font.textSizeExShaped(dvui.currentWindow().gpa, gpa, word[0..2], .{})).?;
     defer alone.shaped.deinit();
-    // No Arabic anywhere in the font stack on this platform: nothing to test.
-    if (alone.shaped.line.buffer.info.items[0].codepoint == 0) return;
+    if (alone.shaped.line.buffer.info.items[0].codepoint == 0) return error.SkipZigTest;
 
     var joined = (try font.textSizeExShaped(dvui.currentWindow().gpa, gpa, word, .{ .item = .{ .start = 0, .end = 2 } })).?;
     defer joined.shaped.deinit();
@@ -1163,15 +1198,13 @@ test "caret pen offsets step one glyph at a time through an RTL run" {
     const advance = res.shaped.caretOffset(0);
     try std.testing.expect(advance > 0);
 
-    // The caret walks leftwards as the logical prefix grows, by one whole
-    // glyph each step, and the full prefix lands on the run's left edge.
     var prev = advance;
     var off: usize = 2;
     while (off <= txt.len) : (off += 2) {
         const x = res.shaped.caretOffset(off);
         try std.testing.expect(x < prev);
-        // Each step gives back exactly one glyph's advance -- the run's
-        // rightmost, since an RTL prefix grows leftwards from there.
+        // An RTL prefix grows leftwards, so its next glyph is the run's
+        // rightmost not-yet-counted one.
         const g = res.shaped.line.buffer.info.items.len - off / 2;
         const entry = res.shaped.entryForGlyph(g);
         const step = @round(entry.toPixels(res.shaped.line.buffer.pos.items[g].x_advance)) / res.shaped.ss;

@@ -1681,6 +1681,37 @@ test "mixed-direction text: digits inside an RTL run" {
     try std.testing.expectEqual(@as(usize, 7), TestEntry.cursor);
 }
 
+test "mixed-direction text: shift+arrow extends the selection over the visual step" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    try TestEntry.focus();
+
+    // "abc" | Hebrew | "xyz": bytes 0..3, 3..11, 11..14. Shift+Right walks
+    // the same visual stops as Right, so the anchor and the caret can end up
+    // on opposite sides of the boundary and the selection is the logical
+    // range between them, not the run the caret is in.
+    try TestEntry.load("abc\u{05e9}\u{05dc}\u{05d5}\u{05dd}xyz");
+    for (0..4) |_| try TestEntry.press(.right);
+    try std.testing.expectEqual(@as(usize, 9), TestEntry.cursor);
+
+    try TestEntry.pressMod(.left, .lshift);
+    try std.testing.expectEqual(@as(usize, 11), TestEntry.cursor);
+    try std.testing.expectEqual(@as(usize, 9), TestEntry.sel_start);
+    try std.testing.expectEqual(@as(usize, 11), TestEntry.sel_end);
+
+    // Stepping out of the RTL run puts the caret before the anchor: the
+    // selection flips ends rather than growing from the wrong one.
+    try TestEntry.pressMod(.left, .lshift);
+    try std.testing.expectEqual(@as(usize, 2), TestEntry.cursor);
+    try std.testing.expectEqual(@as(usize, 2), TestEntry.sel_start);
+    try std.testing.expectEqual(@as(usize, 9), TestEntry.sel_end);
+
+    try TestEntry.pressMod(.right, .lshift);
+    try std.testing.expectEqual(@as(usize, 3), TestEntry.cursor);
+    try std.testing.expectEqual(@as(usize, 3), TestEntry.sel_start);
+    try std.testing.expectEqual(@as(usize, 9), TestEntry.sel_end);
+}
+
 test "right-to-left text: Left at the end of the text stays put" {
     var t = try dvui.testing.init(.{});
     defer t.deinit();
@@ -1746,6 +1777,8 @@ test "overflow_wrap reaches the inner TextLayout" {
 
 const TestEntry = struct {
     var cursor: usize = 0;
+    var sel_start: usize = 0;
+    var sel_end: usize = 0;
     var multiline = false;
     var text_buf: [64]u8 = undefined;
     var text_len: usize = 0;
@@ -1764,6 +1797,8 @@ const TestEntry = struct {
         entry.processEvents();
         entry.draw();
         cursor = entry.textLayout.selection.cursor;
+        sel_start = entry.textLayout.selection.start;
+        sel_end = entry.textLayout.selection.end;
         const txt = entry.getText();
         text_len = @min(txt.len, text_buf.len);
         @memcpy(text_buf[0..text_len], txt[0..text_len]);

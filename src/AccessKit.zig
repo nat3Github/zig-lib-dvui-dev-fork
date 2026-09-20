@@ -1869,20 +1869,39 @@ pub const RoleNoAccessKit = enum {
     terminal,
 };
 
+test "buildCharacterInfo: bytes before the first cluster still get a zero-width entry" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const text = "ab";
+    var glyphs = [_]GlyphPosition{.{ .cluster_byte = 1, .x = 10, .w = 10 }};
+
+    var info: std.MultiArrayList(CharPositionInfo) = .empty;
+    buildCharacterInfo(arena, text, &glyphs, &info);
+
+    try std.testing.expectEqual(@as(usize, 2), info.len);
+    var total: usize = 0;
+    for (info.items(.l)) |l| total += l;
+    try std.testing.expectEqual(text.len, total);
+    try std.testing.expectEqual(@as(f32, 0), info.items(.w)[0]);
+    try std.testing.expectEqual(@as(f32, 10), info.items(.w)[1]);
+    try std.testing.expectEqual(@as(f32, 10), info.items(.x)[1]);
+}
+
 test "buildCharacterInfo: one entry per character, summing to the run's bytes" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // "aé" + a two-codepoint ligature drawn as one glyph, then a mark
-    // stacked on the last letter: three cases glyph counting gets wrong.
     const text = "a\u{e9}fin\u{0301}";
+    // Visual order, as an RTL run delivers it: buildCharacterInfo must sort.
     var glyphs = [_]GlyphPosition{
-        .{ .cluster_byte = 0, .x = 0, .w = 10 }, // a
-        .{ .cluster_byte = 1, .x = 10, .w = 10 }, // é
-        .{ .cluster_byte = 3, .x = 20, .w = 20 }, // fi ligature, one glyph
+        .{ .cluster_byte = 5, .x = 40, .w = 0 }, // combining acute on the n
         .{ .cluster_byte = 5, .x = 40, .w = 10 }, // n
-        .{ .cluster_byte = 5, .x = 40, .w = 0 }, // combining acute
+        .{ .cluster_byte = 3, .x = 20, .w = 20 }, // fi, two characters in one glyph
+        .{ .cluster_byte = 1, .x = 10, .w = 10 }, // é
+        .{ .cluster_byte = 0, .x = 0, .w = 10 }, // a
     };
 
     var info: std.MultiArrayList(CharPositionInfo) = .empty;
@@ -1893,11 +1912,9 @@ test "buildCharacterInfo: one entry per character, summing to the run's bytes" {
     try std.testing.expectEqual(text.len, total);
     try std.testing.expectEqual(@as(usize, 6), info.len);
 
-    // The ligature's width is split between the two characters under it.
     try std.testing.expectEqual(@as(f32, 10), info.items(.w)[2]);
     try std.testing.expectEqual(@as(f32, 30), info.items(.x)[3]);
 
-    // Round-trip: character indices and byte offsets name the same places.
     var byte: usize = 0;
     for (info.items(.l), 0..) |l, ch| {
         try std.testing.expectEqual(byte, byteOffset(text, ch));

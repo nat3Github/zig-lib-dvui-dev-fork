@@ -3074,54 +3074,19 @@ test "reorderLineVisual: a piece cut mid-fragment is reshaped with the rest as c
 
     try std.testing.expectEqual(@as(usize, 3), fns.pieces);
     try std.testing.expectEqualStrings("world", fns.cut_text);
-    // Every cut piece is reshaped against the whole fragment, the leading
-    // one included: its parent's shape covers bytes it doesn't own, and in
-    // an RTL run those are the ones its own glyphs sit behind.
+    // The leading piece is reshaped too: its parent's shape covers bytes it
+    // doesn't own, and in an RTL run its own glyphs sit behind those.
     try std.testing.expect(fns.leading_has_render_shape);
-    // The one that had to shape again did it with the whole fragment around
-    // it, so it still has a drawable shape rather than falling back to a
-    // context-free reshape at render time.
     try std.testing.expect(fns.cut_has_render_shape);
 }
 
-test "e2e: an RTL line built from two addText chunks stays one line" {
-    // Smoke cover for the buffer/reorder/emit path with real fonts and real
-    // shaping; the placement itself is asserted in the two tests above.
-    var t = try dvui.testing.init(.{ .window_size = .{ .w = 400, .h = 200 } });
-    defer t.deinit();
-
-    const fns = struct {
-        var width: f32 = 0;
-        var height: f32 = 0;
-
-        fn frame() !dvui.App.Result {
-            var tl = dvui.textLayout(@src(), .{}, .{ .tag = "tl" });
-            tl.addText("\u{05e9}\u{05dc}\u{05d5}\u{05dd}", .{});
-            tl.addText(" world", .{});
-            tl.addTextDone(.{});
-            width = tl.data().min_size.w;
-            height = tl.data().min_size.h;
-            tl.deinit();
-            return .ok;
-        }
-    };
-
-    try dvui.testing.settle(fns.frame);
-
-    // Reordering is a permutation, so the line is as wide as its content and
-    // never wrapped.
-    try std.testing.expect(fns.width > 60);
-    try std.testing.expect(fns.height < 40);
-}
-
-test "e2e: a clickable chunk is reordered, and answers one frame late" {
+test "e2e: a clickable chunk reordered to the left edge answers a click there" {
     var t = try dvui.testing.init(.{ .window_size = .{ .w = 400, .h = 200 } });
     defer t.deinit();
 
     const fns = struct {
         var clicks: usize = 0;
         var content: dvui.Rect.Physical = .{};
-        var scale: f32 = 1;
 
         fn frame() !dvui.App.Result {
             // No expand: the widget hugs the text, so the RTL line origin is
@@ -3130,9 +3095,7 @@ test "e2e: a clickable chunk is reordered, and answers one frame late" {
             tl.addText("\u{05e9}\u{05dc}\u{05d5}\u{05dd} ", .{});
             if (tl.addTextClick("world", .{})) |_| clicks += 1;
             tl.addTextDone(.{});
-            const rs = tl.data().contentRectScale();
-            content = rs.r;
-            scale = rs.s;
+            content = tl.data().contentRectScale().r;
             tl.deinit();
             return .ok;
         }
@@ -3156,6 +3119,7 @@ test "e2e: splitting a mixed chunk measures the same as splitting by hand" {
 
     const fns = struct {
         var one_chunk: f32 = 0;
+        var one_h: f32 = 0;
         var two_chunks: f32 = 0;
 
         fn frame() !dvui.App.Result {
@@ -3164,6 +3128,7 @@ test "e2e: splitting a mixed chunk measures the same as splitting by hand" {
                 tl.addText("\u{05e9}\u{05dc}\u{05d5}\u{05dd} world", .{});
                 tl.addTextDone(.{});
                 one_chunk = tl.data().min_size.w;
+                one_h = tl.data().min_size.h;
                 tl.deinit();
             }
             {
@@ -3184,6 +3149,7 @@ test "e2e: splitting a mixed chunk measures the same as splitting by hand" {
     // keeps the chunk's shape while the rest are reshaped; both paths have to
     // agree, or the line's pieces overlap or leave a gap.
     try std.testing.expect(fns.one_chunk > 60);
+    try std.testing.expect(fns.one_h < 40);
     try std.testing.expectApproxEqAbs(fns.two_chunks, fns.one_chunk, 1.0);
 }
 
@@ -3254,7 +3220,6 @@ test "e2e: an RTL paragraph starts at the right edge" {
     const fns = struct {
         var clicks: usize = 0;
         var content: dvui.Rect.Physical = .{};
-        var scale: f32 = 1;
         var hit: ?Rect = null;
 
         fn frame() !dvui.App.Result {
@@ -3265,9 +3230,7 @@ test "e2e: an RTL paragraph starts at the right edge" {
             if (tl.addTextClick("world", .{})) |_| clicks += 1;
             tl.addText(" \u{05e9}\u{05dc}\u{05d5}\u{05dd}", .{});
             tl.addTextDone(.{});
-            const rs = tl.data().contentRectScale();
-            content = rs.r;
-            scale = rs.s;
+            content = tl.data().contentRectScale().r;
             hit = if (tl.deferred_click) |h| h.rect else null;
             tl.deinit();
             return .ok;
@@ -3454,6 +3417,64 @@ test "e2e: a click lands in the run under it, not the logically-first one" {
     // two letters left of *its* right edge, not of the line's.
     try fns.clickAt(fns.total - fns.w_first - fns.w_second_half);
     try std.testing.expectEqual(fns.first.len + 4, fns.sel.cursor);
+}
+
+test "e2e: a drag across a level-run boundary selects the logical range between its ends" {
+    var t = try dvui.testing.init(.{ .window_size = .{ .w = 400, .h = 200 } });
+    defer t.deinit();
+
+    const fns = struct {
+        const first = "\u{05e9}\u{05dc}\u{05d5}\u{05dd}";
+        const second = "\u{05e2}\u{05d5}\u{05dc}\u{05dd}";
+        var sel: Selection = .{};
+        var content: dvui.Rect.Physical = .{};
+        var scale: f32 = 1;
+        var w_first: f32 = 0;
+        var w_first_half: f32 = 0;
+        var w_second_half: f32 = 0;
+        var total: f32 = 0;
+
+        fn frame() !dvui.App.Result {
+            var tl = dvui.textLayout(@src(), .{ .selection = &sel }, .{});
+            const font = tl.data().options.fontGet();
+            w_first = font.textSizeEx(first, .{}).w;
+            w_first_half = font.textSizeEx(first[0..4], .{}).w;
+            w_second_half = font.textSizeEx(second[0..4], .{}).w;
+            total = w_first + font.textSizeEx(second, .{}).w;
+            tl.addText(first, .{});
+            tl.addText(second, .{});
+            tl.addTextDone(.{});
+            const rs = tl.data().contentRectScale();
+            content = rs.r;
+            scale = rs.s;
+            tl.deinit();
+            return .ok;
+        }
+
+        fn moveTo(x: f32) !void {
+            _ = try dvui.currentWindow().addEventMouseMotion(.{ .pt = .{ .x = content.x + x * scale, .y = content.y + 4 } });
+            try dvui.testing.settle(frame);
+        }
+
+        fn button(action: enum { press, release }) !void {
+            _ = try dvui.currentWindow().addEventMouseButton(.left, if (action == .press) .press else .release);
+            try dvui.testing.settle(frame);
+        }
+    };
+
+    try dvui.testing.settle(fns.frame);
+
+    // Press two letters into the right (logically first) run and release two
+    // letters into the left (logically second) one: the drag crosses the
+    // boundary between the two level runs, and the selection it leaves is the
+    // logical range between the two bytes, not the visual sweep.
+    try fns.moveTo(fns.total - fns.w_first_half);
+    try fns.button(.press);
+    try fns.moveTo(fns.total - fns.w_first - fns.w_second_half);
+    try fns.button(.release);
+
+    try std.testing.expectEqual(@as(usize, 4), fns.sel.start);
+    try std.testing.expectEqual(fns.first.len + 4, fns.sel.end);
 }
 
 test "e2e: a wrapping RTL fragment answers clicks by cluster, not by leading glyph" {
@@ -3709,7 +3730,7 @@ test "base_direction: an empty RTL paragraph puts its caret on the right" {
     try std.testing.expectEqual(fns.avail - 1, fns.caret_x);
 }
 
-test "e2e: an RTL line ending in a newline keeps its shape" {
+test "e2e: an RTL line ending in a newline does not trip emitFragment" {
     var t = try dvui.testing.init(.{ .window_size = .{ .w = 400, .h = 200 } });
     defer t.deinit();
 
@@ -3894,9 +3915,7 @@ test "reshapeWithNeighbourContext: a word split across chunks joins across the s
 
     var alone = (try font.textSizeExShaped(dvui.currentWindow().gpa, gpa, frags[0].text, .{})).?;
     defer alone.shaped.deinit();
-    // Nothing in the stack covers Arabic on this platform (every glyph is
-    // .notdef): the plumbing above is all there is to check here.
-    if (alone.shaped.line.buffer.info.items[0].codepoint == 0) return;
+    if (alone.shaped.line.buffer.info.items[0].codepoint == 0) return error.SkipZigTest;
 
     // With the alef visible as context, seen+lam take joining forms -- a
     // different glyph sequence from the same bytes shaped on their own, which
@@ -3919,11 +3938,16 @@ test "stickyBoundary: only a boundary that could join or kern pays for a reshape
     try std.testing.expect(!stickyBoundary("foo ", "bar"));
     try std.testing.expect(!stickyBoundary("foo", " bar"));
     try std.testing.expect(!stickyBoundary("", "bar"));
-    // Cut on a codepoint boundary, never mid-sequence.
-    const long = "x" ** 40 ++ "\u{0633}\u{0644}";
-    try std.testing.expect(std.unicode.utf8ValidateSlice(contextTail(long)));
-    try std.testing.expect(std.unicode.utf8ValidateSlice(contextHead(long)));
-    try std.testing.expectEqual(@as(usize, neighbour_context_bytes), contextHead(long).len);
+}
+
+test "contextHead/contextTail: a cut landing mid-sequence backs off to a codepoint boundary" {
+    // 3-byte codepoints: neither 32-byte cut can land on a boundary.
+    const cjk = "\u{4e00}" ** 20;
+    try std.testing.expect(std.unicode.utf8ValidateSlice(contextHead(cjk)));
+    try std.testing.expect(std.unicode.utf8ValidateSlice(contextTail(cjk)));
+    try std.testing.expectEqual(@as(usize, 30), contextHead(cjk).len);
+    try std.testing.expectEqual(@as(usize, 30), contextTail(cjk).len);
+    try std.testing.expectEqual(@as(usize, neighbour_context_bytes), contextHead("x" ** 40).len);
 }
 test "assignVisualX: the logically-first chunk lands rightmost" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);

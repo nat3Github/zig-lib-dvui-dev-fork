@@ -1361,12 +1361,21 @@ test "Cache.shapeLineText: a shaped_line_cache hit reshapes instead of dropping 
     try std.testing.expectEqual(korean_entry_after, line2.entries[line2.line.segments[1].font_index]);
 }
 
-test "Cache.reset: evicts resolved stacks for sizes no longer used" {
+test "Cache.reset: keeps a resolved stack used since the last reset, evicts it one reset later" {
     var t = try dvui.testing.init(.{});
     defer t.deinit();
     const cw = dvui.currentWindow();
     for (1..50) |size| _ = try cw.fonts.resolveStack(cw.gpa, Font.init("Vera").withSize(@floatFromInt(size)));
+    const key = Font.init("Vera").withSize(7).cacheKey();
+
     cw.fonts.reset(cw.gpa, cw.backend);
+    try std.testing.expect(cw.fonts.resolved_stacks.containsUsed(key) != null);
+
+    _ = try cw.fonts.resolveStack(cw.gpa, Font.init("Vera").withSize(7));
+    cw.fonts.reset(cw.gpa, cw.backend);
+    try std.testing.expect(cw.fonts.resolved_stacks.containsUsed(key) != null);
+    try std.testing.expectEqual(@as(usize, 1), cw.fonts.resolved_stacks.count());
+
     cw.fonts.reset(cw.gpa, cw.backend);
     try std.testing.expectEqual(@as(usize, 0), cw.fonts.resolved_stacks.count());
 }
@@ -1391,15 +1400,22 @@ test "Cache.addFamily: re-registering an alias reaches stacks already resolved" 
     try std.testing.expectEqualStrings("Vera", (try cw.fonts.resolveStack(cw.gpa, Font.init("Swap"))).family_fonts[0].familyName());
 }
 
-test "Cache.reset: evicts shaped lines unused for a frame" {
+test "Cache.reset: keeps a shaped line used since the last reset, evicts it one reset later" {
     var t = try dvui.testing.init(.{});
     defer t.deinit();
     const cw = dvui.currentWindow();
-    const resolved = try cw.fonts.resolveStack(cw.gpa, Font.init("Vera"));
-    var line = try cw.fonts.shapeLineText(std.testing.allocator, cw.gpa, resolved, "abc", null, .auto, .{});
+    var line = try cw.fonts.shapeLineText(std.testing.allocator, cw.gpa, try cw.fonts.resolveStack(cw.gpa, Font.init("Vera")), "abc", null, .auto, .{});
     line.deinit();
     try std.testing.expectEqual(@as(usize, 1), cw.fonts.line_cache.count());
+
     cw.fonts.reset(cw.gpa, cw.backend);
+    try std.testing.expectEqual(@as(usize, 1), cw.fonts.line_cache.count());
+
+    var again = try cw.fonts.shapeLineText(std.testing.allocator, cw.gpa, try cw.fonts.resolveStack(cw.gpa, Font.init("Vera")), "abc", null, .auto, .{});
+    again.deinit();
+    cw.fonts.reset(cw.gpa, cw.backend);
+    try std.testing.expectEqual(@as(usize, 1), cw.fonts.line_cache.count());
+
     cw.fonts.reset(cw.gpa, cw.backend);
     try std.testing.expectEqual(@as(usize, 0), cw.fonts.line_cache.count());
     try std.testing.expectEqual(@as(usize, 0), cw.fonts.line_cache.bytes);
@@ -1444,7 +1460,9 @@ test "Cache.reset: drops unreferenced discovered font bytes; findSource reads th
         .path = try cw.gpa.dupe(u8, path),
     });
     const source = &cw.fonts.database.items[cw.fonts.database.items.len - 1];
-    for (0..Cache.evict_after_unreferenced_resets) |_| cw.fonts.reset(cw.gpa, cw.backend);
+    for (0..Cache.evict_after_unreferenced_resets - 1) |_| cw.fonts.reset(cw.gpa, cw.backend);
+    try std.testing.expect(source.bytes.len > 0);
+    cw.fonts.reset(cw.gpa, cw.backend);
     try std.testing.expectEqual(@as(usize, 0), source.bytes.len);
 
     // The re-read assembles the requested face as a fresh standalone sfnt,
