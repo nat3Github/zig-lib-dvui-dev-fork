@@ -589,7 +589,7 @@ pub const CellWidget = struct {
             }
         } else {
             var te: dvui.TextEntryWidget = undefined;
-            te.init(src, .{ .text = .{ .internal = .{ .limit = init_opts.limit } }, .multiline = true, .break_lines = true, .scroll_horizontal = false }, opts);
+            te.init(src, .{ .text = .{ .internal = .{ .limit = init_opts.limit } }, .multiline = true, .break_lines = true }, opts);
 
             var escape = false;
             var enter = false;
@@ -1227,6 +1227,7 @@ pub fn deinit(self: *GridWidget) void {
             dvui.refresh(null, @src(), self.data().id);
         }
 
+        var focused_this_frame = false;
         const wd = self.data();
         const evts = dvui.events();
         for (evts) |*e| {
@@ -1236,13 +1237,24 @@ pub fn deinit(self: *GridWidget) void {
                 .mouse => |me| {
                     if (me.action == .focus) {
                         e.handle(@src(), wd);
+                        if (!self.focus_in_grid.*) {
+                            focused_this_frame = true;
+                            if (self.cellFromPoint(me.p)) |cel| {
+                                self.moveCursor(cel.col, cel.row);
+                            }
+                        }
                         // focus so that we can receive keyboard input
                         dvui.focusWidget(wd.id, null, e.num);
                         dvui.dataSet(null, wd.id, "__focus_touch", me.button.touch());
                     } else if (me.action == .press and me.button.pointer()) {
                         e.handle(@src(), wd);
-                        dvui.captureMouse(wd, e.num);
-                        dvui.dragPreStart(me.button, me.p, .{});
+                        // ignore the press if we just got focus, prevents:
+                        // * last-focused cell from flashing
+                        // * editing if you happened to click on the last-focused cell
+                        if (!focused_this_frame) {
+                            dvui.captureMouse(wd, e.num);
+                            dvui.dragPreStart(me.button, me.p, .{});
+                        }
                     } else if (me.action == .motion and me.button.touch()) {
                         if (dvui.captured(wd.id)) {
                             if (dvui.dragging(me.p, null)) |_| {
