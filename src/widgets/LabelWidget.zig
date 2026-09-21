@@ -160,8 +160,7 @@ pub fn draw(self: *LabelWidget) void {
             self.ellipsized = true;
             const font = self.data().options.fontGet();
             const cut = font.ellipsisCut(line, self.data().contentRect().w, .{});
-            // Shaped as one run so bidi puts the ellipsis at the logical end,
-            // which is the left of an RTL line.
+            // one run so bidi puts the ellipsis at the logical end (left for RTL)
             line = std.mem.concat(dvui.currentWindow().arena(), u8, &.{ line[0..cut], font.ellipsis() }) catch line[0..cut];
             tsize = font.textSize(line);
             lineRect = dvui.placeIn(self.data().contentRect(), tsize, .none, .{ .x = 0, .y = 0 });

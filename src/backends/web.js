@@ -129,9 +129,8 @@ const fragmentShaderSource_webgl2 = `# version 300 es
 /**
  * @param {string | HTMLCanvasElement} canvas - A canvas element or string id of one
  * @param {DVUI.WasmArg} wasmRef - The url to the wasm file, to be used in `fetch`;
- *   or a function instantiating it with the given imports (use this to bring
- *   your own wasm: the imports differ per build, e.g. -Dfont-fallback adds some);
- *   or an already instantiated source, which must have been given those imports.
+ *   a function instantiating it with the given imports; or an already
+ *   instantiated source created with those imports (they differ per build).
  * @returns {Promise<Dvui>}
  */
 export function dvui(canvas, wasmRef) {

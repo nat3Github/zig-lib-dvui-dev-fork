@@ -67,9 +67,7 @@ pub const Strike = struct {
 
 pub const max_variations = 4;
 
-/// One slot of a family alias: a family name plus optional per-family
-/// tweaks, for stacks whose fonts don't agree on size or weight (a CJK
-/// fallback that runs visually large next to the Latin primary, say).
+/// One slot of a family alias: a family name plus optional size/weight tweaks.
 pub const FamilyEntry = struct {
     family: [NAME_MAX_LEN:0]u8 = @splat(0),
     size_scale: f32 = 1,
@@ -88,10 +86,7 @@ pub const FamilyEntry = struct {
 };
 
 /// A single family name, or an alias registered with `dvui.addFontFamily`
-/// standing for an ordered list of families (CSS font-family model). Name
-/// every script you need in that list (e.g. a Latin font, an Arabic font, a
-/// CJK font) rather than relying on dynamic OS fallback, which is unreliable
-/// on Android/Windows and varies by what's installed elsewhere.
+/// (an ordered fallback list, CSS font-family model).
 family: [NAME_MAX_LEN:0]u8 = @splat(0),
 
 /// Height of a capital M in logical pixels.  After converting to physical
@@ -357,10 +352,8 @@ pub const Source = struct {
     /// weight/stretch but lose to `withVariation`.
     pinned_axes: [DiscoveryProperties.max_pinned_axes]UserCoord = undefined,
     pinned_axis_count: u8 = 0,
-    /// Human-readable family name from the font's own `name` table, for UI
-    /// display only -- `family` itself is a synthetic key (e.g. "fb:1a2b3c")
-    /// for dynamic-fallback sources, so it isn't fit to print. Empty unless
-    /// set by `Cache.loadDynamicFallback`.
+    /// Family name from the font's `name` table, for display: `family` may be
+    /// a synthetic key (e.g. "fb:1a2b3c"). Empty unless set by `Cache.loadDynamicFallback`.
     display_family: [NAME_MAX_LEN:0]u8 = @splat(0),
     /// File `bytes` came from, owned by `allocator`; set only for
     /// OS-discovered fonts. `Cache.reset` may drop such bytes while unused
@@ -465,19 +458,10 @@ pub const WebFallbackOptions = struct {
     base_url: []const u8 = if (web_fallback_enabled) opentype.discovery_web_fallback.default_base_url else "",
 };
 
-/// The whole font file, mapped. Only the pages actually parsed and
-/// rasterized fault in, so drawing a line of CJK out of a 55MB face costs
-/// the few pages its glyphs sit on instead of a 53MB read -- measured on
-/// STHeiti Light.ttc, 7.4ms warm / 128ms cold down to 0.05ms. That also
-/// makes subsetting the face pointless: a collection's other faces and
-/// every `sbix` strike we never touch cost nothing but address space.
-///
-/// `createMemoryMap` allocates and reads instead where mapping is
-/// unavailable, which is the old behaviour minus the subsetting; no target
-/// with a discovery backend takes that path today.
-///
-/// The mapping outlives the descriptor, so the file is closed right away.
-/// It is `MAP.SHARED`: a font file truncated underneath us faults on
+/// The whole font file, memory-mapped: only the pages actually parsed or
+/// rasterized fault in, so a few glyphs out of a 55MB CJK face cost a few
+/// pages instead of a full read. Where mapping is unavailable it reads the
+/// file instead. `MAP.SHARED`: a file truncated underneath us faults on
 /// access rather than returning short data.
 pub fn mapFaceFile(path: []const u8) ?std.Io.File.MemoryMap {
     const file = std.Io.Dir.cwd().openFile(dvui.io, path, .{}) catch return null;
@@ -511,14 +495,9 @@ pub fn mapFaceFile(path: []const u8) ?std.Io.File.MemoryMap {
 /// decides Chinese vs. Japanese vs. Korean Han glyph shapes.
 pub const generic_families = DiscoveryFamilyName.generic_keywords;
 
-/// Every font family installed on this machine, alphabetically, as reported
-/// by the OS discovery backend -- so it's device-dependent by nature (a
-/// different list on macOS vs. an Android phone), unlike `generic_families`.
-/// Empty when there's no backend compiled in (e.g. wasm).
-///
-/// Names are slices into caller-owned `name_storage`, and both buffers are
-/// hard caps: a machine with more families installed than fit yields a
-/// truncated list. `gpa` is only borrowed for the duration of the call.
+/// Every installed font family, alphabetically (device-dependent). Empty
+/// without a discovery backend (e.g. wasm). Names slice into `name_storage`;
+/// both buffers are hard caps, so the list may be truncated.
 pub fn systemFamilies(names_buf: [][]const u8, name_storage: []u8, gpa: std.mem.Allocator) []const []const u8 {
     const SysBackend = system_font_backend orelse return names_buf[0..0];
 
@@ -545,10 +524,8 @@ pub fn systemFamilies(names_buf: [][]const u8, name_storage: []u8, gpa: std.mem.
     return sorted;
 }
 
-/// Resolves `font`'s family against the OS font-discovery backend, reads
-/// the matched font file, and returns it as a `Source` -- the last resort
-/// before `Cache.getOrCreate` falls back to the embedded Vera font, for
-/// families the app never registered with `dvui.addFont`.
+/// Finds `font`'s family via OS font discovery and loads it: the last resort
+/// before the embedded Vera font.
 pub fn discoverSystemFont(gpa: std.mem.Allocator, font: Font) ?Source {
     const SysBackend = system_font_backend orelse return null;
 
@@ -704,10 +681,9 @@ pub fn ellipsisCut(self: Font, text: []const u8, max_width: f32, opts: TextSizeO
 
 pub const EndMetric = opentype.EndMetric;
 
-/// Byte range of the text to actually produce glyphs for. Bytes outside it
-/// still shape -- they are the context Arabic joining, ligatures and kerning
-/// resolve against -- but their glyphs are dropped, and the result is rebased
-/// so it reads exactly like a shape of `text[start..end]` on its own.
+/// Byte range of `text` to produce glyphs for. Bytes outside it are shaping
+/// context only (Arabic joining, ligatures, kerning); the result reads like a
+/// shape of `text[start..end]` alone.
 pub const ShapeItem = struct { start: usize, end: usize };
 
 pub const TextSizeOptions = struct {
@@ -716,12 +692,10 @@ pub const TextSizeOptions = struct {
     end_metric: EndMetric = .before,
     ascent_out: ?*f32 = null,
     /// When set, `text` is context and only this range is measured/shaped.
-    /// Mutually exclusive with `max_width`: the break decision has to have
-    /// been made already for the caller to know the range.
+    /// Excludes `max_width`.
     item: ?ShapeItem = null,
-    /// Paragraph base direction for UAX #9 P2/P3. `.auto` is first-strong,
-    /// which resolves LTR for a neutral-only or LTR-leading run even inside
-    /// an RTL paragraph -- so a caller that knows the paragraph says so.
+    /// Paragraph base direction (UAX #9 P2/P3). `.auto` is first-strong, so a
+    /// caller that knows the paragraph direction should pass it.
     base_direction: opentype.unicode.Bidi.ParagraphDirection = .auto,
     /// Where on its line `text` starts (logical pixels); tab stops count
     /// from the line start.
@@ -829,10 +803,6 @@ pub fn textSizeExShaped(self: Font, state_gpa: std.mem.Allocator, output: std.me
 
     var result = try cw.fonts.textSizeRawShaped(output, state_gpa, resolved, text, options, self.shapeStyle(opts.tab_origin * ss));
 
-    // Fetched after textSizeRawShaped, not before: it shapes text via
-    // shapeLineText, which can insert into self.cache while lazily
-    // materializing fallback-family entries -- that can grow/rehash the map
-    // and invalidate any *Entry captured beforehand.
     const fallback_entry = cw.fonts.primaryEntry(state_gpa, resolved) catch {
         result.shaped.deinit();
         return null;
@@ -1169,7 +1139,7 @@ test "TextSizeOptions.item: a joining neighbour changes the glyph chosen" {
 
     // seen + lam. Shaped alone, seen takes its isolated form; shaped with the
     // lam as (discarded) context it must take its initial form -- a different
-    // glyph. This is what per-addText-chunk shaping used to get wrong.
+    // glyph.
     const word = "\u{0633}\u{0644}";
     var alone = (try font.textSizeExShaped(dvui.currentWindow().gpa, gpa, word[0..2], .{})).?;
     defer alone.shaped.deinit();

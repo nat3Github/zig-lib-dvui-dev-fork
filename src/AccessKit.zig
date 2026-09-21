@@ -307,22 +307,16 @@ pub const CharPositionInfo = struct {
     x: f32, // x pos
 };
 
-/// Where one glyph landed, tagged with the byte offset of the cluster it
-/// came from. Glyphs are what rendering produces; AccessKit wants
-/// characters, so `buildCharacterInfo` converts.
+/// A rendered glyph, tagged with the byte offset of its cluster.
 pub const GlyphPosition = struct {
     cluster_byte: usize,
     x: f32,
     w: f32,
 };
 
-/// AccessKit indexes a text run by *character* -- here one codepoint --
-/// everywhere: `character_lengths` must sum to the run's byte length,
-/// `word_starts` and `TextPosition.character_index` count entries in it.
-/// Glyphs are not characters (a ligature merges several, a mark splits
-/// one), and in an RTL run they don't even arrive in logical order, so
-/// clusters are collected by byte offset and split evenly across the
-/// characters they cover.
+/// AccessKit indexes runs by character (codepoint), not glyph. Glyphs are
+/// sorted by cluster (RTL arrives in visual order) and each cluster's width
+/// is split evenly across its characters.
 pub fn buildCharacterInfo(
     arena: std.mem.Allocator,
     text: []const u8,
@@ -399,10 +393,8 @@ pub const TextRunOptions = struct {
     controlling_widget_id: dvui.Id,
     /// line number
     line: usize,
-    /// byte offset of this run within the widget's text (dvui counts
-    /// bytes; AccessKit's own indices into the run count characters)
+    /// byte offset of this run within the widget's text
     byte_offset: usize,
-    /// visual direction of this run, from the shaped bidi level
     rtl: bool = false,
 };
 
@@ -423,8 +415,7 @@ pub fn textRunPopulate(
     defer word_starts.deinit(window.arena());
 
     var prev_char_wordbreak: bool = self.text_run_prev_wordbreak or opts.node_parent_id != self.text_run_prev_parent_id;
-    // Indices into `character_lengths`, not into the bytes: a word start
-    // past any multi-byte character would otherwise point at the wrong one.
+    // word starts count characters, not bytes
     var character: usize = 0;
     var i: usize = 0;
     while (i < text.len) : (character += 1) {
@@ -471,8 +462,6 @@ pub fn textRunPopulate(
     self.text_runs.append(window.gpa, opts) catch {}; // If text run can't be added, selection actions will fail this frame.
 }
 
-/// The byte offset a character index names within `run`'s own text, which
-/// the node still holds as its value.
 fn runByteOffset(self: *AccessKit, run: TextRunOptions, character_index: usize) usize {
     const ak_node = self.nodes.get(run.node_id) orelse return character_index;
     const value = nodeValue(ak_node) orelse return character_index;
@@ -597,9 +586,6 @@ fn processActions(self: *AccessKit) void {
                 }
 
                 if (anchor_run) |a_run| if (focus_run) |f_run| {
-                    // `byte_offset` is dvui's unit; `character_index` is
-                    // AccessKit's, so it only lands on the right byte
-                    // after converting through the run's own text.
                     _ = window.addEventTextSelect(.{
                         .start = a_run.byte_offset + self.runByteOffset(a_run, anchor.character_index),
                         .end = f_run.byte_offset + self.runByteOffset(f_run, focus.character_index),

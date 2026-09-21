@@ -155,8 +155,7 @@ pub fn renderText(opts: TextOptions) Backend.GenericError!void {
     if (opts.rs.s == 0) return;
     if (clipped_rect.empty() and opts.ak_opts == null) return;
 
-    // `pre_shaped` bytes were already validated/shaped by the caller
-    // (`Font.textSizeExShaped`) -- skip re-validating them here too.
+    // pre_shaped text was already validated by the caller
     const utf8_text = if (opts.pre_shaped != null) opts.text else try dvui.toUtf8(cw.lifo(), opts.text);
     defer if (opts.pre_shaped == null and opts.text.ptr != utf8_text.ptr) cw.lifo().free(utf8_text);
 
@@ -168,16 +167,10 @@ pub fn renderText(opts: TextOptions) Backend.GenericError!void {
         return;
     }
 
-    // fce is built directly at this device-pixel size (see Font.zig), so
-    // everything below stays in device pixels -- no separate rescale factor
-    // needed the way the old FreeType/stb integer-pixel-size path required.
     const target_size = opts.font.size * opts.rs.s;
     const sized_font = opts.font.withSize(target_size);
 
-    // The Entry each glyph was actually shaped against (may differ per
-    // glyph for a multi-family Font -- see `ShapedLine.entryForGlyph`).
-    // `fallback_entry` (family index 0) is what line-level metrics
-    // (underline/strike/selection bounds, atlas) use.
+    // glyphs may come from different fallback entries; line metrics use the primary one
     var fallback_entry: *Font.Cache.Entry = undefined;
     var fallback_ascent: f32 = undefined;
     var shaped_text: Font.Cache.ShapedText = undefined;
@@ -185,9 +178,6 @@ pub fn renderText(opts: TextOptions) Backend.GenericError!void {
     defer if (owns_line) shaped_text.deinit();
 
     if (opts.pre_shaped) |shaped| {
-        // Already shaped once by the caller (full UAX #9 bidi + GSUB/GPOS)
-        // for measurement -- reuse it instead of reshaping the same bytes
-        // a second time just to draw them.
         fallback_entry = shaped.fallback;
         fallback_ascent = shaped.ascent;
         shaped_text = .{ .line = shaped.line, .entries = shaped.entries };
@@ -195,10 +185,6 @@ pub fn renderText(opts: TextOptions) Backend.GenericError!void {
         const resolved = try cw.fonts.resolveStack(cw.gpa, sized_font);
         shaped_text = cw.fonts.shapeLineText(cw.arena(), cw.gpa, resolved, utf8_text, null, .auto, opts.font.shapeStyle(0)) catch return error.OutOfMemory;
         owns_line = true;
-        // Fetched after shapeLineText, not before: shapeLineText can insert
-        // into self.cache while lazily materializing fallback-family
-        // entries, which can grow/rehash the map and invalidate any *Entry
-        // captured beforehand.
         fallback_entry = try cw.fonts.primaryEntry(cw.gpa, resolved);
         fallback_ascent = fallback_entry.ascent;
         if (opts.font.line_height_factor < 1.0) {
@@ -242,19 +228,11 @@ pub fn renderText(opts: TextOptions) Backend.GenericError!void {
 
     const snap = cw.snap_to_pixels;
 
-    // `line` may cover more than `utf8_text` when reusing a wider
-    // pre-shaped line (e.g. before UAX #14 line-break trimming shrank the
-    // rendered range) -- only draw the glyphs that correspond to it.
+    // a reused pre-shaped line can extend past the text drawn here
     const glyph_limit = if (opts.pre_shaped != null) opts.pre_shaped_glyph_limit orelse line.buffer.info.items.len else line.buffer.info.items.len;
 
-    // Glyphs can come from different `Entry`s (multi-family fallback), and
-    // each `Entry` owns its own atlas texture -- one shared vertex batch
-    // can only ever sample one atlas correctly, so batch per contiguous
-    // same-entry run and issue one `renderTriangles` call per atlas.
-    // Submission is deferred until after the loop (rather than per-segment)
-    // because `start.x` can still shift below (negative leftBearing/offset
-    // correction), and every segment must rotate around the same final
-    // `start`.
+    // Each entry has its own atlas, so batch per same-entry run. Submitted after
+    // the loop: start.x can still shift left, and all runs rotate around it.
     const SegRender = struct { tri: Triangles, tex: Texture };
     var seg_renders: std.ArrayList(SegRender) = .empty;
     defer {
@@ -295,6 +273,8 @@ pub fn renderText(opts: TextOptions) Backend.GenericError!void {
             const adv = fce.toPixels(pos.x_advance);
             const adv_used = if (snap) @round(adv) else adv;
 
+            // Glyph extends left of the start (negative left bearing, like "j"):
+            // shift the whole line over. textSize() includes this extra space.
             if (x + off_x + gi.leftBearing < start.x) {
                 start.x -= off_x + gi.leftBearing;
                 x = start.x;

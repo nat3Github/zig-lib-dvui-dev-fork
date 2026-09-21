@@ -103,7 +103,7 @@ pub fn scrollCanvas() void {
         ftb.init();
         defer ftb.deinit();
 
-        // outlines directly (no forced integer-pixel hinting) like stb did.
+        // This makes the text smoothly zoom
         const snap = dvui.snapToPixelsSet(false);
         defer _ = dvui.snapToPixelsSet(snap);
 

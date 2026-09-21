@@ -1339,9 +1339,7 @@ test "Cache.shapeLineText: a shaped_line_cache hit reshapes instead of dropping 
     try std.testing.expectEqual(@as(usize, 3), line.line.segments.len);
     const korean_key = resolved.entry_keys[1];
 
-    // Simulate the Korean fragment scrolling out of view: nothing touches
-    // `cache` for two frames, so it's unused across both resets and gets
-    // evicted (used-since-last-reset only survives one reset cycle).
+    // Korean fragment scrolls out of view: unused for two resets, so evicted.
     cw.fonts.reset(cw.gpa, cw.backend);
     cw.fonts.reset(cw.gpa, cw.backend);
     try std.testing.expect(cw.fonts.cache.getPtr(korean_key) == null);
@@ -1349,10 +1347,7 @@ test "Cache.shapeLineText: a shaped_line_cache hit reshapes instead of dropping 
     // The stack was evicted with it; a later frame resolves it anew.
     resolved = try cw.fonts.resolveStack(cw.gpa, stack);
 
-    // Scrolled back into view: same text, same stack -- shaped_line_cache
-    // still has the old line cached, but its Korean segment now points at
-    // an evicted entry. Must reshape from scratch, not silently drop the
-    // Korean segment and leave the caller thinking it's Latin-only.
+    // Back in view: the cached line points at the evicted entry, so it must reshape.
     var line2 = try cw.fonts.shapeLineText(std.testing.allocator, cw.gpa, resolved, text, null, .auto, .{});
     defer line2.deinit();
     try std.testing.expectEqual(@as(usize, 3), line2.line.segments.len);
@@ -1489,14 +1484,8 @@ test "Cache.loadDynamicFallback: rejects a discovered font with no rasterizable 
     const font: Font = .find(.{ .family = "Vera Sans", .size = 20 });
     const resolved = try cw.fonts.resolveStack(cw.gpa, font);
 
-    // Simplified Chinese: on recent macOS, CoreText's cascade list for this
-    // script can bottom out at a system-UI PingFang face (PingFangUI.ttc)
-    // whose glyphs live only in Apple's proprietary `hvgl` table (no glyf/
-    // CFF/CFF2) -- unrasterizable here. Whatever font (if any) ends up
-    // materialized for this text must have a real outline table; a rejected
-    // candidate should leave the codepoints uncovered (rendered via the
-    // primary font's notdef) rather than registering a font that produces
-    // zero-size glyphs for everything.
+    // macOS may offer an `hvgl`-only PingFang face (no glyf/CFF) for Chinese.
+    // A fallback must have real outlines; otherwise render notdef.
     const text = "这是一个中文测试句子。";
     var line = try cw.fonts.shapeLineText(gpa, gpa, resolved, text, null, .auto, .{});
     defer line.deinit();
@@ -1523,27 +1512,16 @@ test "Cache.shapeLineText: emoji next to CJK gets its own dynamic-fallback font,
     const stack: Font = .init("TestLatin");
     const resolved = try cw.fonts.resolveStack(cw.gpa, stack);
 
-    // CJK immediately followed by an emoji, both uncovered by TestLatin:
-    // each needs its own OS-discovered fallback font. Regression test for
-    // two bugs found together: (1) a weak/Common-script codepoint (the
-    // emoji, or the space next to it) could ride along in the same shaped
-    // run as an adjacent strong-script codepoint's font even when that font
-    // doesn't cover it (shaping.zig's font_of run-break check only fired for
-    // "strong" script codepoints); (2) `loadDynamicFallback` capped the
-    // fallback font file read at 64MiB, silently failing to load Apple
-    // Color Emoji.ttc (~180MiB on modern macOS) and returning null.
+    // CJK followed by an emoji, both uncovered by TestLatin: each needs its
+    // own fallback font, and the emoji must not ride along in the CJK run.
     const text = "\u{4E2D}\u{6587}\u{1F600}";
     var line = try cw.fonts.shapeLineText(gpa, gpa, resolved, text, null, .auto, .{});
     defer line.deinit();
 
     if (line.line.segments.len < 2) return error.SkipZigTest; // no dynamic fallback available in this environment
 
-    // Only glyphs actually shaped against a dynamically-discovered fallback
-    // font must be non-notdef -- a CJK codepoint can legitimately have no
-    // usable fallback at all (e.g. recent macOS's CJK system-UI face is
-    // `hvgl`-only and gets rejected by discovery's outline-table check) and
-    // falls back to the primary font's .notdef, which is correct, not a
-    // regression.
+    // CJK may legitimately have no usable fallback (hvgl-only), so only
+    // glyphs shaped against a fallback font must be non-notdef.
     const primary = cw.fonts.stackEntry(resolved, 0).?;
     for (line.line.buffer.info.items, 0..) |info, gidx| {
         if (line.entryForGlyph(primary, gidx) == primary) continue;

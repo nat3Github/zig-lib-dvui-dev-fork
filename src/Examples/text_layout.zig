@@ -31,24 +31,19 @@ var tab_entry_filled = false;
 var variable_font_registered = false;
 /// Registered stack alias, first entry in the family dropdown below.
 const demo_stack_alias = "Demo Stack (Aleo + Noto KR)";
-/// Dropdown entries: the CSS generics, then every family this device
-/// actually has installed (`dvui.Font.systemFamilies`), enumerated once --
-/// the OS query walks the whole font catalog, too slow to redo per frame.
+/// CSS generics plus installed families, enumerated once (the OS query is slow).
 var family_choices: ?[]const []const u8 = null;
 var family_choices_buf: [1024][]const u8 = undefined;
 var family_names_storage: [64 * 1024]u8 = undefined;
 
 /// ![image](Examples-text_layout.png)
 pub fn layoutText() void {
-    // Register a variable font once so the wght slider below has an fvar axis
-    // to move. Bytes are embedded (static), so pass null allocator.
+    // variable font, so the wght slider has an axis to move
     if (!variable_font_registered) {
         dvui.addFont("Aleo VF", @embedFile("../fonts/Aleo/Aleo-VariableFont_wght.ttf"), null) catch {};
         dvui.addFont("Noto Sans KR", @embedFile("../fonts/NotoSansKR-Regular.ttf"), null) catch {};
-        // An explicit family stack (CSS font-family model): Latin from Aleo,
-        // Hangul from Noto Sans KR, everything else from whatever the OS
-        // calls sans-serif. The KR slot is scaled down because Noto's
-        // Hangul runs visually larger than Aleo's Latin at the same size.
+        // Latin from Aleo, Hangul from Noto Sans KR (scaled down: it runs
+        // larger than Aleo), everything else from the OS sans-serif.
         dvui.addFontFamilyEntries(demo_stack_alias, &.{
             .{ .family = dvui.Font.array("Aleo VF") },
             .{ .family = dvui.Font.array("Noto Sans KR"), .size_scale = 0.85 },
@@ -494,9 +489,7 @@ fn familyChoices() []const []const u8 {
     };
 }
 
-/// Name of the font that actually renders `codepoint` in `font`: its own
-/// stack entry, else dvui's dynamic OS fallback. `source` must outlive the
-/// returned slice (`displayName()` borrows from it).
+/// Name of the font that renders `codepoint` in `font`. The result borrows from `source`.
 fn resolvedFontName(font: dvui.Font, codepoint: u21, source: *dvui.Font.Source) []const u8 {
     const cw = dvui.currentWindow();
     const stack = cw.fonts.resolveStack(cw.gpa, font) catch return "out of memory";
@@ -546,8 +539,7 @@ fn multiScript() void {
     }
     mtl.addText("\n\n", .{ .font = font });
 
-    // The label after each script name is the font that actually renders it,
-    // so a wrong or missing fallback shows up here instead of only as tofu.
+    // show which font renders each script, so a wrong fallback is visible
     const scripts = [_]struct { label: []const u8, sample: []const u8 }{
         .{ .label = "Latin", .sample = "The quick brown fox jumps over the lazy dog." },
         .{ .label = "Arabic", .sample = "هذه جملة اختبارية باللغة العربية." },
@@ -634,6 +626,16 @@ fn bidi() void {
     tl.addText("שורה שמתחילה בעברית, then Latin 42% ", .{});
     tl.addText("and a highlight שחוצה", highlight);
     tl.addText(" את הגבול.\n", .{});
+    // Words split across chunks still shape as one: Arabic letters keep joining, AV/To keep kerning.
+    tl.addText("Split words: ", .{});
+    tl.addText("مر", .{});
+    tl.addText("حب", highlight);
+    tl.addText("ا", .{});
+    tl.addText(" A", .{});
+    tl.addText("V", highlight);
+    tl.addText("A T", .{});
+    tl.addText("o", highlight);
+    tl.addText("\n", .{});
 }
 
 test {

@@ -82,9 +82,7 @@ pub const InitOptions = struct {
     word_break: opentype.WordBreakMode = .normal,
     overflow_wrap: TextLayoutWidget.OverflowWrap = .anywhere,
 
-    /// Paragraph base direction for the text; see
-    /// `TextLayoutWidget.InitOptions.base_direction`. `.rtl` puts an empty
-    /// entry's caret on the right.
+    /// See `TextLayoutWidget.InitOptions.base_direction`.
     base_direction: opentype.unicode.Bidi.ParagraphDirection = .auto,
 
     scroll_vertical: ?bool = null, // default is value of multiline
@@ -1687,9 +1685,7 @@ test "mixed-direction text: shift+arrow extends the selection over the visual st
     try TestEntry.focus();
 
     // "abc" | Hebrew | "xyz": bytes 0..3, 3..11, 11..14. Shift+Right walks
-    // the same visual stops as Right, so the anchor and the caret can end up
-    // on opposite sides of the boundary and the selection is the logical
-    // range between them, not the run the caret is in.
+    // visual stops; the selection is the logical range between anchor and caret.
     try TestEntry.load("abc\u{05e9}\u{05dc}\u{05d5}\u{05dd}xyz");
     for (0..4) |_| try TestEntry.press(.right);
     try std.testing.expectEqual(@as(usize, 9), TestEntry.cursor);

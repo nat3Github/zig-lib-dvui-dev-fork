@@ -590,24 +590,15 @@ pub fn frameTimeNS() i128 {
 /// If ttf_bytes_allocator is not null, it will be used to free `ttf_bytes` in
 /// `Window.deinit`.
 ///
-/// Only valid between `Window.begin`and `Window.end`: the font is validated by
-/// rendering a probe glyph, which needs the current window. Calling it before
-/// the first `begin` panics.
+/// Only valid between `Window.begin`and `Window.end`.
 pub fn addFont(name: []const u8, ttf_bytes: []const u8, ttf_bytes_allocator: ?std.mem.Allocator) (std.mem.Allocator.Error || FontError)!void {
     try currentWindow().addFont(name, ttf_bytes, ttf_bytes_allocator);
 }
 
-/// Register `alias` as an ordered fallback stack of family names, usable as
-/// a `Font` family anywhere a real family name is: the first family covering
-/// a codepoint renders it. Name one family per script you care about (Latin,
-/// Arabic, CJK, ...) instead of relying on OS fallback.
-///
-/// A family in the list may itself be an alias, registered before or after
-/// this one; nested aliases expand in place, up to `Font.Cache.max_alias_depth`
-/// levels deep and `Font.Cache.max_alias_expansions` expansions (past that,
-/// e.g. a cycle, is cut off with a warning).
-///
-/// Re-registering an alias replaces its list for all text from then on.
+/// Register `alias` as an ordered fallback stack usable as a `Font` family:
+/// the first family covering a codepoint renders it. Families may themselves
+/// be aliases (nesting is capped, cycles are cut off with a warning).
+/// Re-registering replaces the stack.
 ///
 /// Only valid between `Window.begin` and `Window.end`.
 pub fn addFontFamily(alias: []const u8, families: []const []const u8) std.mem.Allocator.Error!void {
@@ -615,8 +606,7 @@ pub fn addFontFamily(alias: []const u8, families: []const []const u8) std.mem.Al
     try cw.fonts.addFamily(cw.gpa, alias, families);
 }
 
-/// `addFontFamily` with per-family overrides (size scale, weight, style,
-/// stretch) applied to each family in the stack.
+/// `addFontFamily` with per-family size/weight/style/stretch overrides.
 ///
 /// Only valid between `Window.begin` and `Window.end`.
 pub fn addFontFamilyEntries(alias: []const u8, entries: []const Font.FamilyEntry) std.mem.Allocator.Error!void {

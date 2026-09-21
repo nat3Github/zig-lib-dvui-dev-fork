@@ -210,8 +210,7 @@ fn fonts(theme: *Theme) bool {
                 changed = true;
             }
         }
-        // Aliases name a whole stack, not one face -- style/weight belong to
-        // the entries inside it, so don't overwrite them here.
+        // an alias is a font stack, so keep the current style/weight
         var it = cw.fonts.family_aliases.keyIterator();
         while (it.next()) |key| {
             if (dd.addChoiceLabel(key.*)) {

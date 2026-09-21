@@ -215,7 +215,6 @@ pub fn build(b: *std.Build) !void {
 
     const libc_option = b.option(bool, "libc", "Use libc (default is backend specific)");
     const tiny_file_dialogs_option = b.option(bool, "tiny-file-dialogs", "OS-native file dialogs (default is backend specific)");
-    // Forwarded to the opentype dependency's font-discovery backends.
     const opentype_fontconfig = b.option(bool, "fontconfig", "Enable the Fontconfig font-discovery backend (forwarded to opentype)") orelse (target.result.os.tag == .linux and target.result.abi != .android);
     const opentype_core_text = b.option(bool, "core-text", "Enable the CoreText font-discovery backend (forwarded to opentype)") orelse target.result.os.tag.isDarwin();
     const opentype_directwrite = b.option(bool, "directwrite", "Enable the DirectWrite font-discovery backend (forwarded to opentype)") orelse (target.result.os.tag == .windows);
@@ -324,7 +323,6 @@ pub fn build(b: *std.Build) !void {
         .opentype_manifest = opentype_manifest,
         .opentype_woff2 = opentype_woff2,
         .font_fallback = font_fallback,
-
         .tiny_file_dialogs = tiny_file_dialogs_option,
         .linux_display_backend = linux_display_backend,
         .stb_image = stb_image_option,
@@ -1508,8 +1506,6 @@ pub fn addDvuiModule(
         });
     }
 
-    // Text/font engine: lib-opentype-renderer, replacing FreeType/stb_truetype
-    // entirely (parsing/shaping/rasterization, no C font-rendering deps left).
     const opentype_dep = b.dependency("opentype", .{
         .target = target,
         .optimize = optimize,

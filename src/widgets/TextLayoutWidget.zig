@@ -45,20 +45,16 @@ pub const InitOptions = struct {
     /// If true, break text on space to fit (or any character if width is < 10 Ms)
     break_lines: bool = true,
 
-    /// CSS `line-break`: how strictly to allow breaks around punctuation,
-    /// small kana, etc. `.strict` is the untailored UAX #14 default;
-    /// `.normal`/`.loose` add more opportunities. See `LineBreakStrictness`.
+    /// CSS `line-break`: `.strict` is plain UAX #14, `.normal`/`.loose` allow
+    /// more breaks around punctuation and small kana.
     line_break: LineBreakStrictness = .strict,
 
-    /// CSS `word-break`: `.normal` is customary UAX #14, `.break_all` allows
-    /// breaks between any two letters (CJK-style), `.keep_all` forbids breaks
-    /// between letters (keeping runs whole, dictionary breaks still apply).
+    /// CSS `word-break`: `.break_all` allows breaks between any letters,
+    /// `.keep_all` forbids them between letters.
     word_break: WordBreakMode = .normal,
 
-    /// CSS `overflow-wrap`. `.anywhere` (default, dvui's existing behavior)
-    /// breaks an over-long word at a character boundary so it never exceeds
-    /// the line; `.normal` lets such a word overflow instead of breaking it
-    /// mid-word.
+    /// CSS `overflow-wrap`: `.anywhere` (default) character-breaks an over-long
+    /// word, `.normal` lets it overflow.
     overflow_wrap: OverflowWrap = .anywhere,
 
     /// If true, assume text (and text height) is the same as we saw last frame
@@ -74,20 +70,18 @@ pub const InitOptions = struct {
 
     process_events_in_deinit: bool = true,
 
-    /// Paragraph base direction (UAX #9 P2/P3). `.auto` resolves per
-    /// paragraph from its first strong character, so an empty line, a
-    /// neutral-only line or an LTR-leading line all read left to right --
-    /// wrong when the surrounding UI is RTL. Set it to pin the direction.
+    /// Paragraph base direction (UAX #9 P2/P3). `.auto` uses the first strong
+    /// character, so empty or neutral-only lines read left to right; set it for
+    /// RTL UIs.
     base_direction: opentype.unicode.Bidi.ParagraphDirection = .auto,
 
     /// CSS `text-align`, applied to each line once it is broken. `.start`
     /// and `.end` follow the paragraph's resolved direction. No justify.
     text_align: TextAlign = .start,
 
-    /// CSS `line-clamp`: lay out at most this many lines, ending the last
-    /// one in an ellipsis if the text didn't fit (`text-overflow:
-    /// ellipsis`); 1 truncates a single line. Text past it is not laid out.
-    /// ponytail: a last line closed by a hard break gets no ellipsis.
+    /// CSS `line-clamp`: lay out at most this many lines, ending the last in an
+    /// ellipsis if the text didn't fit. A last line ended by a hard break gets
+    /// no ellipsis.
     max_lines: ?usize = null,
 };
 
@@ -199,9 +193,8 @@ cursor_event: ?dvui.Event.EventTypes = null,
 click_pt: ?Point = null,
 click_event: ?dvui.Event.EventTypes = null,
 
-/// Recorded last frame, answered this frame. Click and hover get a slot each:
-/// one frame can hold a hover on one chunk and a click on another, and a
-/// single slot would let the later one overwrite the earlier.
+/// Recorded last frame, answered this frame. Click and hover have separate
+/// slots so one can't overwrite the other.
 deferred_click: ?DeferredHit = null,
 deferred_hover: ?DeferredHit = null,
 /// Recorded this frame, answered next frame.
@@ -214,13 +207,10 @@ click_num_pt: dvui.Point.Physical = .{},
 
 line: usize = 0,
 
-/// Fragments laid out but not yet drawn, all belonging to the visual line
-/// currently being built. UAX #9 cannot place any of them until the whole
-/// line's logical text is known, and a line can span several addText calls.
-/// Arena-backed, so nothing here needs freeing.
+/// Fragments of the visual line being built. Bidi can only place them once
+/// the whole line is known, which can span several addText calls. Arena-backed.
 line_frags: std.ArrayList(Fragment) = .empty,
-/// Set when any buffered fragment holds bytes that could resolve RTL; when
-/// false the line is placed left to right without running the bidi pass.
+/// A buffered fragment may hold RTL text; false skips the bidi pass.
 line_maybe_rtl: bool = false,
 /// Byte a point past the far edge of the most recently placed line resolves
 /// to; null until a line with fragments has been placed.
@@ -228,10 +218,8 @@ line_end_byte: ?usize = null,
 /// Left edge of the most recently placed line, which an RTL line's logical
 /// end sits at; null until a line with fragments has been placed.
 line_left_x: ?f32 = null,
-/// UAX #9 P2/P3 runs over the paragraph, not the visual line: once a strong
-/// character has fixed the base direction it holds until the next hard break,
-/// so a wrapped RTL paragraph whose second line starts with a Latin word
-/// stays right-to-left. Null until the paragraph's first strong character.
+/// Paragraph direction from its first strong character (UAX #9 P2/P3), held
+/// until the next hard break. Null until one is seen.
 paragraph_direction: ?opentype.unicode.Bidi.ParagraphDirection = null,
 bytes_seen: usize = 0,
 first_byte_in_line: usize = 0,
@@ -655,14 +643,9 @@ pub fn addLink(self: *TextLayoutWidget, init_opts: AddLinkOptions, opts: Options
     }
 }
 
-/// A hit answered one frame late, so a clickable chunk doesn't have to force
-/// its line out before the bidi pass can place it. Keyed on the chunk's
-/// ordinal within the frame rather than its byte offset: offsets shift
-/// whenever earlier text changes, ordinals survive re-highlighting.
-/// ponytail: the counter is shared across click and hover chunks in draw
-/// order, so if the click itself changes how many actionable chunks the
-/// frame emits, the stored hit lands on the neighbouring chunk for one
-/// frame. Key on a caller-supplied id if that ever bites.
+/// A hit answered one frame late, keyed on the chunk's ordinal in the frame
+/// (byte offsets shift when earlier text changes). If a click changes how many
+/// actionable chunks the frame has, the hit lands on a neighbour for one frame.
 const DeferredHit = struct {
     ordinal: usize,
     event: dvui.Event.EventTypes,
@@ -725,18 +708,14 @@ pub fn addTextTooltip(self: *TextLayoutWidget, src: std.builtin.SourceLocation, 
     tt.deinit();
 }
 
-/// Reading direction of the run the caret sat in last frame. A key arrives
-/// before this frame has laid anything out, so a move that has to be decided
-/// up front (word steps, which collect their targets during the pass) has
-/// only the previous frame to ask.
+/// Direction of the run the caret was in last frame: keys arrive before this
+/// frame's layout.
 pub fn caretRtl(self: *TextLayoutWidget) bool {
     return if (self.selection.cursor == self.selection.start) self.sel_start_rtl else self.sel_end_rtl;
 }
 
-/// Which way a Left/Right key moves the caret through the *text*. Word steps
-/// collect their targets during the layout pass, so unlike char steps they
-/// cannot be resolved against the placed line afterwards: they go by the
-/// direction of the run the caret sat in last frame.
+/// Which way a Left/Right key moves the caret through the text. Word steps
+/// go by the direction of the caret's run last frame.
 pub fn logicalStep(self: *TextLayoutWidget, right: bool) i8 {
     return if (right != self.caretRtl()) 1 else -1;
 }
@@ -1128,9 +1107,8 @@ fn cursorSeen(self: *TextLayoutWidget) void {
             }
         },
         .char_left_right => |*clr| {
-            // Visual first: on the placed line the caret walks the screen,
-            // not the byte stream. Only what runs off the end of the line is
-            // left for the logical paths here and in `selMoveText`.
+            // Visual steps first; only what runs off the end of the line is left for
+            // the logical paths here and in `selMoveText`.
             self.charVisualMove(clr);
             if (clr.count < 0) {
                 const oldcur = self.selection.cursor;
@@ -1442,9 +1420,7 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
 
     const options = self.data().options.override(opts);
     const font = options.fontGet();
-    // font.lineHeight() is textHeight() * factor, and textHeight() is
-    // sizeM(1,1).h -- reuse msize instead of re-shaping "M" a second time
-    // for the same font/scale.
+    // lineHeight() is sizeM(1, 1).h * factor, so reuse msize
     const msize = font.sizeM(1, 1);
     const line_height = msize.h * font.line_height_factor;
 
@@ -1510,22 +1486,12 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
         // get slice of text that fits within width or ends with newline
         var ascent: f32 = undefined;
 
-        // Shape this fragment once and reuse the shape (full UAX #9 bidi +
-        // GSUB/GPOS) for line-break re-measurement, cursor/selection
-        // tracking, and the actual glyph render below -- each of those
-        // used to trigger its own independent reshape of the same bytes,
-        // 3-4x per fragment per frame. `shaped` is scratch-allocated on
-        // `cw.arena()` (bulk-freed at frame end), so it's deliberately
-        // never `.deinit()`'d here -- only arena-copied out via
-        // `shaped_ptr` right before the render call that needs it to
-        // outlive this function (see there).
+        // Shaped once, reused for re-measuring, cursor/selection and rendering.
+        // Arena-allocated, so never deinit'd.
         var shaped: ?Font.ShapedText = null;
         var s: Size = undefined;
-        // Set when this fragment's shape holds both directions at once: no
-        // byte prefix of it is a contiguous stretch of the line, so we drop
-        // to the reshape-per-line path -- which shapes each final line
-        // byte-range on its own and is therefore visually correct -- and
-        // retreat over-wide lines to a fitting break below.
+        // The shape holds both directions, so no byte prefix is contiguous on
+        // screen: reshape each line and retreat over-wide lines below.
         var line_is_mixed = false;
         if (font.textSizeExShaped(cw.gpa, cw.arena(), txt, .{
             .max_width = if (self.break_lines) width else null,
@@ -1538,8 +1504,6 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
             shaped = res.shaped;
             if (shaped) |*st| {
                 if (st.line.isMixedDirection()) {
-                    // Leave the unused shape for the frame arena to bulk-free
-                    // (matches the "never deinit here" convention above).
                     shaped = null;
                     line_is_mixed = true;
                 }
@@ -1565,13 +1529,11 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
 
         if (self.break_lines) blk: {
 
-            // Slice ended due to width (not newline): retreat to a break
-            // opportunity. No narrow-width cutoff -- without an opportunity
-            // `overflow_wrap` already falls back to a character break.
+            // Cut by width, not newline: retreat to a break opportunity. With none,
+            // `overflow_wrap` falls back to a character break.
             if (end < txt.len and !self.newline) {
-                // Spaces past the width hang (CSS white-space: normal), and
-                // UAX #14 only breaks after them, so search from past the run.
-                // ponytail: U+0020 only; tabs/NBSP-like spaces don't hang.
+                // Spaces past the width hang (CSS white-space: normal) and UAX #14 only
+                // breaks after them, so search from past the run. Only U+0020 hangs.
                 var hang_end = end;
                 while (hang_end < txt.len and txt[hang_end] == ' ') hang_end += 1;
                 if (Font.firstHardBreak(txt[hang_end..])) |hb| {
@@ -1589,16 +1551,10 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
                     if (shaped) |*st| {
                         const shaped_len = st.line.byte_offsets[st.line.codepoints.len];
                         if (end <= shaped_len) {
-                            // Common case: the break point falls inside
-                            // what we already shaped above -- re-measure
-                            // by summing already-computed advances instead
-                            // of reshaping.
+                            // break inside the shaped range: sum the existing advances
                             s = st.measureUpToByteOffset(cw.gpa, ink_end) catch font.textSizeEx(txt[0..ink_end], .{ .tab_origin = self.insert_pt.x });
                         } else {
-                            // Rare: the break search's lookahead crossed
-                            // past what was shaped. Fall back to a single
-                            // reshape for this fragment (`shaped` no longer
-                            // matches `end` so downstream reuse is skipped).
+                            // break past the shaped range: reshape
                             shaped = null;
                             s = font.textSizeEx(txt[0..ink_end], .{ .tab_origin = self.insert_pt.x });
                         }
@@ -1608,13 +1564,8 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
                     break :blk; // this part will fit
                 }
 
-                // No break opportunity: this is an over-long word. Under
-                // `overflow-wrap: normal` extend `end` to the word's next
-                // natural break (or end of text) so it renders whole and
-                // overflows rather than being char-broken; the drop-to-next-
-                // line check below still moves it down first if it isn't
-                // already at the line start. Under `.anywhere` (default) keep
-                // the width-limited `end`, i.e. a character break.
+                // No break opportunity (over-long word): `.normal` extends to the word's
+                // end so it overflows whole, `.anywhere` keeps the character break.
                 if (self.overflow_wrap == .normal) {
                     end = nextLineBreakOpportunity(dvui.currentWindow().lifo(), txt, end, self.line_break, self.word_break) orelse txt.len;
                     shaped = null;
@@ -1623,12 +1574,8 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
                 // else fall through -> character break
             }
 
-            // Bidi: the seed `end`/`s` came from a visual-prefix width walk,
-            // which for reordered text can pick a byte range that reshapes
-            // wider than `width`. Re-measure the real line, and if we're
-            // already at the line start (so dropping down wouldn't help),
-            // retreat to the previous break opportunity until it fits (or no
-            // earlier break exists -- an unbreakable run, left to overflow).
+            // Reordered text can reshape wider than the seed break. At the line start,
+            // retreat to earlier breaks until it fits (an unbreakable run overflows).
             if (line_is_mixed) {
                 s = font.textSizeEx(txt[0..end], .{ .tab_origin = self.insert_pt.x });
                 const at_line_start = !(linewidth < container_width or self.insert_pt.x > linestart);
@@ -1701,13 +1648,9 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
         }
 
         if (shaped) |*st| {
-            // A shape running past the fragment can't be sliced from the
-            // leading end of an RTL run -- that is the wrong end, and the
-            // glyphs it would keep aren't even the ones under `f.text`. So
-            // reshape the fragment's own bytes, with the rest of `txt` as
-            // context so the break doesn't undo any joining forms. Dropping
-            // the shape instead would leave the caret to be placed from ink
-            // widths, which is not where the pen is (see `fragCaretX`).
+            // A shape running past the fragment can't be sliced (the leading end is the
+            // wrong one for RTL), so reshape the fragment's bytes with the rest of `txt`
+            // as context to keep joining forms.
             if (st.line.isRtl() and st.line.byte_offsets[st.line.codepoints.len] != shapeableLen(txt[0..end])) {
                 shaped = null;
                 if (font.textSizeExShaped(cw.gpa, cw.arena(), txt, .{
@@ -1767,9 +1710,8 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
             break :text_loop;
         }
 
-        // The line closes right here, so place and draw it before the layout
-        // half moves on: lineBreak() below mutates the same selection state
-        // emitFragment does, and used to run after it.
+        // Place and draw the line before lineBreak() changes the selection state
+        // emitFragment uses.
         if (self.newline or end < txt.len) self.flushLine();
 
         // Even if we don't actually render (might be outside clipping region),
@@ -1841,23 +1783,16 @@ fn addTextEx(self: *TextLayoutWidget, text_in: []const u8, action: AddTextExActi
     return ret;
 }
 
-/// A cheap pre-filter on UTF-8 lead bytes: true unless the text provably holds
-/// no character that bidi could resolve as anything but left-to-right, so
-/// Latin -- and CJK, and emoji -- never run the bidi pass. Conservative by
-/// construction: a truncated sequence at the end of `text` says yes.
-/// Where a caret with no text to sit against goes: the pen, except that an
-/// RTL paragraph starts at the right edge, so an empty line's caret belongs
-/// there rather than at x=0.
+/// Caret x with no text to sit against: the pen, or the right edge in an
+/// RTL paragraph.
 fn penX(self: *TextLayoutWidget) f32 {
     if (self.insert_pt.x == 0) {
         const avail = self.data().contentRect().w;
         const factor = self.alignFactor();
         return if (avail == 0 or factor == 0) 0 else @min(avail * factor, avail - 1);
     }
-    // The line was aligned after the pen moved, so `insert_pt.x` is a width
-    // rather than a position.
-    // ponytail: the left edge, not the logical end, on a mixed line -- this
-    // is the fallback for a caret no fragment claimed.
+    // `insert_pt.x` is a width here: the line was aligned after the pen moved.
+    // On a mixed line this is the left edge, not the logical end.
     if (self.baseDir() == .rtl) return self.line_left_x orelse self.insert_pt.x;
     return self.insert_pt.x + self.line_shift;
 }
@@ -1867,11 +1802,9 @@ fn onLastLine(self: *TextLayoutWidget, line_height: f32, text_height: f32) bool 
         if (self.line + 1 >= max) return true;
     }
 
-    // Height-capped: end on the last line that fits whole, otherwise the clip
-    // shears the next one through the middle of the glyphs.  The cap comes
-    // from max_size_content and never from the rect we were given, which is
-    // fed by our own min size and would ratchet us down a line per frame.
-    // A trailing line reserves text_height, matching the min size below.
+    // Height cap: stop at the last whole line instead of clipping one. The cap
+    // comes from max_size_content, never our own rect (fed by our min size, it
+    // would shrink a line per frame). A trailing line reserves text_height.
     if (self.cache_layout) return false;
     const avail = self.data().options.max_size_contentGet().h;
     if (avail >= dvui.max_float_safe) return false;
@@ -1884,9 +1817,8 @@ fn baseDir(self: *const TextLayoutWidget) opentype.unicode.Bidi.ParagraphDirecti
     return self.paragraph_direction orelse self.base_direction;
 }
 
-/// Replaces the buffered line with its level-run pieces, each carrying the x
-/// UAX #9 rule L2 puts it at. Pieces stay in logical order so the emit half
-/// still walks the text the way the caller wrote it.
+/// Splits the buffered line into level-run pieces placed by UAX #9 L2, kept
+/// in logical order.
 fn reorderLineVisual(self: *TextLayoutWidget) void {
     const cw = dvui.currentWindow();
     const arena = cw.arena();
@@ -1907,11 +1839,8 @@ fn reorderLineVisual(self: *TextLayoutWidget) void {
         if (p.start != 0 or p.end != src.text.len) {
             // Only the piece holding the fragment's tail closes the line.
             f.newline = src.newline and p.end == src.text.len;
-            // The fragment's own shape covers bytes this piece doesn't, so
-            // it is shaped again -- with the rest of the fragment as context,
-            // so cutting a level run out of the middle of a word doesn't undo
-            // its joining forms. The result is rebased onto the piece, so
-            // both halves can slice it by byte offset.
+            // Reshape the piece with the rest of the fragment as context (keeps joining
+            // forms), rebased onto the piece.
             f.shaped = null;
             f.render_shaped = null;
             if (src.font.textSizeExShaped(cw.gpa, cw.arena(), src.text, .{
@@ -1933,9 +1862,7 @@ fn reorderLineVisual(self: *TextLayoutWidget) void {
 }
 
 /// Share of a line's free space that goes before it: 0 left, 1 right.
-/// UAX #9 places runs relative to a line origin but says nothing about
-/// where that origin is; `.start` puts it where the paragraph's reader
-/// starts, the right edge of an RTL one.
+/// `.start` is the right edge of an RTL paragraph.
 fn alignFactor(self: *const TextLayoutWidget) f32 {
     const rtl = self.baseDir() == .rtl;
     return switch (self.text_align) {
@@ -1976,15 +1903,12 @@ fn flushLine(self: *TextLayoutWidget) void {
         return;
     }
 
-    // A flush can land in addTextDone/deinit/rectFor rather than in the
-    // addText call that produced the fragments, so re-establish the clip
-    // addTextEx set for them -- and put back whatever the caller had.
+    // A flush can run from addTextDone/deinit/rectFor, so restore the clip
+    // addTextEx set for these fragments, then the caller's.
     const saved_clip = dvui.clip(self.data().contentRectScale().r);
     defer dvui.clipSet(saved_clip);
 
-    // Each fragment snapshotted the line ascent as it stood when it was
-    // buffered, so one that turned out to be taller only reached the
-    // fragments after it. The line is closed now, so take the real max.
+    // Fragments captured the line ascent when buffered; use the final max.
     var line_max_ascent: f32 = 0;
     for (self.line_frags.items) |f| line_max_ascent = @max(line_max_ascent, @max(f.max_ascent, f.ascent));
     for (self.line_frags.items) |*f| f.max_ascent = line_max_ascent;
@@ -2001,11 +1925,8 @@ fn flushLine(self: *TextLayoutWidget) void {
     self.line_left_x = left;
     for (self.line_frags.items, 0..) |f, i| self.emitFragment(f, i);
 
-    // A caret at the end of the text with `.after` affinity -- what Ctrl+End
-    // leaves -- points at the start of a line that never comes, so no
-    // fragment claims it. Take it here, while the line it actually sits on is
-    // still placed, or a visual key step finds no stops to walk and falls
-    // back to a logical one: on an RTL line, a step the wrong way.
+    // A caret at the end of the text with `.after` affinity (Ctrl+End) belongs
+    // to no fragment, so claim it while its line is placed.
     if (self.add_text_done and !self.cursor_seen) {
         const last = self.line_frags.items[self.line_frags.items.len - 1];
         self.cursor_rect = .{ .x = self.penX(), .y = last.y, .w = 1, .h = last.size.h };
@@ -2016,18 +1937,14 @@ fn flushLine(self: *TextLayoutWidget) void {
     if (self.line_frags.items[self.line_frags.items.len - 1].newline) self.paragraph_direction = null;
 }
 
-/// One laid-out fragment, ready to draw. Everything here is decided by the
-/// layout half of `addTextEx`; emitting is pure logical-order work (selection,
-/// cursor, clipboard, accesskit, render), so `x`/`y` are the only inputs that
-/// visual reordering has to change.
+/// One laid-out fragment. Bidi reordering only changes `x`/`y`; emitting
+/// (selection, cursor, clipboard, accesskit, render) is logical-order work.
 pub const Fragment = struct {
     text: []const u8,
     size: Size,
     ascent: f32,
-    /// Prefix-safe shape of `text`: set unless the shape mixes both
-    /// directions, in which case no byte prefix of it covers a contiguous
-    /// stretch of the line. A single RTL run is fine -- the emit half asks
-    /// for prefixes by cluster, not by leading glyph.
+    /// Shape of `text` that can be sliced by byte prefix; null when it mixes
+    /// directions.
     shaped: ?Font.ShapedText,
     /// Whole-fragment shape taken with the neighbouring text as context, so
     /// Arabic joining forms and cross-boundary kerning are right. Valid for
@@ -2084,11 +2001,8 @@ fn emitFragment(self: *TextLayoutWidget, f: Fragment, index: usize) void {
         return;
     }
     var shaped = f.shaped;
-    // How many leading glyphs of
-    // `shaped` (if any) correspond to `f.text`, for reuse by
-    // cursor/selection tracking and the render call below. Leading is the
-    // wrong end of an RTL run, so a shape that overruns the fragment must
-    // already have been dropped (see addTextEx).
+    // leading glyphs of `shaped` that belong to `f.text` (RTL shapes that
+    // overrun the fragment were already dropped in addTextEx)
     if (shaped) |*st| std.debug.assert(!st.line.buffer.isRtl() or st.line.byte_offsets[st.line.codepoints.len] == shapeableLen(f.text));
     const shaped_glyph_limit: ?usize = if (shaped) |*st| st.line.glyphLimitForByteOffset(f.text.len) else null;
     // see if selection needs to be updated
@@ -2236,12 +2150,8 @@ fn emitFragment(self: *TextLayoutWidget, f: Fragment, index: usize) void {
             break :info null;
         };
 
-        // Hand the shape from above to renderText instead of letting
-        // it reshape `rtxt` from scratch -- but it needs to outlive
-        // this function (a floating window's render can be deferred to
-        // later this frame), so copy the small `ShapedText` header
-        // (not the shape's own arrays, already arena-owned) onto
-        // `cw.arena()` rather than pointing at this stack frame.
+        // Reuse the shape in renderText. Rendering can be deferred (floating
+        // windows), so copy the ShapedText header onto the arena.
         var render_glyph_limit = shaped_glyph_limit;
         const pre_shaped: ?*const Font.ShapedText = blk: {
             // The context shape covers exactly `f.text`, so it needs no
@@ -2253,10 +2163,7 @@ fn emitFragment(self: *TextLayoutWidget, f: Fragment, index: usize) void {
             break :blk p;
         };
 
-        // Sampled against this run's own `rs.r`, so a gradient resets at
-        // each line/style-run boundary; set `gradient.anchor` to a
-        // shared rect (e.g. the whole TextLayoutWidget) for a continuous
-        // sweep across multiple lines/runs.
+        // gradient resets per run; set `gradient.anchor` for one continuous sweep
         const text_col = f.options.color(.text).split();
         dvui.renderText(.{
             .font = f.font,
@@ -2997,7 +2904,7 @@ pub fn deinit(self: *TextLayoutWidget) void {
         .sel_end_r = self.sel_end_r,
         .sel_end_rtl = self.sel_end_rtl,
         .click_num = self.click_num,
-        // No click in progress: the point restarts from its default, as it did when the key was dropped.
+        // No click in progress: reset the point to its default.
         .click_num_pt = if (self.click_num == 0) .{} else self.click_num_pt,
         .deferred_click = self.deferred_click_new,
         .deferred_hover = self.deferred_hover_new,
@@ -3117,8 +3024,7 @@ test "e2e: a clickable chunk reordered to the left edge answers a click there" {
 
     try dvui.testing.settle(fns.frame);
 
-    // The link is logically last but visually first, so it sits at the left
-    // edge -- which it could not if it still flushed its own line.
+    // The link is logically last but visually first, so it sits at the left edge.
     const c = fns.content;
     _ = try dvui.currentWindow().addEventMouseMotion(.{ .pt = .{ .x = c.x + 4, .y = c.y + 4 } });
     try dvui.testing.click(.left);
@@ -3221,9 +3127,8 @@ test "e2e: a word that fits keeps its line when only the trailing space overflow
 
     try dvui.testing.settle(fns.frame);
 
-    // Before: the seed stopped on the space, the `end + 1` lookahead never saw
-    // the break after it, and the first word was char-broken off, leaving the
-    // second line to start with a space and wrap again.
+    // The `end + 1` lookahead must see the break after the space, or the first
+    // word is char-broken off.
     try std.testing.expectEqual(@as(usize, 2), fns.lines);
 }
 
@@ -3299,8 +3204,7 @@ test "recordHit: a click and a hover in the same frame both answer" {
     const hover_pt = fns.rs.pointToPhysical(.{ .x = font.textSizeEx("AAAA        ", .{}).w + 2, .y = 2 });
 
     // Click lands on the first chunk, then the mouse moves onto the second
-    // before the frame's single position event -- one frame, two hits, two
-    // different chunks. With one slot the later one used to win.
+    // before the frame's single position event: one frame, two hits, two chunks.
     const cw = dvui.currentWindow();
     _ = try cw.addEventMouseMotion(.{ .pt = click_pt });
     try dvui.testing.click(.left);
@@ -3752,8 +3656,8 @@ test "e2e: an RTL line ending in a newline does not trip emitFragment" {
         fn frame() !dvui.App.Result {
             var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal });
             defer tl.deinit();
-            // Shaping stops at the hard break, so the shape is one byte
-            // shorter than the fragment -- which used to trip emitFragment.
+            // Shaping stops at the hard break, so the shape is one byte shorter than
+            // the fragment.
             tl.addText("\u{05e9}\u{05dc}\u{05d5}\u{05dd}\n\n", .{});
             tl.addTextDone(.{});
             return .ok;
@@ -3810,12 +3714,9 @@ fn bidiPieces(arena: std.mem.Allocator, frags: []const Fragment, base_direction:
     return opentype.unicode.Bidi.lineRuns(arena, texts, base_direction) catch null;
 }
 
-/// How much of a neighbouring fragment to carry into a fragment's own
-/// shaping call as context. Cursive joining and kerning reach one glyph past
-/// the boundary and ligatures a couple more, so this is a cap rather than the
-/// whole neighbour -- taking the whole line would make one flush O(n^2) in
-/// fragment count.
-/// ponytail: 32 bytes each side; raise it if a real feature ever spans more.
+/// Bytes of each neighbouring fragment used as shaping context. Joining and
+/// kerning reach one glyph, ligatures a few more; a cap keeps a flush linear
+/// in fragment count. Raise it if a real feature spans more.
 const neighbour_context_bytes = 32;
 
 fn contextTail(text: []const u8) []const u8 {
@@ -3839,12 +3740,9 @@ fn stickyBoundary(before: []const u8, after: []const u8) bool {
     return !std.ascii.isWhitespace(before[before.len - 1]) and !std.ascii.isWhitespace(after[0]);
 }
 
-/// Shaping is per addText chunk, so an Arabic word split across two chunks
-/// gets no cursive joining and nothing kerns across the split. Re-shape every
-/// fragment that abuts a non-whitespace boundary with its neighbours' bytes
-/// as context -- their glyphs are discarded, they only get to influence this
-/// fragment's -- and re-place the line, since joined forms are narrower than
-/// the isolated ones the layout half measured.
+/// Reshape fragments at non-whitespace chunk boundaries with their
+/// neighbours' bytes as context (Arabic joining, kerning), then re-place the
+/// line since joined forms are narrower.
 fn reshapeWithNeighbourContext(frags: []Fragment, base_direction: opentype.unicode.Bidi.ParagraphDirection) void {
     if (frags.len < 2) return;
     const cw = dvui.currentWindow();
@@ -3931,9 +3829,8 @@ test "reshapeWithNeighbourContext: a word split across chunks joins across the s
     defer alone.shaped.deinit();
     if (alone.shaped.line.buffer.info.items[0].codepoint == 0) return error.SkipZigTest;
 
-    // With the alef visible as context, seen+lam take joining forms -- a
-    // different glyph sequence from the same bytes shaped on their own, which
-    // is exactly what per-chunk shaping could not produce.
+    // With the alef as context, seen+lam take joining forms: a different glyph
+    // sequence than the same bytes shaped alone.
     const ctx_glyphs = frags[0].render_shaped.?.line.buffer.info.items;
     const alone_glyphs = alone.shaped.line.buffer.info.items;
     var same = ctx_glyphs.len == alone_glyphs.len;
@@ -3989,15 +3886,11 @@ test "assignVisualX: the logically-first chunk lands rightmost" {
 
 const PointHit = struct { byte: usize, affinity: Selection.Affinity = .after };
 
-/// Byte a point inside `f` lands on. An RTL run's logical prefix grows
-/// leftwards from its right edge, so the width is measured from there --
-/// otherwise clicking the visually-first letter of an Arabic or Hebrew word
-/// lands on the last byte of it.
+/// Byte a point inside `f` lands on. In an RTL run the width is measured
+/// from the right edge.
 fn hitWithin(f: Fragment, p: Point) PointHit {
-    // Hit-tested against the already-shaped line's pen positions, the same
-    // places `fragCaretX` puts the caret, so a click and the caret it leaves
-    // behind agree. The reshape below is the last resort for a fragment that
-    // never got shaped, and can only measure widths.
+    // Hit-test against pen positions, where `fragCaretX` puts the caret. The
+    // reshape below is a fallback for unshaped fragments.
     var pt_end: usize = undefined;
     if (f.shaped) |shaped| {
         var st = shaped;
@@ -4015,12 +3908,9 @@ fn hitWithin(f: Fragment, p: Point) PointHit {
     return .{ .byte = f.bytes_seen + pt_end, .affinity = if (pt_end == f.text.len) .before else .after };
 }
 
-/// Which fragment of one buffered line answers a hit-test point, and where on
-/// it the point lands. `frags` is in logical order but rule L2 permutes the
-/// line on screen, so the scan runs across it by `x` -- the coordinate the
-/// reorder wrote -- rather than walking the text the way the caller supplied
-/// it. `line_end` answers a point past the far edge of the line: that is the
-/// logical end of an LTR line and the logical start of an RTL one.
+/// Which fragment of the placed line a point hits, scanned by visual `x`.
+/// `line_end` answers a point past the far edge: the logical end of an LTR
+/// line, the logical start of an RTL one.
 fn hitLine(frags: []const Fragment, p: Point, line_end: usize) ?struct { index: usize, hit: PointHit } {
     if (frags.len == 0) return null;
     // Above the line there is no x to read, so the answer is where the line
@@ -4071,11 +3961,9 @@ const CaretStop = struct {
     frag: usize,
 };
 
-/// Every caret position on the placed line, ordered left to right on screen.
-/// Built from the same reordered fragments `hitLine` walks, so a keyboard
-/// step and a mouse click agree about which byte lives where.
-/// ponytail: quadratic -- every stop re-measures its fragment's prefix from
-/// the start. One line, one keypress; measure before caching anything.
+/// Every caret position on the placed line, left to right, from the same
+/// fragments `hitLine` walks. Quadratic in the line length; one line per
+/// keypress is cheap enough.
 fn visualStops(self: *TextLayoutWidget, arena: std.mem.Allocator) []const CaretStop {
     var stops: std.ArrayList(CaretStop) = .empty;
     for (self.line_frags.items, 0..) |f, frag| {
@@ -4101,11 +3989,8 @@ fn visualStops(self: *TextLayoutWidget, arena: std.mem.Allocator) []const CaretS
         }
     }.lessThan);
 
-    // Two fragments meeting inside one level run (an addText chunk boundary,
-    // a highlight span) both name that byte at the same x. That is one caret
-    // position, and leaving both in would eat a keypress moving nowhere --
-    // unlike a level-run boundary, where the same byte has two real homes at
-    // two different x.
+    // Fragments meeting inside one level run name the same byte at the same x:
+    // keep one stop, or a keypress moves nowhere.
     var kept: usize = 0;
     for (stops.items) |st| {
         if (kept > 0) {
@@ -4134,12 +4019,9 @@ fn stopIndex(stops: []const CaretStop, byte: usize, affinity: Selection.Affinity
     return by_byte;
 }
 
-/// The neighbouring stop that sits somewhere else on screen. Where two level
-/// runs meet, two different bytes are drawn at one x (the end of "abc" and
-/// the logical end of the RTL run after it); stepping between them would eat
-/// a keypress that moves nothing. Of the bytes sharing the x it lands on, it
-/// keeps to the fragment it is leaving, so a selection grows by exactly the
-/// text the caret passed over.
+/// The neighbouring stop at a different x (a level-run boundary draws two
+/// bytes at one x). Prefers the fragment being left, so a selection grows by
+/// exactly the text passed over.
 fn nextVisualStop(stops: []const CaretStop, from: usize, right: bool) ?usize {
     var found: ?usize = null;
     var i = from;
@@ -4181,9 +4063,8 @@ fn charVisualMove(self: *TextLayoutWidget, clr: *@FieldType(@TypeOf(self.sel_mov
     }
 
     if (moved) {
-        // ponytail: a count that outran the line after a step that landed is
-        // dropped rather than resumed on the neighbouring line -- it takes
-        // two steps in one frame to reach, and key repeat brings the rest.
+        // A count that outruns the line after a step landed is dropped; key
+        // repeat brings the rest.
         clr.count = 0;
         self.scroll_to_cursor_next_frame = true;
         dvui.refresh(null, @src(), self.data().id);
@@ -4196,10 +4077,9 @@ fn charVisualMove(self: *TextLayoutWidget, clr: *@FieldType(@TypeOf(self.sel_mov
         }
         const edge = stops[idx].byte;
         if (edge != line_first and edge != line_last) {
-            // ponytail: the edge of a mixed-direction line can sit mid-text
-            // ("abc مرحبا" ends visually at the Arabic's first byte), where
-            // a logical step would jump back into this line; stop instead.
-            // Continuing onto the next line from there needs the next line.
+            // The edge of a mixed-direction line can sit mid-text ("abc مرحبا" ends
+            // at the Arabic's first byte), where a logical step would jump back into
+            // this line, so stop.
             clr.count = 0;
         } else if (stops[idx].rtl) {
             clr.count = -clr.count;
@@ -4223,10 +4103,8 @@ fn caretX(f: Fragment, prefix_w: f32) f32 {
     return if (f.rtl) f.x + f.size.w - prefix_w else f.x + prefix_w;
 }
 
-/// Where the caret sits after `off` logical bytes of the fragment. Reads the
-/// shape's pen positions, so it lands exactly on a glyph boundary
-/// `renderText` drew at; a width-derived x drifts into the glyphs, because
-/// `f.size.w` and a prefix width are both ink boxes and neither is additive.
+/// Caret x after `off` logical bytes of the fragment, from the shape's pen
+/// positions. Ink widths are not additive and would drift into the glyphs.
 fn fragCaretX(f: Fragment, off: usize) f32 {
     if (f.shaped) |shaped| {
         var st = shaped;
@@ -4270,7 +4148,7 @@ test "caretX/hitWithin: the two sides of a level-run boundary are two places" {
     try std.testing.expectEqual(txt.len, last.byte);
     try std.testing.expectEqual(Selection.Affinity.before, last.affinity);
 
-    // Same click, read as LTR, lands on the opposite end -- what it used to do.
+    // Same click, read as LTR, lands on the opposite end.
     g.rtl = false;
     try std.testing.expectEqual(@as(usize, 0), hitWithin(g, .{ .x = 0.5, .y = 1 }).byte);
 }

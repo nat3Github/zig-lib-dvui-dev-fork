@@ -9,8 +9,6 @@ size: dvui.Size.Natural,
 size_pixels: dvui.Size.Physical,
 time: i128 = 0,
 clipboard: ?[]const u8 = null,
-/// Count of textureCreate() calls; lets tests detect atlas rebuilds.
-texture_creates: usize = 0,
 
 pub const kind: dvui.enums.Backend = .testing;
 
@@ -88,7 +86,6 @@ pub fn drawClippedTriangles(_: *TestingBackend, _: ?dvui.Texture, _: []const dvu
 /// Create a texture from the given pixels in RGBA.  The returned
 /// pointer is what will later be passed to drawClippedTriangles.
 pub fn textureCreate(self: *TestingBackend, pixels: [*]const u8, options: dvui.Texture.CreateOptions) !dvui.Texture {
-    self.texture_creates += 1;
     const new_pixels = self.allocator.dupe(u8, pixels[0 .. options.width * options.height * 4]) catch @panic("Couldn't create texture: OOM");
     return .{
         .width = options.width,

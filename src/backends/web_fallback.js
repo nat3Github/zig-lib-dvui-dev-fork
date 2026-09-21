@@ -1,6 +1,4 @@
-// Font fallback glue: fetches the Noto fonts opentype's web_fallback service
-// picks (see Font.Cache.web_fallback). web.js imports it on the first request,
-// which only -Dfont-fallback builds make.
+// Fetches the Noto fonts picked by opentype's web_fallback (see Font.Cache.web_fallback).
 
 const max_attempts = 3;
 const retry_delay_ms = 1000;

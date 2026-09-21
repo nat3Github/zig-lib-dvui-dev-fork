@@ -512,8 +512,7 @@ pub const CellWidget = struct {
         const editing = dvui.dataGet(null, id, "__editing", bool) orelse false;
 
         if (!editing) {
-            // Hand our height cap down: the text layout ends on a whole line
-            // with an ellipsis instead of being sheared by the cell's clip.
+            // pass the height cap down so text ellipsizes instead of being clipped mid-line
             var tl_opts = opts;
             const cap = self.data().options.max_size_contentGet().h;
             if (cap < dvui.max_float_safe) {
@@ -1554,7 +1553,5 @@ test "cell height cap: text ends on a whole line instead of overflowing the cell
     };
 
     try dvui.testing.settle(fns.frame);
-    // Without the cap handed down, the layout asks for its full ~102px and the
-    // cell clips a line through the middle.
     try std.testing.expect(fns.cell_min_h <= fns.max_h);
 }
