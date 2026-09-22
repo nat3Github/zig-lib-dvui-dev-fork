@@ -250,17 +250,16 @@ pub fn renderText(opts: TextOptions) Backend.GenericError!void {
         // misses this frame's upload and gets UVs from the pre-growth size.
         for (line.buffer.info.items[seg_start..seg_end]) |info| _ = fce.glyphInfoGet(cw.gpa, info.codepoint) catch {};
 
-        const texture_atlas = fce.getTextureAtlas(cw.gpa, cw.backend) catch |err| switch (err) {
+        const texture_atlas: ?Texture = fce.getTextureAtlas(cw.gpa, cw.backend) catch |err| switch (err) {
             error.OutOfMemory => |e| return e,
-            else => {
+            else => blk: {
                 const fname = opts.font.name(cw.arena());
                 defer cw.arena().free(fname);
-                dvui.log.err("Could not get texture atlas for font {s}, text area marked in magenta, to display '{s}'", .{ fname, opts.text });
-                opts.rs.r.fill(.{}, .{ .color = .magenta });
-                return;
+                dvui.log.err("Could not get texture atlas for font {s} ({any}), skipping glyphs of '{s}'", .{ fname, err, opts.text });
+                break :blk null;
             },
         };
-        const atlas_size: Size = .{ .w = @floatFromInt(texture_atlas.width), .h = @floatFromInt(texture_atlas.height) };
+        const atlas_size: Size = if (texture_atlas) |tex| .{ .w = @floatFromInt(tex.width), .h = @floatFromInt(tex.height) } else .{ .w = 1, .h = 1 };
 
         var builder = try dvui.Triangles.Builder.init(cw.lifo(), 4 * (seg_end - seg_start), 6 * (seg_end - seg_start));
         errdefer builder.deinit(cw.lifo());
@@ -318,7 +317,7 @@ pub fn renderText(opts: TextOptions) Backend.GenericError!void {
                 }
             }
 
-            if (gi.w > 0) {
+            if (gi.w > 0 and texture_atlas != null) {
                 const vtx_offset: dvui.Vertex.Index = @intCast(builder.vertexes.items.len);
                 var v: Vertex = undefined;
                 const base_col: Color.PMA = if (gi.is_color) white_pma else col;
@@ -368,7 +367,7 @@ pub fn renderText(opts: TextOptions) Backend.GenericError!void {
         }
 
         if (builder.vertexes.items.len > 0) {
-            try seg_renders.append(cw.lifo(), .{ .tri = builder.build(), .tex = texture_atlas });
+            try seg_renders.append(cw.lifo(), .{ .tri = builder.build(), .tex = texture_atlas.? });
         } else {
             builder.deinit(cw.lifo());
         }

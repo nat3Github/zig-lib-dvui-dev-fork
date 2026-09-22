@@ -104,6 +104,8 @@ pub fn addFamilyEntries(self: *Cache, gpa: std.mem.Allocator, alias: []const u8,
 }
 
 pub const max_atlas_height = 4096;
+// 1024x4096 RGBA fits sdl3gpu's 16MB texture transfer buffer.
+pub const max_atlas_width = 1024;
 
 pub fn reset(self: *Cache, gpa: std.mem.Allocator, backend: Backend) void {
     var it = self.cache.iterator();
@@ -119,9 +121,23 @@ pub fn reset(self: *Cache, gpa: std.mem.Allocator, backend: Backend) void {
         gpa.destroy(stack);
     }
     self.line_cache.evictUnused(gpa);
-    var eit = self.cache.iterator();
-    while (eit.next_peek()) |kv| kv.value.clearAtlasIfOversized(gpa);
+    if (self.coverage_cache.map.count() > max_coverage_entries) self.evictUnreferencedCoverage(gpa);
     self.evictUnreferencedFontBytes(gpa);
+}
+
+// Coverage is size-independent and costly to rebuild, so keep it past its stack's eviction until there are many.
+const max_coverage_entries = 64;
+
+fn evictUnreferencedCoverage(self: *Cache, gpa: std.mem.Allocator) void {
+    var it = self.coverage_cache.map.iterator();
+    next: while (it.next()) |kv| {
+        var sit = self.resolved_stacks.iterator();
+        while (sit.next_peek()) |stack| {
+            if (stack.value.fallback.coverage.ptr == kv.value_ptr.coverage.ptr) continue :next;
+        }
+        kv.value_ptr.deinit(gpa);
+        self.coverage_cache.map.removeByPtr(kv.key_ptr);
+    }
 }
 
 const evict_after_unreferenced_resets = 600;
@@ -225,16 +241,15 @@ pub fn getOrCreate(self: *Cache, state_gpa: std.mem.Allocator, font: Font) std.m
     if (entry.found_existing) return entry.value_ptr.*;
     errdefer self.cache.map.removeByPtr(entry.key_ptr);
 
-    const fname = font.name(state_gpa);
-    defer state_gpa.free(fname);
-
     const source = try self.resolveSource(state_gpa, font);
 
     const boxed = try state_gpa.create(Entry);
     errdefer state_gpa.destroy(boxed);
     boxed.* = Entry.init(state_gpa, &source, font) catch |err| blk: {
-        dvui.log.err("Font {s} init got {any}, using fallback", .{ fname, err });
-        break :blk Entry.init(state_gpa, &Source.fallback, font) catch return error.OutOfMemory;
+        dvui.log.err("Font {f} init got {any}, using fallback", .{ font, err });
+        break :blk Entry.init(state_gpa, &Source.fallback, font) catch |fallback_err|
+            // the built-in font is embedded, so a load failure is a build defect, not a runtime condition
+            std.debug.panic("built-in fallback font failed to load: {any}", .{fallback_err});
     };
     entry.value_ptr.* = boxed;
     return boxed;
@@ -692,7 +707,7 @@ pub const Entry = struct {
     ascent: f32, // ascender
     em_height: f32, // measured M height
     /// Glyphs keyed by ID (post-shaping), not Unicode codepoint.
-    /// Bounded by `Cache.max_atlas_height` across `reset()`s.
+    /// Bounded by `Cache.max_atlas_width` x `Cache.max_atlas_height`.
     glyphs: std.AutoHashMapUnmanaged(u32, GlyphInfo) = .empty,
     texture_atlas_cache: ?Texture = null,
     /// Allocated height (may exceed pack_y due to geometric growth).
@@ -895,8 +910,7 @@ pub const Entry = struct {
         return true;
     }
 
-    pub fn clearAtlasIfOversized(self: *Entry, gpa: std.mem.Allocator) void {
-        if (self.pack_y + self.pack_row_height + pad <= max_atlas_height) return;
+    fn clearAtlas(self: *Entry, gpa: std.mem.Allocator) void {
         var it = self.glyphs.valueIterator();
         while (it.next()) |gi| gpa.free(gi.pixels);
         self.glyphs.clearAndFree(gpa);
@@ -921,7 +935,7 @@ pub const Entry = struct {
         if (self.atlas_width == 0) {
             self.atlas_width = @max(initial_atlas_width, w + 2 * pad);
         } else if (w + 2 * pad > self.atlas_width) {
-            self.atlas_width = @max(w + 2 * pad, self.atlas_width * 2);
+            self.atlas_width = @min(max_atlas_width, @max(w + 2 * pad, self.atlas_width * 2));
             self.repackAll();
         }
         if (self.pack_x + w + pad > self.atlas_width) {
@@ -1011,7 +1025,7 @@ pub const Entry = struct {
 
         const needed_height = self.pack_y + self.pack_row_height + pad;
         if (self.texture_atlas_cache == null or needed_height > self.atlas_alloc_height) {
-            const new_height = @max(needed_height, self.atlas_alloc_height * 2);
+            const new_height = @min(max_atlas_height, @max(needed_height, self.atlas_alloc_height * 2));
             try self.rebuildAtlasTexture(gpa, new_height);
             return self.texture_atlas_cache.?;
         }
@@ -1084,7 +1098,20 @@ pub const Entry = struct {
         };
 
         if (gi.w > 0 and gi.h > 0) {
-            gi.origin = self.placeGlyph(@intFromFloat(gi.w), @intFromFloat(gi.h));
+            const w: u32 = @intFromFloat(gi.w);
+            const h: u32 = @intFromFloat(gi.h);
+            if (w + 2 * pad > max_atlas_width or h + 2 * pad > max_atlas_height) {
+                dvui.log.warn("Font.Cache.Entry.glyphInfoGet() glyph {d} of font {s} is {d}x{d}, larger than the atlas, skipped\n", .{ glyph_id, self.name, w, h });
+                gi.w = 0;
+                gi.h = 0;
+            } else {
+                gi.origin = self.placeGlyph(w, h);
+                if (self.pack_y + self.pack_row_height + pad > max_atlas_height) {
+                    // ponytail: evict everything; a frame needing more than one full atlas thrashes, LRU shelves if that shows up
+                    self.clearAtlas(gpa);
+                    gi.origin = self.placeGlyph(w, h);
+                }
+            }
         }
 
         try self.glyphs.put(gpa, glyph_id, gi);
@@ -1416,16 +1443,32 @@ test "Cache.reset: keeps a shaped line used since the last reset, evicts it one 
     try std.testing.expectEqual(@as(usize, 0), cw.fonts.line_cache.bytes);
 }
 
-test "Cache.reset: clears an atlas grown past max_atlas_height" {
+test "Entry.glyphInfoGet: a full atlas is cleared instead of growing past max_atlas_height" {
     var t = try dvui.testing.init(.{});
     defer t.deinit();
     const cw = dvui.currentWindow();
     const entry = try cw.fonts.getOrCreate(cw.gpa, Font.init("Vera"));
-    entry.pack_y = Cache.max_atlas_height;
     _ = try entry.glyphInfoGet(cw.gpa, 36);
+    entry.pack_y = Cache.max_atlas_height;
+    const gi = try entry.glyphInfoGet(cw.gpa, 37);
+    try std.testing.expectEqual(@as(usize, 1), entry.glyphs.count());
+    try std.testing.expectEqual(@as(f32, @floatFromInt(Cache.Entry.pad)), gi.origin[1]);
+    try std.testing.expect(entry.atlas_width <= Cache.max_atlas_width);
+}
+
+test "Cache.reset: past max_coverage_entries, drops coverage no resolved stack uses" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    const cw = dvui.currentWindow();
+    for (0..Cache.max_coverage_entries + 1) |i| {
+        var fallback = try Cmap.FallbackStack.build(cw.gpa, &.{});
+        errdefer fallback.deinit(cw.gpa);
+        try cw.fonts.coverage_cache.map.put(cw.gpa, i, fallback);
+    }
+    const resolved = try cw.fonts.resolveStack(cw.gpa, Font.init("Vera"));
+    _ = resolved;
     cw.fonts.reset(cw.gpa, cw.backend);
-    try std.testing.expectEqual(@as(usize, 0), entry.glyphs.count());
-    try std.testing.expectEqual(Cache.Entry.pad, entry.pack_y);
+    try std.testing.expectEqual(@as(u32, 1), cw.fonts.coverage_cache.map.count());
 }
 
 test "Entry.getTextureAtlas: keeps glyph pixels when partial uploads are unsupported" {
