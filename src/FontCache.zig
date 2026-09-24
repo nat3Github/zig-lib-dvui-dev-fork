@@ -1486,6 +1486,7 @@ test "Cache.reset: past max_coverage_entries, drops coverage no resolved stack u
 }
 
 test "Entry.getTextureAtlas: keeps glyph pixels when partial uploads are unsupported" {
+    if (Cache.Entry.drops_uploaded_pixels) return error.SkipZigTest;
     var t = try dvui.testing.init(.{});
     defer t.deinit();
     const cw = dvui.currentWindow();
@@ -1496,6 +1497,22 @@ test "Entry.getTextureAtlas: keeps glyph pixels when partial uploads are unsuppo
     _ = try entry.getTextureAtlas(cw.gpa, cw.backend);
     try std.testing.expect(entry.glyphs.get(36).?.pixels.len > 0);
     try std.testing.expect(entry.glyphs.get(37).?.pixels.len > 0);
+}
+
+test "Entry.getTextureAtlas: drops uploaded glyph pixels when partial uploads are supported; restorePixels re-renders" {
+    if (!Cache.Entry.drops_uploaded_pixels) return error.SkipZigTest;
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    const cw = dvui.currentWindow();
+    const entry = try cw.fonts.getOrCreate(cw.gpa, Font.init("Vera"));
+    _ = try entry.glyphInfoGet(cw.gpa, 36);
+    _ = try entry.getTextureAtlas(cw.gpa, cw.backend);
+    _ = try entry.glyphInfoGet(cw.gpa, 37);
+    _ = try entry.getTextureAtlas(cw.gpa, cw.backend);
+    try std.testing.expectEqual(@as(usize, 0), entry.glyphs.get(37).?.pixels.len);
+    const gi = entry.glyphs.getPtr(36).?;
+    try std.testing.expect(try entry.restorePixels(cw.gpa, 36, gi));
+    try std.testing.expect(gi.pixels.len > 0);
 }
 
 test "Cache.reset: drops unreferenced discovered font bytes; findSource reads them back" {
