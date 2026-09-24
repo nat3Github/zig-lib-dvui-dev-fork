@@ -708,7 +708,7 @@ pub const Entry = struct {
     em_height: f32, // measured M height
     /// Glyphs keyed by ID (post-shaping), not Unicode codepoint.
     /// Bounded by `Cache.max_atlas_width` x `Cache.max_atlas_height`.
-    glyphs: std.AutoHashMapUnmanaged(u32, GlyphInfo) = .empty,
+    glyphs: std.HashMapUnmanaged(u32, GlyphInfo, GlyphIdContext, std.hash_map.default_max_load_percentage) = .empty,
     texture_atlas_cache: ?Texture = null,
     /// Allocated height (may exceed pack_y due to geometric growth).
     atlas_alloc_height: u32 = 0,
@@ -717,6 +717,17 @@ pub const Entry = struct {
     pack_x: u32 = pad,
     pack_y: u32 = pad,
     pack_row_height: u32 = 0,
+
+    // Wyhash over 4 bytes dominated glyphInfoGet; Fibonacci hashing spreads
+    // dense glyph ids across both the bucket bits and the top fingerprint bits.
+    const GlyphIdContext = struct {
+        pub fn hash(_: GlyphIdContext, glyph_id: u32) u64 {
+            return @as(u64, glyph_id) *% 0x9E3779B97F4A7C15;
+        }
+        pub fn eql(_: GlyphIdContext, a: u32, b: u32) bool {
+            return a == b;
+        }
+    };
 
     /// Padding (px) kept on every side of a packed glyph.
     const pad: u32 = 1;
@@ -1078,7 +1089,7 @@ pub const Entry = struct {
         if (self.glyphs.get(glyph_id)) |gi| return gi;
 
         var gi: GlyphInfo = blk: {
-            const bounds = self.renderer.glyphBounds(@intCast(glyph_id), .{}, dvui.currentWindow().lifo()) catch |err| switch (err) {
+            const rendered = self.renderer.renderGlyph(@intCast(glyph_id), .{}, dvui.currentWindow().lifo(), gpa) catch |err| switch (err) {
                 error.OutOfMemory => |e| return e,
                 else => {
                     dvui.log.warn("Font.Cache.Entry.glyphInfoGet() opentype render error {any} font {s} glyph {d}\n", .{ err, self.name, glyph_id });
@@ -1086,16 +1097,17 @@ pub const Entry = struct {
                 },
             };
             break :blk .{
-                .leftBearing = @floatFromInt(bounds.left),
-                .topBearing = @floatFromInt(bounds.top),
-                .w = @floatFromInt(bounds.width),
-                .h = @floatFromInt(bounds.rows),
+                .leftBearing = @floatFromInt(rendered.bitmap.left),
+                .topBearing = @floatFromInt(rendered.bitmap.top),
+                .w = @floatFromInt(rendered.bitmap.width),
+                .h = @floatFromInt(rendered.bitmap.rows),
                 .origin = .{ 0, 0 },
-                .is_color = bounds.is_color,
-                .pixels = &.{},
+                .is_color = rendered.is_color,
+                .pixels = rendered.bitmap.pixels_row_major,
                 .uploaded = false,
             };
         };
+        errdefer gpa.free(gi.pixels);
 
         if (gi.w > 0 and gi.h > 0) {
             const w: u32 = @intFromFloat(gi.w);
@@ -1104,6 +1116,8 @@ pub const Entry = struct {
                 dvui.log.warn("Font.Cache.Entry.glyphInfoGet() glyph {d} of font {s} is {d}x{d}, larger than the atlas, skipped\n", .{ glyph_id, self.name, w, h });
                 gi.w = 0;
                 gi.h = 0;
+                gpa.free(gi.pixels);
+                gi.pixels = &.{};
             } else {
                 gi.origin = self.placeGlyph(w, h);
                 if (self.pack_y + self.pack_row_height + pad > max_atlas_height) {
