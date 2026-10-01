@@ -29,8 +29,8 @@
         // target-OS switch has none; see linkSdl3 in build.zig and examples/ios-example/README.md).
         // Additive only — every other target builds identically to the plain upstream fork.
         .sdl3 = .{
-            .url = "git+https://github.com/nat3Github/lib-sdl3-dev-fork#3aec7d397ca8997725dcb624f7470a60c9b33734",
-            .hash = "sdl-0.4.2+3.4.4-SDL--gqNpQF1CjofImvjmIBRf7mkJns3eCFIsRbucO1m",
+            .url = "git+https://github.com/nat3Github/lib-aycb-sdl-dev#0647ccf8519803974b9cf51a53a4ae412bcaa238",
+            .hash = "sdl-1.0.3+3.4.16-i4QD0dquqQDaL5FpdGR0cbVif8KTiGcqAR2PzM50LZwf",
             .lazy = true,
         },
         .freetype = .{

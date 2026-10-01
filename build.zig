@@ -71,41 +71,10 @@ pub fn linkSdl3(
         // SDL3 compiled from source
 
         sdl3_options.addOption(std.SemanticVersion, "version", .{ .major = 3, .minor = 0, .patch = 0 });
-        // msvcup / minimal SDK trees often omit um/gameinput.h. Upstream's Zig SDL enables
-        // HAVE_GAMEINPUT_H for every MSVC build; undef here when cross-compiling so
-        // SDL_gameinput*.cpp stub out instead of #including <gameinput.h>.
-        const cross_win_msvc = opts.target.result.os.tag == .windows and
-            opts.target.result.abi == .msvc and
-            opts.b.graph.host.result.os.tag != .windows;
-        // NOTE: iOS builds compile a static lib that Xcode's own linker (not zig) links
-        // together with this dependency's separately-built libSDL3.a. UBSan's runtime
-        // (__ubsan_handle_*) only gets bundled into the artifact zig itself produces as a
-        // final binary, so a plain sanitize_c default (full in Debug) leaves libSDL3.a with
-        // unresolved symbols at that link step. Every other target links through zig itself,
-        // which bundles ubsan into the one binary, so this is iOS-only.
-        const sdl3_sanitize_c: ?std.zig.SanitizeC = if (opts.target.result.os.tag == .ios) .off else null;
-        const sdl3_dep = if (cross_win_msvc)
-            opts.b.lazyDependency("sdl3", .{
-                .target = opts.target,
-                .optimize = opts.optimize,
-                .system_include_path = opts.sdl3_system_include_path,
-                .system_framework_path = opts.sdl3_system_framework_path,
-                .library_path = opts.sdl3_library_path,
-                .sanitize_c = sdl3_sanitize_c,
-                .build_config_h_overrides = @as([]const []const u8, &[_][]const u8{
-                    "-UHAVE_GAMEINPUT_H",
-                    "-USDL_JOYSTICK_GAMEINPUT",
-                }),
-            })
-        else
-            opts.b.lazyDependency("sdl3", .{
-                .target = opts.target,
-                .optimize = opts.optimize,
-                .system_include_path = opts.sdl3_system_include_path,
-                .system_framework_path = opts.sdl3_system_framework_path,
-                .library_path = opts.sdl3_library_path,
-                .sanitize_c = sdl3_sanitize_c,
-            });
+        const sdl3_dep = opts.b.lazyDependency("sdl3", .{
+            .target = opts.target,
+            .optimize = opts.optimize,
+        });
         if (sdl3_dep) |sdl3| {
             if (opts.target.result.abi.isAndroid()) {
                 sdl_mod.addIncludePath(sdl3.artifact("SDL3").getEmittedIncludeTree());
@@ -117,7 +86,7 @@ pub fn linkSdl3(
             if (opts.target.result.os.tag == .ios) {
                 // NOTE: published for installIosSdl3() below, so downstream doesn't need its own sdl3 dep.
                 opts.b.installArtifact(sdl3.artifact("SDL3"));
-                opts.b.addNamedLazyPath("sdl3_include", sdl3.path("include"));
+                opts.b.addNamedLazyPath("sdl3_include", sdl3.artifact("SDL3").getEmittedIncludeTree());
             }
         }
     }
