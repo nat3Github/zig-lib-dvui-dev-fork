@@ -25,9 +25,7 @@
             .hash = "SDL-2.32.10-JToi37G3EgG0eraPos4vhCwC6vVgyB1FYf1SxxhpBr_Y",
             .lazy = true,
         },
-        // Fork of david-vanderson/SDL with an .ios case added to build.zig (upstream's
-        // target-OS switch has none; see linkSdl3 in build.zig and examples/ios-example/README.md).
-        // Additive only — every other target builds identically to the plain upstream fork.
+        // allyourcodebase/SDL fork, branch lean2: lazy platform deps, -fsys=<name> for sysroot headers.
         .sdl3 = .{
             .url = "git+https://github.com/nat3Github/lib-aycb-sdl-dev#0647ccf8519803974b9cf51a53a4ae412bcaa238",
             .hash = "sdl-1.0.3+3.4.16-i4QD0dquqQDaL5FpdGR0cbVif8KTiGcqAR2PzM50LZwf",
