@@ -1,6 +1,7 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const dvui = @import("../dvui.zig");
+const opentype = @import("opentype");
 
 const Event = dvui.Event;
 const Options = dvui.Options;
@@ -78,7 +79,16 @@ pub const InitOptions = struct {
     cache_layout: bool = false,
 
     break_lines: bool = false,
-    kerning: ?bool = null,
+
+    /// CSS `line-break`/`word-break`/`overflow-wrap`; see the matching
+    /// `TextLayoutWidget.InitOptions` fields. Only matter with `break_lines`.
+    line_break: opentype.LineBreakStrictness = .strict,
+    word_break: opentype.WordBreakMode = .normal,
+    overflow_wrap: TextLayoutWidget.OverflowWrap = .anywhere,
+
+    /// See `TextLayoutWidget.InitOptions.base_direction`.
+    base_direction: opentype.unicode.Bidi.ParagraphDirection = .auto,
+
     scroll_vertical: ?bool = null, // default is value of multiline
     scroll_vertical_bar: ?ScrollInfo.ScrollBarMode = null, // default .auto
     scroll_horizontal: ?bool = null, // default false if break_lines, true otherwise
@@ -215,7 +225,10 @@ pub fn init(self: *TextEntryWidget, src: std.builtin.SourceLocation, init_opts: 
 
     self.textLayout.init(@src(), .{
         .break_lines = self.init_opts.break_lines,
-        .kerning = self.init_opts.kerning,
+        .line_break = self.init_opts.line_break,
+        .word_break = self.init_opts.word_break,
+        .overflow_wrap = self.init_opts.overflow_wrap,
+        .base_direction = self.init_opts.base_direction,
         .touch_edit_just_focused = false,
         .cache_layout = self.init_opts.cache_layout,
         .focused = self.data().id == dvui.focusedWidgetId(),
@@ -605,14 +618,7 @@ pub fn textTyped(self: *TextEntryWidget, new: []const u8, selected: bool) void {
     }
 
     var sel = self.textLayout.selectionGet(self.len);
-    if (!sel.empty()) {
-        // delete selection
-        self.textChangedRemoved(sel.start, sel.end);
-        @memmove(self.text[sel.start..][0 .. self.len - sel.end], self.text[sel.end..self.len]);
-        self.len -= (sel.end - sel.start);
-        sel.end = sel.start;
-        sel.cursor = sel.start;
-    }
+    if (!sel.empty()) self.deleteSelection();
 
     const space_left = self.text.len - self.len;
     if (space_left < new.len) {
@@ -886,33 +892,30 @@ pub fn processEvent(self: *TextEntryWidget, e: *Event) void {
 
             if ((ke.action == .down or ke.action == .repeat) and ke.matchBind("word_left")) {
                 e.handle(@src(), self.data());
-                if (!self.textLayout.selection.empty()) {
-                    self.textLayout.selection.moveCursor(self.textLayout.selection.start, false);
-                    self.textLayout.scroll_to_cursor = true;
-                } else {
-                    if (self.textLayout.sel_move == .none) {
-                        self.textLayout.sel_move = .{ .word_left_right = .{ .select = false } };
-                    }
-                    if (self.textLayout.sel_move == .word_left_right) {
-                        self.textLayout.sel_move.word_left_right.count -= 1;
-                    }
+                const step = self.textLayout.logicalStep(false);
+                const sel = self.textLayout.selection;
+                // A selection steps a word on from its logical start or end (TextKit).
+                if (!sel.empty()) sel.moveCursor(if (step < 0) sel.start else sel.end, false);
+                if (self.textLayout.sel_move == .none) {
+                    self.textLayout.sel_move = .{ .word_left_right = .{ .select = false } };
+                }
+                if (self.textLayout.sel_move == .word_left_right) {
+                    self.textLayout.sel_move.word_left_right.count += step;
                 }
                 break :blk;
             }
 
             if ((ke.action == .down or ke.action == .repeat) and ke.matchBind("word_right")) {
                 e.handle(@src(), self.data());
-                if (!self.textLayout.selection.empty()) {
-                    self.textLayout.selection.moveCursor(self.textLayout.selection.end, false);
-                    self.textLayout.selection.affinity = .before;
-                    self.textLayout.scroll_to_cursor = true;
-                } else {
-                    if (self.textLayout.sel_move == .none) {
-                        self.textLayout.sel_move = .{ .word_left_right = .{ .select = false } };
-                    }
-                    if (self.textLayout.sel_move == .word_left_right) {
-                        self.textLayout.sel_move.word_left_right.count += 1;
-                    }
+                const step = self.textLayout.logicalStep(true);
+                const sel = self.textLayout.selection;
+                // A selection steps a word on from its logical start or end (TextKit).
+                if (!sel.empty()) sel.moveCursor(if (step < 0) sel.start else sel.end, false);
+                if (self.textLayout.sel_move == .none) {
+                    self.textLayout.sel_move = .{ .word_left_right = .{ .select = false } };
+                }
+                if (self.textLayout.sel_move == .word_left_right) {
+                    self.textLayout.sel_move.word_left_right.count += step;
                 }
                 break :blk;
             }
@@ -920,7 +923,7 @@ pub fn processEvent(self: *TextEntryWidget, e: *Event) void {
             if ((ke.action == .down or ke.action == .repeat) and ke.matchBind("char_left")) {
                 e.handle(@src(), self.data());
                 if (!self.textLayout.selection.empty()) {
-                    self.textLayout.selection.moveCursor(self.textLayout.selection.start, false);
+                    self.textLayout.collapseSelection(false);
                 } else {
                     if (self.textLayout.sel_move == .none) {
                         self.textLayout.sel_move = .{ .char_left_right = .{ .select = false } };
@@ -935,8 +938,7 @@ pub fn processEvent(self: *TextEntryWidget, e: *Event) void {
             if ((ke.action == .down or ke.action == .repeat) and ke.matchBind("char_right")) {
                 e.handle(@src(), self.data());
                 if (!self.textLayout.selection.empty()) {
-                    self.textLayout.selection.moveCursor(self.textLayout.selection.end, false);
-                    self.textLayout.selection.affinity = .before;
+                    self.textLayout.collapseSelection(true);
                 } else {
                     if (self.textLayout.sel_move == .none) {
                         self.textLayout.sel_move = .{ .char_left_right = .{ .select = false } };
@@ -976,12 +978,7 @@ pub fn processEvent(self: *TextEntryWidget, e: *Event) void {
                         e.handle(@src(), self.data());
                         var sel = self.textLayout.selectionGet(self.len);
                         if (!sel.empty()) {
-                            // just delete selection
-                            self.textChangedRemoved(sel.start, sel.end);
-                            @memmove(self.text[sel.start..][0 .. self.len - sel.end], self.text[sel.end..self.len]);
-                            self.setLen(self.len - (sel.end - sel.start));
-                            sel.end = sel.start;
-                            sel.cursor = sel.start;
+                            self.deleteSelection();
                             self.textLayout.scroll_to_cursor = true;
                         } else if (ke.matchBind("delete_to_line_start")) {
                             // delete from the start of the current line up to the cursor
@@ -1021,14 +1018,7 @@ pub fn processEvent(self: *TextEntryWidget, e: *Event) void {
                             sel.start = sel.cursor;
                             self.textLayout.scroll_to_cursor = true;
                         } else if (sel.cursor > 0) {
-                            // delete character just before cursor
-                            //
-                            // A utf8 char might consist of more than one byte.
-                            // Find the beginning of the last byte by iterating over
-                            // the string backwards. The first byte of a utf8 char
-                            // does not have the pattern 10xxxxxx.
-                            var i: usize = 1;
-                            while (sel.cursor - i > 0 and self.text[sel.cursor - i] & 0xc0 == 0x80) : (i += 1) {}
+                            const i = sel.cursor - opentype.unicode.backspaceStart(self.text[0..self.len], sel.cursor);
                             self.textChangedRemoved(sel.cursor - i, sel.cursor);
                             @memmove(self.text[sel.cursor - i ..][0 .. self.len - sel.cursor], self.text[sel.cursor..self.len]);
                             self.setLen(self.len - i);
@@ -1044,12 +1034,7 @@ pub fn processEvent(self: *TextEntryWidget, e: *Event) void {
                         e.handle(@src(), self.data());
                         var sel = self.textLayout.selectionGet(self.len);
                         if (!sel.empty()) {
-                            // just delete selection
-                            self.textChangedRemoved(sel.start, sel.end);
-                            @memmove(self.text[sel.start..][0 .. self.len - sel.end], self.text[sel.end..self.len]);
-                            self.setLen(self.len - (sel.end - sel.start));
-                            sel.end = sel.start;
-                            sel.cursor = sel.start;
+                            self.deleteSelection();
                             self.textLayout.scroll_to_cursor = true;
                         } else if (ke.matchBind("delete_to_line_end")) {
                             // delete from the cursor up to the end of the current line
@@ -1091,11 +1076,7 @@ pub fn processEvent(self: *TextEntryWidget, e: *Event) void {
                             sel.start = sel.cursor;
                             self.textLayout.scroll_to_cursor = true;
                         } else if (sel.cursor < self.len) {
-                            // delete the character just after the cursor
-                            //
-                            // A utf8 char might consist of more than one byte.
-                            const ii = std.unicode.utf8ByteSequenceLength(self.text[sel.cursor]) catch 1;
-                            const i = @min(ii, self.len - sel.cursor);
+                            const i = opentype.unicode.nextGraphemeBoundary(self.text[0..self.len], sel.cursor) - sel.cursor;
 
                             self.textChangedRemoved(sel.cursor, sel.cursor + i);
                             const remaining = self.len - (sel.cursor + i);
@@ -1207,29 +1188,49 @@ fn insertText(self: *TextEntryWidget, text: []const u8) void {
 }
 
 pub fn cut(self: *TextEntryWidget) void {
-    var sel = self.textLayout.selectionGet(self.len);
-    if (!sel.empty()) {
-        // copy selection to clipboard
-        dvui.clipboardTextSet(self.text[sel.start..sel.end]);
-
-        // delete selection
-        self.textChangedRemoved(sel.start, sel.end);
-        @memmove(self.text[sel.start..][0 .. self.len - sel.end], self.text[sel.end..self.len]);
-        self.setLen(self.len - (sel.end - sel.start));
-        sel.end = sel.start;
-        sel.cursor = sel.start;
+    if (!self.textLayout.selectionGet(self.len).empty()) {
+        self.copy();
+        self.deleteSelection();
         self.textLayout.scroll_to_cursor = true;
     }
+}
+
+/// Removes the selected text, every range of a split selection, leaving the
+/// caret where the last range started (as TextKit does).
+fn deleteSelection(self: *TextEntryWidget) void {
+    const sel = self.textLayout.selectionGet(self.len);
+    var ranges_buf: [TextLayoutWidget.Selection.max_split_ranges][2]usize = undefined;
+    const split = sel.splitRanges();
+    @memcpy(ranges_buf[0..split.len], split);
+    const ranges: []const [2]usize = if (split.len > 0) ranges_buf[0..split.len] else &.{.{ sel.start, sel.end }};
+    var removed: usize = 0;
+    for (ranges) |r| {
+        const start = r[0] - removed;
+        const end = r[1] - removed;
+        self.textChangedRemoved(start, end);
+        @memmove(self.text[start..][0 .. self.len - end], self.text[end..self.len]);
+        self.setLen(self.len - (end - start));
+        removed += end - start;
+    }
+    const caret = ranges[ranges.len - 1][0] - (removed - (ranges[ranges.len - 1][1] - ranges[ranges.len - 1][0]));
+    sel.cursor = caret;
+    sel.start = caret;
+    sel.end = caret;
 }
 
 /// This could use textLayout.copy(), but that doesn't work if we have a masked
 /// password field (textLayout only sees the password char).
 pub fn copy(self: *TextEntryWidget) void {
     var sel = self.textLayout.selectionGet(self.len);
-    if (!sel.empty()) {
-        // copy selection to clipboard
-        dvui.clipboardTextSet(self.text[sel.start..sel.end]);
-    }
+    if (sel.empty()) return;
+    const split = sel.splitRanges();
+    if (split.len == 0) return dvui.clipboardTextSet(self.text[sel.start..sel.end]);
+    // A split selection copies its ranges joined in text order, as TextKit does.
+    var joined: std.ArrayList(u8) = .empty;
+    const lifo = dvui.currentWindow().lifo();
+    defer joined.deinit(lifo);
+    for (split) |r| joined.appendSlice(lifo, self.text[r[0]..r[1]]) catch return;
+    dvui.clipboardTextSet(joined.items);
 }
 
 pub fn deinit(self: *TextEntryWidget) void {
@@ -1629,4 +1630,246 @@ test "text delete to line start and end multiline" {
     try dvui.testing.pressKey(.delete, ctrl_shift);
     try dvui.testing.settle(Local.frame);
     try std.testing.expectEqualStrings("abc\n\nghi", Local.text);
+}
+
+test "mixed-direction text: digits inside an RTL run" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    try TestEntry.focus();
+
+    // "a" | Hebrew+space | "12": bytes 0..1, 1..6, 6..8, drawn "a 12 ␣לש".
+    // The line's last byte, 8, steps from the right edge (TextKit), so the x
+    // between "2" and the space, where it and byte 6 are drawn, is skipped.
+    try TestEntry.load("a\u{05e9}\u{05dc} 12");
+    const expected_right = [_]usize{ 1, 7, 5, 3, 8, 8 };
+    for (expected_right) |byte| {
+        try TestEntry.press(.right);
+        try std.testing.expectEqual(byte, TestEntry.cursor);
+    }
+    for (0..2) |_| try TestEntry.press(.left);
+    try std.testing.expectEqual(@as(usize, 5), TestEntry.cursor);
+    try TestEntry.press(.left);
+    try std.testing.expectEqual(@as(usize, 7), TestEntry.cursor);
+}
+
+test "mixed-direction text: a mouse drag selects what lies on screen between press and pointer" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    try TestEntry.focus();
+
+    // Same line as the shift+arrow test: drag from between "b" and "c" to
+    // where Right x4 draws the caret, left of the Hebrew's last letter.
+    try TestEntry.load("abc\u{05e9}\u{05dc}\u{05d5}\u{05dd}xyz");
+    for (0..2) |_| try TestEntry.press(.right);
+    const press_pt = TestEntry.caret_pt;
+    for (0..2) |_| try TestEntry.press(.right);
+    const drag_pt = TestEntry.caret_pt;
+
+    const cw = dvui.currentWindow();
+    _ = try cw.addEventMouseMotion(.{ .pt = press_pt });
+    _ = try cw.addEventMouseButton(.left, .press);
+    try dvui.testing.settle(TestEntry.frame);
+    _ = try cw.addEventMouseMotion(.{ .pt = drag_pt });
+    try dvui.testing.settle(TestEntry.frame);
+    _ = try cw.addEventMouseButton(.left, .release);
+    try dvui.testing.settle(TestEntry.frame);
+
+    try std.testing.expectEqual(@as(usize, 9), TestEntry.cursor);
+    try std.testing.expectEqual(@as(usize, 2), TestEntry.sel_start);
+    try std.testing.expectEqual(@as(usize, 11), TestEntry.sel_end);
+    try std.testing.expectEqual(@as(usize, 2), TestEntry.split_len);
+}
+
+test "multiline mixed-direction text: a mouse drag anywhere draws its final selection at once" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    TestEntry.multiline = true;
+    defer TestEntry.multiline = false;
+    try TestEntry.focus();
+
+    try TestEntry.load("\u{05e9}\u{05dc}\u{05d5}\u{05dd} abc\nabc \u{05e9}\u{05dc}\u{05d5}\u{05dd} 12\n\u{05e2}\u{05d5}\u{05dc}\u{05dd}");
+    var line_ys: [3]f32 = undefined;
+    for (&line_ys, 0..) |*y, i| {
+        if (i > 0) try TestEntry.press(.down);
+        y.* = TestEntry.caret_pt.y;
+    }
+
+    const cw = dvui.currentWindow();
+    for ([_]usize{ 0, 2 }) |press_line| {
+        _ = try cw.addEventMouseMotion(.{ .pt = .{ .x = 30, .y = line_ys[press_line] } });
+        _ = try cw.addEventMouseButton(.left, .press);
+        try dvui.testing.settle(TestEntry.frame);
+        for (line_ys) |y| {
+            var x: f32 = -20;
+            while (x < 900) : (x += 11) {
+                _ = try cw.addEventMouseMotion(.{ .pt = .{ .x = x, .y = y } });
+                _ = try dvui.testing.step(TestEntry.frame);
+                const drag_frame = .{ TestEntry.cursor, TestEntry.sel_start, TestEntry.sel_end, TestEntry.split_len };
+                try dvui.testing.settle(TestEntry.frame);
+                // The drag frame already draws what the settled frames do.
+                try std.testing.expectEqual(drag_frame, .{ TestEntry.cursor, TestEntry.sel_start, TestEntry.sel_end, TestEntry.split_len });
+            }
+        }
+        _ = try cw.addEventMouseButton(.left, .release);
+        try dvui.testing.settle(TestEntry.frame);
+    }
+}
+
+test "overflow_wrap reaches the inner TextLayout" {
+    var t = try dvui.testing.init(.{ .window_size = .{ .w = 700, .h = 300 } });
+    defer t.deinit();
+
+    const Local = struct {
+        var wrap: TextLayoutWidget.OverflowWrap = .anywhere;
+        var lines: usize = 0;
+
+        fn frame() !dvui.App.Result {
+            var entry: TextEntryWidget = undefined;
+            entry.init(@src(), .{
+                .multiline = true,
+                .break_lines = true,
+                .overflow_wrap = wrap,
+                .text = .{ .buffer = &buf },
+                .scroll_horizontal = false,
+            }, .{ .rect = .{ .w = 280, .h = 200 } });
+            defer entry.deinit();
+            entry.processEvents();
+            entry.draw();
+            lines = entry.textLayout.line + 1;
+            return .ok;
+        }
+
+        var buf = blk: {
+            var b: [64]u8 = @splat(0);
+            const s = "a" ** 48;
+            @memcpy(b[0..s.len], s);
+            break :blk b;
+        };
+    };
+
+    Local.wrap = .anywhere;
+    try dvui.testing.settle(Local.frame);
+    const broken = Local.lines;
+
+    Local.wrap = .normal;
+    try dvui.testing.settle(Local.frame);
+    const whole = Local.lines;
+
+    try std.testing.expect(broken > 1);
+    try std.testing.expectEqual(@as(usize, 1), whole);
+}
+
+const TestEntry = struct {
+    var cursor: usize = 0;
+    var sel_start: usize = 0;
+    var sel_end: usize = 0;
+    var multiline = false;
+    var split_len: usize = 0;
+    var text_buf: [64]u8 = undefined;
+    var text_len: usize = 0;
+    var reset: ?[]const u8 = null;
+    var caret_x: f32 = 0;
+    var caret_pt: dvui.Point.Physical = .{};
+    var sel_end_x: f32 = 0;
+    var sel_end_rtl: bool = false;
+
+    fn frame() !dvui.App.Result {
+        var entry: TextEntryWidget = undefined;
+        entry.init(@src(), .{ .multiline = multiline }, .{ .tag = "entry" });
+        defer entry.deinit();
+
+        if (reset) |s| {
+            entry.textSet(s, false);
+            reset = null;
+        }
+
+        entry.processEvents();
+        entry.draw();
+        cursor = entry.textLayout.selection.cursor;
+        sel_start = entry.textLayout.selection.start;
+        sel_end = entry.textLayout.selection.end;
+        split_len = entry.textLayout.selection.splitRanges().len;
+        caret_x = entry.textLayout.cursor_rect.x;
+        caret_pt = entry.textLayout.data().contentRectScale().pointToPhysical(entry.textLayout.cursor_rect.center());
+        sel_end_x = entry.textLayout.state.sel_end_r.x;
+        sel_end_rtl = entry.textLayout.state.sel_end_rtl;
+        const txt = entry.getText();
+        text_len = @min(txt.len, text_buf.len);
+        @memcpy(text_buf[0..text_len], txt[0..text_len]);
+        return .ok;
+    }
+
+    fn text() []const u8 {
+        return text_buf[0..text_len];
+    }
+
+    fn focus() !void {
+        try dvui.testing.settle(frame);
+        try dvui.testing.pressKey(.tab, .none);
+        try dvui.testing.settle(frame);
+    }
+
+    fn load(s: []const u8) !void {
+        reset = s;
+        try dvui.testing.settle(frame);
+        try dvui.testing.pressKey(.home, .lcontrol);
+        try dvui.testing.settle(frame);
+    }
+
+    fn write(s: []const u8) !void {
+        try dvui.testing.writeText(s);
+        try dvui.testing.settle(frame);
+    }
+
+    fn press(key: dvui.enums.Key) !void {
+        try pressMod(key, .none);
+    }
+
+    fn pressMod(key: dvui.enums.Key, mod: dvui.enums.Mod) !void {
+        try dvui.testing.pressKey(key, mod);
+        try dvui.testing.settle(frame);
+    }
+};
+
+test "graphemes: a cluster is one caret stop; backspace and delete follow the platforms" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    try TestEntry.focus();
+
+    const family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+    const cases = [_]struct { text: []const u8, right: usize, after_backspace: ?[]const u8 = null, after_delete: ?[]const u8 = null }{
+        // Backspace takes a combining accent alone, as Blink and Android do.
+        .{ .text = "e\u{0301}x", .right = 3, .after_backspace = "ex", .after_delete = "x" },
+        .{ .text = "\u{0915}\u{094D}\u{0937}a", .right = 9, .after_backspace = "\u{0915}\u{094D}a" },
+        .{ .text = family ++ "x", .right = family.len, .after_backspace = "x", .after_delete = "x" },
+        .{ .text = "\u{0E17}\u{0E35}\u{0E48}x", .right = 9, .after_delete = "x" },
+    };
+    for (cases) |c| {
+        try TestEntry.load(c.text);
+        try TestEntry.press(.right);
+        try std.testing.expectEqual(c.right, TestEntry.cursor);
+        if (c.after_backspace) |expected| {
+            try TestEntry.press(.backspace);
+            try std.testing.expectEqualStrings(expected, TestEntry.text());
+        }
+        if (c.after_delete) |expected| {
+            try TestEntry.load(c.text);
+            try TestEntry.press(.delete);
+            try std.testing.expectEqualStrings(expected, TestEntry.text());
+        }
+    }
+}
+
+test "mixed-direction text: a selection ending at a level-run boundary ends where it was drawn" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    try TestEntry.focus();
+
+    // Selecting "abc" of "abc" | Hebrew | "xyz": byte 3 is also the Hebrew
+    // run's right edge, but the touch handle belongs after "c".
+    try TestEntry.load("abc\u{05e9}\u{05dc}\u{05d5}\u{05dd}xyz");
+    for (0..3) |_| try TestEntry.pressMod(.right, .lshift);
+    try std.testing.expectEqual(@as(usize, 3), TestEntry.sel_end);
+    try std.testing.expectApproxEqAbs(TestEntry.caret_x, TestEntry.sel_end_x, 0.5);
+    try std.testing.expect(!TestEntry.sel_end_rtl);
 }

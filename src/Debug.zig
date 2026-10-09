@@ -507,8 +507,8 @@ fn dumpValue(writer: *std.Io.Writer, v: anytype) std.Io.Writer.Error!void {
         try writer.print("\"#{x:0>2}{x:0>2}{x:0>2}{x:0>2}\"", .{ v.r, v.g, v.b, v.a });
     } else if (T == dvui.Font) {
         try writer.writeAll("{\"family\":");
-        try dumpString(writer, dvui.Font.string(&v.family));
-        try writer.print(",\"size\":{d},\"weight\":\"{s}\",\"style\":\"{s}\"}}", .{ v.size, @tagName(v.weight), @tagName(v.style) });
+        try dumpString(writer, v.familyName());
+        try writer.print(",\"size\":{d},\"weight\":{d},\"style\":\"{s}\"}}", .{ v.size, v.weight.value, @tagName(v.style) });
     } else if (T == Options.Gravity) {
         try writer.print("{{\"x\":{d},\"y\":{d}}}", .{ v.x, v.y });
     } else if (T == dvui.Id) {
@@ -1464,7 +1464,7 @@ fn fontChanger(self: *Options) bool {
 
         var current_font_index: ?usize = null;
         var current_font_name: []const u8 = "Unknown";
-        for (dvui.currentWindow().fonts.database.items, 0..) |dbs, i| {
+        for (dvui.currentWindow().fonts.database.faces.items, 0..) |dbs, i| {
             if (std.mem.eql(u8, dbs.familyName(), edited_font.familyName())) {
                 current_font_index = i;
                 current_font_name = edited_font.familyName();
@@ -1474,7 +1474,7 @@ fn fontChanger(self: *Options) bool {
         var dd: dvui.DropdownWidget = undefined;
         dd.init(@src(), .{ .selected_index = current_font_index, .label = current_font_name }, .{});
         if (dd.dropped()) {
-            for (dvui.currentWindow().fonts.database.items) |dbs| {
+            for (dvui.currentWindow().fonts.database.faces.items) |dbs| {
                 const name = dbs.name(dvui.currentWindow().lifo());
                 defer dvui.currentWindow().lifo().free(name);
                 if (dd.addChoiceLabel(name)) {

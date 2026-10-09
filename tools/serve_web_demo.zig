@@ -37,6 +37,8 @@ pub fn main(init: std.process.Init) !void {
 var html: Response = .{ .mime = "text/html", .location = undefined, .content = undefined, .etag = undefined };
 var js: Response = .{ .mime = "text/javascript", .location = undefined, .content = undefined, .etag = undefined };
 var wasm: Response = .{ .mime = "application/wasm", .location = undefined, .content = undefined, .etag = undefined };
+// optional 4th file: web_fallback.js
+var extra_js: Response = .{ .mime = "text/javascript", .location = "", .content = "", .etag = undefined };
 
 const not_found: std.http.Status = .not_found;
 const not_found_phrase = not_found.phrase().?;
@@ -58,6 +60,8 @@ fn responseForLocation(location: []const u8) ?Response {
         js
     else if (std.mem.eql(u8, path, wasm.location))
         wasm
+    else if (extra_js.content.len > 0 and std.mem.eql(u8, path, extra_js.location))
+        extra_js
     else
         null;
 }
@@ -65,7 +69,9 @@ fn responseForLocation(location: []const u8) ?Response {
 fn readFiles(io: Io, arena: Allocator, args: []const [:0]const u8) !void {
     const cwd: Io.Dir = .cwd();
     var read_buf: [1024]u8 = undefined;
-    for (args[1..4], [_]*Response{ &html, &js, &wasm }) |path, response| {
+    const responses = [_]*Response{ &html, &js, &wasm, &extra_js };
+    const count = @min(args.len - 1, responses.len);
+    for (args[1..][0..count], responses[0..count]) |path, response| {
         const file = try cwd.openFile(io, path, .{});
         defer file.close(io);
 

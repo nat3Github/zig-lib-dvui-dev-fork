@@ -107,9 +107,8 @@ pub fn scrollCanvas() void {
         ftb.init();
         defer ftb.deinit();
 
-        // This makes the text smoothly zoom, as long as you are using
-        // stb_truetype (-Dfreetype=false)
-        const snap = dvui.snapToPixelsSet(dvui.useFreeType);
+        // This makes the text smoothly zoom
+        const snap = dvui.snapToPixelsSet(false);
         defer _ = dvui.snapToPixelsSet(snap);
 
         var dragBox = dvui.box(@src(), .{}, .{

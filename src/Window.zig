@@ -28,7 +28,6 @@ scroll_to_focused: bool = false,
 text_input_rect: ?Rect.Natural = null,
 
 snap_to_pixels: bool = true,
-kerning: bool = true,
 /// The alpha value for all rendering. All colors alpha values will be
 /// multiplied by this value.
 alpha: f32 = 1.0,
@@ -228,6 +227,11 @@ pub const InitOptions = struct {
     open_flag: ?*bool = null,
 
     button_order: ?dvui.enums.DialogButtonOrder = null,
+
+    /// Web backend only: where fonts for scripts the app's fonts lack come
+    /// from, and whether to fetch them at all. Defaults to Google's font CDN;
+    /// see `dvui.Font.WebFallbackOptions`.
+    web_font_fallback: dvui.Font.WebFallbackOptions = .{},
 };
 
 pub fn init(
@@ -274,6 +278,11 @@ pub fn init(
     }
 
     try self.initEvents();
+
+    if (dvui.Font.web_fallback_enabled and dvui.backend.kind == .web) {
+        self.fonts.setWebFallback(gpa, init_opts.web_font_fallback);
+        self.fonts.database.fallback_language = dvui.backend.fallbackLanguage();
+    }
 
     self.button_order = init_opts.button_order orelse switch (builtin.os.tag) {
         .windows => .ok_cancel,
@@ -410,13 +419,6 @@ pub fn init(
     self.subwindows.focused_id = self.data().id;
     self.frame_time_ns = 1;
 
-    if (dvui.useFreeType) {
-        dvui.Font.FreeType.intToError(c.FT_Init_FreeType(&dvui.ft2lib)) catch |err| {
-            dvui.log.err("freetype error {any} trying to init freetype library\n", .{err});
-            return error.freetypeError;
-        };
-    }
-
     return self;
 }
 
@@ -439,27 +441,38 @@ pub fn stateSet(self: *Self, state: dvui.enums.WindowState) void {
     self.backend.windowStateSet(self, state);
 }
 
+/// Only valid between `begin` and `end` (validation uses the frame's lifo allocator).
 pub fn addFont(self: *Self, name: []const u8, ttf_bytes: []const u8, ttf_bytes_allocator: ?std.mem.Allocator) (std.mem.Allocator.Error || dvui.Font.Error)!void {
-    try self.fonts.database.ensureUnusedCapacity(self.gpa, 1);
+    try self.fonts.database.faces.ensureUnusedCapacity(self.gpa, 1);
     // TODO: try to get this info from the ttf file, and also add override options
     const font: dvui.Font = .find(.{ .family = name });
     // Test if we can successfully open this font
     // TODO: Find some more elegant way of validating ttf files
-    const source: dvui.Font.Source = .{
+    const source: dvui.Font.Source = .{ .family = dvui.Font.array(name), .bytes = ttf_bytes };
+    var entry = try dvui.Font.Cache.Entry.init(self.gpa, &source, font);
+    // Try and cache the entry since the work is already done. Keep an existing
+    // entry: text shaped this frame may still point at it.
+    const slot = self.fonts.cache.getOrPut(self.gpa, font.cacheKey()) catch null;
+    if (slot == null or slot.?.found_existing) {
+        entry.deinit(self.gpa, self.backend);
+    } else if (self.gpa.create(dvui.Font.Cache.Entry)) |boxed| {
+        boxed.* = entry;
+        slot.?.value_ptr.* = boxed;
+    } else |_| {
+        self.fonts.cache.map.removeByPtr(slot.?.key_ptr);
+        entry.deinit(self.gpa, self.backend);
+    }
+    self.fonts.database.faces.appendAssumeCapacity(.{
         .family = dvui.Font.array(name),
         .bytes = ttf_bytes,
         .allocator = ttf_bytes_allocator,
-    };
-    var entry = try dvui.Font.Cache.Entry.init(self.gpa, source, font, false);
-    // Try and cache the entry since the work is already done
-    self.fonts.cache.put(self.gpa, font.hash(), entry) catch entry.deinit(self.gpa, self.backend);
-    self.fonts.database.appendAssumeCapacity(source);
+    });
 }
 
 pub fn addEmbeddedFontsFromTheme(self: *Self, theme: *const Theme) void {
     // load any embedded fonts we haven't yet
     loop: for (theme.embedded_fonts) |fs| {
-        for (self.fonts.database.items) |dbs| {
+        for (self.fonts.database.faces.items) |dbs| {
             if (dbs.bytes.ptr == fs.bytes.ptr) continue :loop;
         }
 
@@ -467,7 +480,7 @@ pub fn addEmbeddedFontsFromTheme(self: *Self, theme: *const Theme) void {
         defer self.arena().free(name);
 
         dvui.log.debug("adding embedded font {s}", .{name});
-        self.fonts.database.append(self.gpa, fs) catch |err| {
+        self.fonts.database.faces.append(self.gpa, fs) catch |err| {
             dvui.logError(@src(), err, "trying to add embedded font {s}", .{name});
         };
     }
@@ -1548,7 +1561,6 @@ pub fn addRenderCommand(self: *Self, cmd: dvui.RenderCommand.Command, after: boo
         .clip = self.clipRect,
         .alpha = self.alpha,
         .snap = self.snap_to_pixels,
-        .kerning = self.kerning,
         .cmd = cmd,
     };
     if (after) {
@@ -1566,9 +1578,6 @@ pub fn renderCommands(self: *Self, queue: []const dvui.RenderCommand) !void {
     const old_snap = self.snap_to_pixels;
     defer self.snap_to_pixels = old_snap;
 
-    const old_kern = self.kerning;
-    defer self.kerning = old_kern;
-
     const old_alpha = self.alpha;
     defer self.alpha = old_alpha;
 
@@ -1581,7 +1590,6 @@ pub fn renderCommands(self: *Self, queue: []const dvui.RenderCommand) !void {
 
     for (queue) |*drc| {
         self.snap_to_pixels = drc.snap;
-        self.kerning = drc.kerning;
         self.clipRect = drc.clip;
         self.alpha = drc.alpha;
         switch (drc.cmd) {
@@ -1731,6 +1739,8 @@ pub fn end(self: *Self, opts: endOptions) !?u32 {
     if (!self.end_rendering_done) {
         self.endRendering(opts);
     }
+
+    self.fonts.processWebFallback(self.gpa, self.lifo());
 
     // events may have been tagged with a focus widget that never showed up
     const evts = dvui.events();

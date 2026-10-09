@@ -1,9 +1,56 @@
 var line_height_factor: f32 = 1.2;
 var underline_thick: f32 = 0.0;
 var strike_thick: f32 = 0.0;
+var wght_axis: f32 = 400;
+var font_weight: f32 = 400;
+var font_stretch: f32 = 1.0;
+var font_style: dvui.Font.Style = .normal;
+var multi_script_font_size: f32 = 18;
+var multi_script_family_choice: usize = 0;
+var fallback_language_choice: usize = 0;
+const fallback_language_labels = [_][]const u8{ "OS locale", "ja", "zh-Hans", "zh-Hant", "ko" };
+const fallback_language_tags = [_]?[]const u8{ null, "ja", "zh-Hans", "zh-Hant", "ko" };
+var break_width: f32 = 260;
+var break_line_break: @FieldType(TextLayoutWidget.InitOptions, "line_break") = .strict;
+var break_word_break: @FieldType(TextLayoutWidget.InitOptions, "word_break") = .normal;
+var break_overflow_wrap: @FieldType(TextLayoutWidget.InitOptions, "overflow_wrap") = .anywhere;
+var bidi_direction: @FieldType(TextLayoutWidget.InitOptions, "base_direction") = .auto;
+var overflow_width: f32 = 220;
+var overflow_ellipsis = true;
+var overflow_lines: f32 = 2;
+var align_choice: TextLayoutWidget.TextAlign = .start;
+var feature_family_choice: ?usize = null;
+var feature_liga = true;
+var feature_tnum = false;
+var feature_onum = false;
+var feature_zero = false;
+var feature_smcp = false;
+var feature_frac = false;
+var tab_size: f32 = 8;
+var tab_entry_filled = false;
+var variable_font_registered = false;
+/// Registered stack alias, first entry in the family dropdown below.
+const demo_stack_alias = "Demo Stack (Aleo + Noto KR)";
+/// CSS generics plus installed families, enumerated once (the OS query is slow).
+var family_choices: ?[]const []const u8 = null;
+var family_choices_buf: [1024][]const u8 = undefined;
+var family_names_storage: [64 * 1024]u8 = undefined;
 
 /// ![image](Examples-text_layout.png)
 pub fn layoutText() void {
+    // variable font, so the wght slider has an axis to move
+    if (!variable_font_registered) {
+        dvui.addFont("Aleo VF", @embedFile("../fonts/Aleo/Aleo-VariableFont_wght.ttf"), null) catch {};
+        dvui.addFont("Noto Sans KR", @embedFile("../fonts/NotoSansKR-Regular.ttf"), null) catch {};
+        // Latin from Aleo, Hangul from Noto Sans KR (scaled down: it runs
+        // larger than Aleo), everything else from the OS sans-serif.
+        dvui.addFontFamilyEntries(demo_stack_alias, &.{
+            .{ .family = dvui.Font.array("Aleo VF") },
+            .{ .family = dvui.Font.array("Noto Sans KR"), .size_scale = 0.85 },
+            .{ .family = dvui.Font.array("sans-serif") },
+        }) catch {};
+        variable_font_registered = true;
+    }
     {
         var box = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
         defer box.deinit();
@@ -11,16 +58,19 @@ pub fn layoutText() void {
         const show_large_doc: *bool = dvui.dataGetPtrDefault(null, box.data().id, "show_large_doc", bool, false);
 
         {
-            var vbox = dvui.box(@src(), .{}, .{});
-            defer vbox.deinit();
+            var flex = dvui.flexbox(@src(), .{ .justify_content = .start }, .{ .expand = .horizontal });
+            defer flex.deinit();
 
             _ = dvui.sliderEntry(@src(), "line height: {d:0.2}", .{ .value = &line_height_factor, .min = 0.1, .max = 2, .interval = 0.1 }, .{});
             _ = dvui.sliderEntry(@src(), "underline thick: {d:0.2}", .{ .value = &underline_thick, .min = 0.00, .max = 1.0, .interval = 0.01 }, .{});
             _ = dvui.sliderEntry(@src(), "strike thick: {d:0.2}", .{ .value = &strike_thick, .min = 0.00, .max = 1.0, .interval = 0.01 }, .{});
-        }
-
-        if (dvui.button(@src(), "Large Doc", .{}, .{ .gravity_x = 1.0 })) {
-            show_large_doc.* = !show_large_doc.*;
+            _ = dvui.sliderEntry(@src(), "weight axis: {d:0.0}", .{ .value = &wght_axis, .min = 100, .max = 900, .interval = 1 }, .{});
+            _ = dvui.sliderEntry(@src(), "font weight: {d:0.0}", .{ .value = &font_weight, .min = 100, .max = 900, .interval = 100 }, .{});
+            _ = dvui.sliderEntry(@src(), "font stretch: {d:0.000}", .{ .value = &font_stretch, .min = 0.5, .max = 2, .interval = 0.125 }, .{});
+            _ = dvui.dropdownEnum(@src(), dvui.Font.Style, .{ .choice = &font_style }, .{}, .{});
+            if (dvui.button(@src(), "Large Doc", .{}, .{})) {
+                show_large_doc.* = !show_large_doc.*;
+            }
         }
 
         if (show_large_doc.*) {
@@ -36,7 +86,6 @@ pub fn layoutText() void {
 
             const copies: *usize = dvui.dataGetPtrDefault(null, box.data().id, "copies", usize, 100);
             const break_lines: *bool = dvui.dataGetPtrDefault(null, box.data().id, "break_lines", bool, false);
-            const kerning: *usize = dvui.dataGetPtrDefault(null, box.data().id, "kerning", usize, 0);
             const refresh: *bool = dvui.dataGetPtrDefault(null, box.data().id, "refresh", bool, false);
             {
                 var box2 = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
@@ -62,23 +111,12 @@ pub fn layoutText() void {
                 if (dvui.checkbox(@src(), break_lines, "Break Lines", .{ .gravity_y = 0.5 })) {
                     cache_ok = false;
                 }
-
-                if (dvui.dropdown(@src(), &.{ "Kern null", "Kern true", "Kern false" }, .{ .choice = kerning }, .{}, .{ .gravity_y = 0.5, .min_size_content = .width(120) })) {
-                    cache_ok = false;
-                }
-
-                if (dvui.checkbox(@src(), &dvui.currentWindow().kerning, "Kern Global", .{ .gravity_y = 0.5 })) {
-                    cache_ok = false;
-                }
             }
 
             var scroll = dvui.scrollArea(@src(), .{}, .{ .expand = .both });
             defer scroll.deinit();
 
-            var kern: ?bool = null;
-            if (kerning.* == 1) kern = true;
-            if (kerning.* == 2) kern = false;
-            var tl = dvui.textLayout(@src(), .{ .cache_layout = cache_ok, .break_lines = break_lines.*, .kerning = kern }, .{ .expand = .both });
+            var tl = dvui.textLayout(@src(), .{ .cache_layout = cache_ok, .break_lines = break_lines.* }, .{ .expand = .both });
             defer tl.deinit();
 
             const lorem1 = "Header line with 9 indented (kerning test T.)\n" ++
@@ -150,9 +188,11 @@ pub fn layoutText() void {
 
         tl.format("Body font is {s}\n\n", .{dvui.Font.theme(.body).familyName()}, .{});
 
-        const lorem = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. ";
-        const lorem2 = " Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.\n";
-        tl.addText(lorem, .{ .font = fontWithLineHeight });
+        const prose = "Typography across scripts: Falsches Üben von Xylophonmusik quält jeden größeren Zwerg. " ++
+            "Γαζέες καὶ μυρτιὲς δὲν θὰ βρῶ πιὰ στὸ χρυσαφὶ ξέφωτο. Съешь же ещё этих мягких французских булок. " ++
+            "यह हिन्दी में एक परीक्षण वाक्य है। 日本語と中文も同じ段落に入ります。 한국어 문장도 있습니다. ";
+        const prose2 = " والنص العربي يُكتب من اليمين إلى اليسار. עברית גם כן. ภาษาไทยไม่มีช่องว่างระหว่างคำ Emoji \u{1F600}\u{1F469}\u{200D}\u{1F4BB}.\n";
+        tl.addText(prose, .{ .font = fontWithLineHeight });
 
         tl.addLink(
             .{
@@ -162,15 +202,138 @@ pub fn layoutText() void {
             .{ .font = fontWithLineHeight.withUnderline(.{}) },
         );
 
-        tl.addText(lorem2, .{ .font = fontWithLineHeight });
+        tl.addText(prose2, .{ .font = fontWithLineHeight });
 
-        const start = "\nNotice that the text in this box is wrapping around the stuff in the corners.\n\n";
-        tl.addText(start, .{ .font = .theme(.title) });
+        tl.addText("\nNotice that the text in this box is wrapping around the stuff in the corners.\n", .{ .font = .theme(.title) });
+    }
+
+    multiScript();
+    lineBreaking();
+    bidi();
+    textOverflow();
+    textAlign();
+    fontFeatures();
+    tabSize();
+    styling();
+}
+
+fn textOverflow() void {
+    dvui.label(@src(), "Text Overflow", .{}, .{ .font = .theme(.title) });
+    {
+        var hbox = dvui.box(@src(), .{ .dir = .horizontal }, .{});
+        defer hbox.deinit();
+        _ = dvui.sliderEntry(@src(), "width: {d:0}", .{ .value = &overflow_width, .min = 40, .max = 600, .interval = 1 }, .{ .gravity_y = 0.5 });
+        _ = dvui.checkbox(@src(), &overflow_ellipsis, "ellipsis", .{ .gravity_y = 0.5 });
+        _ = dvui.sliderEntry(@src(), "max lines: {d:0}", .{ .value = &overflow_lines, .min = 1, .max = 5, .interval = 1 }, .{ .gravity_y = 0.5 });
+    }
+    const box_opts: dvui.Options = .{ .min_size_content = .width(overflow_width), .max_size_content = .width(overflow_width), .border = Rect.all(1) };
+
+    // Single lines: the ellipsis lands at the logical end, left on RTL lines.
+    const lines = [_][]const u8{
+        "A single line of Latin text, too long for its box.",
+        "שורה אחת בעברית שארוכה מדי בשביל התיבה שלה.",
+        "سطر واحد بالعربية أطول من أن يتسع له صندوقه.",
+    };
+    for (lines, 0..) |line, i| {
+        dvui.labelNoFmt(@src(), line, .{ .ellipsize = overflow_ellipsis }, box_opts.override(.{ .id_extra = i }));
+    }
+
+    var tl = dvui.textLayout(@src(), .{ .max_lines = if (overflow_ellipsis) @intFromFloat(overflow_lines) else null }, box_opts);
+    defer tl.deinit();
+    tl.addText("A paragraph clamped to max lines: it keeps wrapping until the last allowed line, ", .{});
+    tl.addText("which ends in an ellipsis instead of spilling out of the box. ", .{ .color_text = .fromHex("d75f5f") });
+    tl.addText("עברית באמצע הפסקה כדי לראות את השבירה.", .{});
+}
+
+fn textAlign() void {
+    dvui.label(@src(), "Text Align", .{}, .{ .font = .theme(.title) });
+    {
+        var hbox = dvui.box(@src(), .{ .dir = .horizontal }, .{});
+        defer hbox.deinit();
+        inline for (@typeInfo(TextLayoutWidget.TextAlign).@"enum".fields, 0..) |field, i| {
+            const value: TextLayoutWidget.TextAlign = @enumFromInt(field.value);
+            if (dvui.radio(@src(), align_choice == value, field.name, .{ .id_extra = i })) align_choice = value;
+        }
+    }
+
+    // start/end flip with each paragraph's direction; left/right/center don't.
+    var tl = dvui.textLayout(@src(), .{ .text_align = align_choice }, .{ .min_size_content = .width(360), .max_size_content = .width(360), .border = Rect.all(1) });
+    defer tl.deinit();
+    tl.addText("An English paragraph that wraps over a few lines, so every line shows where the alignment puts it.\n", .{});
+    tl.addText("פסקה בעברית שנשברת לכמה שורות, כך שכל שורה מראה לאן היישור מזיז אותה.\n", .{});
+    tl.addText("Short line\n", .{});
+    tl.addText("שורה קצרה", .{});
+}
+
+fn fontFeatures() void {
+    dvui.label(@src(), "Font Features", .{}, .{ .font = .theme(.title) });
+    const families = familyChoices();
+    const choice = feature_family_choice orelse blk: {
+        // The system UI font carries most of these features (SF: tnum, zero, smcp, frac).
+        var default: usize = 0;
+        for (families, 0..) |f, i| {
+            if (std.mem.eql(u8, f, "System Font")) default = i;
+        }
+        feature_family_choice = default;
+        break :blk default;
+    };
+    {
+        var hbox = dvui.box(@src(), .{ .dir = .horizontal }, .{});
+        defer hbox.deinit();
+        var picked = choice;
+        if (dvui.dropdown(@src(), families, .{ .choice = &picked }, .{}, .{ .gravity_y = 0.5 })) feature_family_choice = picked;
+        _ = dvui.checkbox(@src(), &feature_liga, "liga", .{ .gravity_y = 0.5 });
+        _ = dvui.checkbox(@src(), &feature_tnum, "tnum", .{ .gravity_y = 0.5 });
+        _ = dvui.checkbox(@src(), &feature_onum, "onum", .{ .gravity_y = 0.5 });
+        _ = dvui.checkbox(@src(), &feature_zero, "zero", .{ .gravity_y = 0.5 });
+        _ = dvui.checkbox(@src(), &feature_smcp, "smcp", .{ .gravity_y = 0.5 });
+        _ = dvui.checkbox(@src(), &feature_frac, "frac", .{ .gravity_y = 0.5 });
+    }
+
+    const plain = dvui.Font.init(families[feature_family_choice.?]).withSize(20);
+    const featured = plain
+        .withFeature("liga", feature_liga)
+        .withFeature("tnum", feature_tnum)
+        .withFeature("onum", feature_onum)
+        .withFeature("zero", feature_zero)
+        .withFeature("smcp", feature_smcp)
+        .withFeature("frac", feature_frac);
+    const sample = "office affluent fjord  Small Caps  1/2 3/4\n1111.11\n9999.00\n";
+
+    var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal });
+    defer tl.deinit();
+    tl.addText("default:\n", .{});
+    tl.addText(sample, .{ .font = plain });
+    tl.addText("with features:\n", .{});
+    tl.addText(sample, .{ .font = featured });
+}
+
+fn tabSize() void {
+    dvui.label(@src(), "Tab Size", .{}, .{ .font = .theme(.title) });
+    _ = dvui.sliderEntry(@src(), "tab size: {d:0}", .{ .value = &tab_size, .min = 0, .max = 16, .interval = 1 }, .{});
+    const font = dvui.Font.theme(.body).withTabSize(@intFromFloat(tab_size));
+    const sample = "name\tqty\tprice\napple\t3\t1.20\nwatermelon\t12\t4.50\n\tindented\tby a tab";
+
+    dvui.labelNoFmt(@src(), sample, .{}, .{ .font = font, .border = Rect.all(1) });
+
+    var te = dvui.textEntry(@src(), .{ .multiline = true }, .{ .font = font, .min_size_content = .{ .w = 400, .h = 90 } });
+    defer te.deinit();
+    if (!tab_entry_filled) {
+        te.textSet(sample, false);
+        tab_entry_filled = true;
+    }
+}
+
+fn styling() void {
+    dvui.label(@src(), "Styling", .{}, .{ .font = .theme(.title) });
+    {
+        var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal });
+        defer tl.deinit();
 
         const col = dvui.Color.average(tl.data().options.color(.text).toColor(), tl.data().options.color(.fill).toColor());
-        tl.addTextTooltip(@src(), "Hover this for a tooltip.\n\n", "This is some tooltip", .{ .color_text = .{ .color = col } });
+        tl.addTextTooltip(@src(), "Hover this for a tooltip.\n", "This is some tooltip", .{ .color_text = .{ .color = col } });
 
-        tl.format("This line uses zig format strings: {d}\n\n", .{12345}, .{});
+        tl.format("This line uses zig format strings: {d}\n", .{12345}, .{});
 
         const bold_font = dvui.Font.theme(.body).withWeight(.bold);
         if (bold_font.findSource()) |s| {
@@ -195,6 +358,19 @@ pub fn layoutText() void {
         tl.addText("is some ", .{ .font = dvui.Font.theme(.body).larger(6), .color_text = .{ .color = .{ .b = 100, .g = 100 } }, .color_fill = .green });
         tl.addText("ugly text ", .{ .font = dvui.Font.theme(.body).larger(8), .color_text = .{ .color = .{ .r = 100, .g = 100 } }, .color_fill = .teal });
         tl.addText("that shows styling.", .{ .font = dvui.Font.theme(.body).larger(-2), .color_text = .{ .color = .{ .r = 100, .g = 50, .b = 50 } } });
+
+        const variable_font = dvui.Font.init("Aleo VF").larger(4).withVariation("wght", wght_axis);
+        tl.format("\n\nVariable font (wght={d:0.0}): the quick brown fox\n", .{wght_axis}, .{ .font = variable_font });
+
+        // CSS font matching: request weight/stretch/style, show the face that actually won.
+        for ([_][]const u8{ "Aleo VF", familyChoices()[multi_script_family_choice] }) |family| {
+            const requested = dvui.Font.init(family).larger(4).withWeight(.{ .value = font_weight }).withStretch(.{ .value = font_stretch }).withStyle(font_style);
+            if (requested.findSource()) |source| {
+                tl.format("{s} {d:0} {d:0.000} {t} -> {s} {d:0} {d:0.000} {t}: the quick brown fox\n", .{ family, font_weight, font_stretch, font_style, source.displayName(), source.weight.value, source.stretch.value, source.style }, .{ .font = requested });
+            } else {
+                tl.format("{s} {d:0} {d:0.000} {t} -> no face loaded: the quick brown fox\n", .{ family, font_weight, font_stretch, font_style }, .{ .font = requested });
+            }
+        }
     }
 
     if (dvui.useTreeSitter) {
@@ -297,6 +473,169 @@ pub fn layoutText() void {
     } else {
         dvui.label(@src(), "Syntax highlight disabled (not yet available in on web)", .{}, .{});
     }
+}
+
+fn familyChoices() []const []const u8 {
+    return family_choices orelse blk: {
+        family_choices_buf[0] = demo_stack_alias;
+        const generics = dvui.Font.generic_families;
+        for (generics, 0..) |g, i| family_choices_buf[1 + i] = g;
+        const head = 1 + generics.len;
+        const system = dvui.Font.systemFamilies(
+            family_choices_buf[head..],
+            &family_names_storage,
+            dvui.currentWindow().gpa,
+        );
+        family_choices = family_choices_buf[0 .. head + system.len];
+        break :blk family_choices.?;
+    };
+}
+
+/// Name of the font that renders `codepoint` in `font`. The result borrows from `source`.
+fn resolvedFontName(font: dvui.Font, codepoint: u21, source: *dvui.Font.Source) []const u8 {
+    const cw = dvui.currentWindow();
+    const stack = cw.fonts.resolveStack(cw.gpa, font) catch return "out of memory";
+    if (stack.entryIndexFor(codepoint)) |idx| {
+        const family_font = &stack.family_fonts[idx];
+        source.* = family_font.findSource() orelse return family_font.familyName();
+        return source.displayName();
+    }
+    const fb_font = cw.fonts.discoverDynamicFallback(cw.gpa, codepoint) orelse return "no fallback available";
+    source.* = fb_font.findSource() orelse return "no fallback available";
+    return source.displayName();
+}
+
+fn firstCodepoint(text: []const u8) u21 {
+    const len = std.unicode.utf8ByteSequenceLength(text[0]) catch return 0xFFFD;
+    return std.unicode.utf8Decode(text[0..len]) catch 0xFFFD;
+}
+
+fn multiScript() void {
+    const families = familyChoices();
+    dvui.label(@src(), "Multi-Script (system fonts)", .{}, .{ .font = .theme(.title) });
+    {
+        var hbox = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
+        defer hbox.deinit();
+        _ = dvui.sliderEntry(@src(), "font size: {d:0.0}", .{ .value = &multi_script_font_size, .min = 8, .max = 48, .interval = 1 }, .{ .gravity_y = 0.5 });
+        _ = dvui.dropdown(@src(), families, .{ .choice = &multi_script_family_choice }, .{}, .{ .gravity_y = 0.5 });
+        dvui.label(@src(), "Han fallback language", .{}, .{ .gravity_y = 0.5 });
+        if (dvui.dropdown(@src(), &fallback_language_labels, .{ .choice = &fallback_language_choice }, .{}, .{ .gravity_y = 0.5 })) {
+            const cw = dvui.currentWindow();
+            cw.fonts.database.setFallbackLanguage(fallback_language_tags[fallback_language_choice]);
+        }
+    }
+
+    var mtl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal });
+    defer mtl.deinit();
+
+    const font_size = multi_script_font_size;
+    const font = dvui.Font.init(families[multi_script_family_choice]).withSize(font_size);
+
+    mtl.addText("Generic families resolve to: ", .{ .font = font });
+    for (dvui.Font.generic_families) |generic| {
+        var source: dvui.Font.Source = undefined;
+        const generic_font = dvui.Font.init(generic).withSize(font_size);
+        mtl.format("{s} = {s}   ", .{ generic, resolvedFontName(generic_font, 'A', &source) }, .{ .font = generic_font });
+    }
+    mtl.addText("\n\n", .{ .font = font });
+
+    // show which font renders each script, so a wrong fallback is visible
+    const scripts = [_]struct { label: []const u8, sample: []const u8 }{
+        .{ .label = "Latin", .sample = "The quick brown fox jumps over the lazy dog." },
+        .{ .label = "Arabic", .sample = "هذه جملة اختبارية باللغة العربية." },
+        .{ .label = "Devanagari", .sample = "यह हिन्दी में एक परीक्षण वाक्य है।" },
+        .{ .label = "Japanese", .sample = "これは日本語のテスト文です。" },
+        .{ .label = "Korean", .sample = "이것은 한국어 테스트 문장입니다." },
+        .{ .label = "Chinese", .sample = "这是一个中文测试句子。" },
+        .{ .label = "Emoji (color)", .sample = "\u{1F600}\u{1F389}\u{1F680}\u{2764}\u{FE0F}\u{1F525}\u{1F30D}" },
+        .{ .label = "Emoji (grey/mono)", .sample = "\u{2600}\u{2602}\u{267B}" },
+    };
+    for (scripts) |s| {
+        var source: dvui.Font.Source = undefined;
+        mtl.format("{s}: {s}\n", .{ s.label, resolvedFontName(font, firstCodepoint(s.sample), &source) }, .{ .font = font });
+        mtl.format("{s}\n\n", .{s.sample}, .{ .font = font });
+    }
+
+    // sans-serif rather than the dropdown pick: the demo stack's Noto Sans KR
+    // covers Han itself, which would hide the fallback-language choice.
+    {
+        const han_font = dvui.Font.init("sans-serif").withSize(font_size);
+        const han_sample = "直 骨 角 誤 返 刃 令 化";
+        var source: dvui.Font.Source = undefined;
+        const lang = fallback_language_labels[fallback_language_choice];
+        // Language in the line text too: shaped lines are cached by text, so this reshapes on a switch.
+        mtl.format("Han, fallback language {s}: {s}\n", .{ lang, resolvedFontName(han_font, firstCodepoint(han_sample), &source) }, .{ .font = han_font });
+        mtl.format("[{s}] {s}\n\n", .{ lang, han_sample }, .{ .font = han_font });
+    }
+}
+
+const line_break_sample =
+    "Thai (dictionary break): ภาษาไทยไม่มีการเว้นวรรคระหว่างคำจึงต้องใช้พจนานุกรมในการตัดคำ\n" ++
+    "CJK: 日本語の文章は「句読点」の前後で改行の規則が変わります。ぁぃぅ小さい仮名もあります。中文句子也可以在任意汉字之间断行。\n" ++
+    "URL: https://example.com/a/very/long/path/to/some/resource?query=value&other=1\n" ++
+    "Long word: Donaudampfschifffahrtsgesellschaftskapitänsmützenhalter\n" ++
+    "LS here\u{2028}next line, PS here\u{2029}next paragraph, CRLF here\r\nlast line.";
+
+fn lineBreaking() void {
+    dvui.label(@src(), "Line Breaking", .{}, .{ .font = .theme(.title) });
+    {
+        var hbox = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
+        defer hbox.deinit();
+        _ = dvui.sliderEntry(@src(), "width: {d:0}", .{ .value = &break_width, .min = 40, .max = 700, .interval = 1 }, .{ .gravity_y = 0.5 });
+        dvui.label(@src(), "line-break", .{}, .{ .gravity_y = 0.5 });
+        _ = dvui.dropdownEnum(@src(), @TypeOf(break_line_break), .{ .choice = &break_line_break }, .{}, .{ .gravity_y = 0.5 });
+        dvui.label(@src(), "word-break", .{}, .{ .gravity_y = 0.5 });
+        _ = dvui.dropdownEnum(@src(), @TypeOf(break_word_break), .{ .choice = &break_word_break }, .{}, .{ .gravity_y = 0.5 });
+        dvui.label(@src(), "overflow-wrap", .{}, .{ .gravity_y = 0.5 });
+        _ = dvui.dropdownEnum(@src(), @TypeOf(break_overflow_wrap), .{ .choice = &break_overflow_wrap }, .{}, .{ .gravity_y = 0.5 });
+    }
+
+    var tl = dvui.textLayout(@src(), .{
+        .line_break = break_line_break,
+        .word_break = break_word_break,
+        .overflow_wrap = break_overflow_wrap,
+    }, .{
+        .min_size_content = .width(break_width),
+        .max_size_content = .width(break_width),
+        .border = Rect.all(1),
+    });
+    defer tl.deinit();
+    tl.addText(line_break_sample, .{});
+}
+
+fn bidi() void {
+    dvui.label(@src(), "Bidi", .{}, .{ .font = .theme(.title) });
+    {
+        var hbox = dvui.box(@src(), .{ .dir = .horizontal }, .{});
+        defer hbox.deinit();
+        dvui.label(@src(), "base direction", .{}, .{ .gravity_y = 0.5 });
+        _ = dvui.dropdownEnum(@src(), @TypeOf(bidi_direction), .{ .choice = &bidi_direction }, .{}, .{ .gravity_y = 0.5 });
+    }
+
+    var tl = dvui.textLayout(@src(), .{ .base_direction = bidi_direction }, .{ .expand = .horizontal });
+    defer tl.deinit();
+
+    const highlight: dvui.Options = .{ .color_fill = .fromHex("f0c040"), .color_text = .black };
+    tl.addText("Latin first, then Hebrew ", .{});
+    tl.addText("עברית עם המספר ", .{});
+    // One styled chunk spanning the RTL -> LTR boundary.
+    tl.addText("1,234 ושוב English", highlight);
+    tl.addText(" and back, then Arabic ", .{});
+    tl.addText("مرحبا بالعالم ٢٠٢٦", .{ .font = dvui.Font.theme(.body).withStyle(.italic) });
+    tl.addText(" (2026).\n", .{});
+    tl.addText("שורה שמתחילה בעברית, then Latin 42% ", .{});
+    tl.addText("and a highlight שחוצה", highlight);
+    tl.addText(" את הגבול.\n", .{});
+    // Words split across chunks still shape as one: Arabic letters keep joining, AV/To keep kerning.
+    tl.addText("Split words: ", .{});
+    tl.addText("مر", .{});
+    tl.addText("حب", highlight);
+    tl.addText("ا", .{});
+    tl.addText(" A", .{});
+    tl.addText("V", highlight);
+    tl.addText("A T", .{});
+    tl.addText("o", highlight);
+    tl.addText("\n", .{});
 }
 
 test {

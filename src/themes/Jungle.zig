@@ -3,12 +3,7 @@ const dvui = @import("../dvui.zig");
 const fonts: []const dvui.Font.Source = &.{
     .{
         .family = dvui.Font.array("Pixelify Sans"),
-        .bytes = @embedFile("../fonts/Pixelify_Sans/static/PixelifySans-Regular.ttf"),
-    },
-    .{
-        .family = dvui.Font.array("Pixelify Sans"),
-        .weight = .bold,
-        .bytes = @embedFile("../fonts/Pixelify_Sans/static/PixelifySans-Bold.ttf"),
+        .bytes = @embedFile("../fonts/Pixelify_Sans/PixelifySans-VariableFont_wght.ttf"),
     },
 };
 

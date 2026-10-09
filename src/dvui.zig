@@ -323,7 +323,6 @@ pub const dialogNativeFileSave = native_dialogs.Native.save;
 pub const dialogNativeFolderSelect = native_dialogs.Native.folderSelect;
 
 pub const useLibc = @import("default_options").libc;
-pub const useFreeType = @import("default_options").freetype;
 pub const useTinyFileDialogs = @import("default_options").tiny_file_dialogs;
 pub const useTreeSitter = @import("default_options").tree_sitter;
 
@@ -350,8 +349,6 @@ pub var reduce_motion: bool = false;
 pub const max_float_safe: f32 = 2_000_000; // 2000000 and 2e6 for searchability
 
 pub const c = @import("dvui-c");
-
-pub var ft2lib: if (useFreeType) c.FT_Library else void = undefined;
 
 pub const Error = std.mem.Allocator.Error || StbImageError || TvgError || FontError;
 pub const TvgError = error{tvgError};
@@ -596,6 +593,25 @@ pub fn frameTimeNS() i128 {
 /// Only valid between `Window.begin`and `Window.end`.
 pub fn addFont(name: []const u8, ttf_bytes: []const u8, ttf_bytes_allocator: ?std.mem.Allocator) (std.mem.Allocator.Error || FontError)!void {
     try currentWindow().addFont(name, ttf_bytes, ttf_bytes_allocator);
+}
+
+/// Register `alias` as an ordered fallback stack usable as a `Font` family:
+/// the first family covering a codepoint renders it. Families may themselves
+/// be aliases (nesting is capped, cycles are cut off with a warning).
+/// Re-registering replaces the stack.
+///
+/// Only valid between `Window.begin` and `Window.end`.
+pub fn addFontFamily(alias: []const u8, families: []const []const u8) std.mem.Allocator.Error!void {
+    const cw = currentWindow();
+    try cw.fonts.addFamily(cw.gpa, alias, families);
+}
+
+/// `addFontFamily` with per-family size/weight/style/stretch overrides.
+///
+/// Only valid between `Window.begin` and `Window.end`.
+pub fn addFontFamilyEntries(alias: []const u8, entries: []const Font.FamilyEntry) std.mem.Allocator.Error!void {
+    const cw = currentWindow();
+    try cw.fonts.addFamilyEntries(cw.gpa, alias, entries);
 }
 
 /// Get or load the underlying font at an integer size <= font.size (guaranteed
@@ -1046,20 +1062,6 @@ pub fn snapToPixelsSet(snap: bool) bool {
 pub fn snapToPixels() bool {
     const cw = currentWindow();
     return cw.snap_to_pixels;
-}
-
-/// Set kerning setting.  If true:
-/// * textSize includes kerning by default
-/// * renderText include kerning by default
-///
-/// Returns the previous setting.
-///
-/// Only valid between `Window.begin`and `Window.end`.
-pub fn kerningSet(kern: bool) bool {
-    const cw = currentWindow();
-    const old = cw.kerning;
-    cw.kerning = kern;
-    return old;
 }
 
 /// Requests another frame to be shown.
@@ -4141,8 +4143,8 @@ pub fn debugFontAtlases(src: std.builtin.SourceLocation, opts: Options) void {
     var height: u32 = 0;
     var it = cw.fonts.cache.iterator();
     while (it.next()) |kv| {
-        const texture_atlas = kv.value_ptr.getTextureAtlas(cw.gpa, cw.backend) catch |err| {
-            dvui.logError(@src(), err, "Could not get texture atlast for '{s}' at height {d}", .{ kv.value_ptr.name, kv.value_ptr.height });
+        const texture_atlas = kv.value_ptr.*.getTextureAtlas(cw.gpa, cw.backend) catch |err| {
+            dvui.logError(@src(), err, "Could not get texture atlast for '{s}' at height {d}", .{ kv.value_ptr.*.name, kv.value_ptr.*.height });
             continue;
         };
         width = @max(width, texture_atlas.width);
@@ -4164,13 +4166,13 @@ pub fn debugFontAtlases(src: std.builtin.SourceLocation, opts: Options) void {
 
     it = cw.fonts.cache.iterator();
     while (it.next()) |kv| {
-        const texture_atlas = kv.value_ptr.getTextureAtlas(cw.gpa, cw.backend) catch continue;
+        const texture_atlas = kv.value_ptr.*.getTextureAtlas(cw.gpa, cw.backend) catch continue;
         rs.r = rs.r.toSize(.{
             .w = @floatFromInt(texture_atlas.width),
             .h = @floatFromInt(texture_atlas.height),
         });
         renderTexture(texture_atlas, rs, .{ .colormod = color }) catch |err| {
-            logError(@src(), err, "Could not render font atlast for '{s}'", .{kv.value_ptr.name});
+            logError(@src(), err, "Could not render font atlast for '{s}'", .{kv.value_ptr.*.name});
         };
         rs.r.y += rs.r.h;
     }

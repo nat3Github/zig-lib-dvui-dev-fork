@@ -5,6 +5,10 @@ var text_entry_multiline_allocator_buf: [1000]u8 = undefined;
 var text_entry_multiline_fba = std.heap.FixedBufferAllocator.init(&text_entry_multiline_allocator_buf);
 var text_entry_multiline_buf: []u8 = &.{};
 var text_entry_multiline_break = false;
+var text_entry_multiline_line_break: @FieldType(dvui.TextEntryWidget.InitOptions, "line_break") = .strict;
+var text_entry_multiline_word_break: @FieldType(dvui.TextEntryWidget.InitOptions, "word_break") = .normal;
+var text_entry_multiline_overflow_wrap: @FieldType(dvui.TextEntryWidget.InitOptions, "overflow_wrap") = .anywhere;
+var text_entry_bidi_direction: @FieldType(dvui.TextEntryWidget.InitOptions, "base_direction") = .auto;
 
 /// ![image](Examples-text_entry.png)
 pub fn textEntryWidgets() void {
@@ -153,17 +157,51 @@ pub fn textEntryWidgets() void {
         dvui.label(@src(), "(limit {d})", .{text_entry_password_buf.len}, .{ .gravity_y = 0.5 });
     }
 
+    {
+        var hbox = dvui.box(@src(), .{ .dir = .horizontal }, .{});
+        defer hbox.deinit();
+
+        {
+            var vbox = dvui.box(@src(), .{}, .{ .gravity_y = 0.5 });
+            defer vbox.deinit();
+            dvui.label(@src(), "Bidi", .{}, .{});
+            _ = dvui.dropdownEnum(@src(), @TypeOf(text_entry_bidi_direction), .{ .choice = &text_entry_bidi_direction }, .{}, .{});
+        }
+
+        left_alignment.spacer(@src(), 0);
+
+        var vbox = dvui.box(@src(), .{}, .{});
+        defer vbox.deinit();
+
+        var te = dvui.textEntry(@src(), .{ .base_direction = text_entry_bidi_direction }, .{ .max_size_content = .sizeM(20, 1) });
+        if (dvui.firstFrame(te.data().id)) {
+            te.textSet("abc שלום עולם 123 def", false);
+        }
+        te.deinit();
+
+        var te_multi = dvui.textEntry(@src(), .{
+            .multiline = true,
+            .break_lines = true,
+            .scroll_horizontal = false,
+            .base_direction = text_entry_bidi_direction,
+        }, .{ .min_size_content = .sizeM(20, 4), .max_size_content = .sizeM(20, 4) });
+        if (dvui.firstFrame(te_multi.data().id)) {
+            te_multi.textSet("English, then עברית עם 42 מספרים, and back.\nمرحبا بالعالم with Latin 2026 inside.\n", false);
+        }
+        te_multi.deinit();
+    }
+
     const FontEntry = struct {
         idx: usize,
         name: []const u8,
     };
 
-    var font_entries: []FontEntry = dvui.currentWindow().lifo().alloc(FontEntry, dvui.currentWindow().fonts.database.items.len + 1) catch &.{};
+    var font_entries: []FontEntry = dvui.currentWindow().lifo().alloc(FontEntry, dvui.currentWindow().fonts.database.faces.items.len + 1) catch &.{};
     defer dvui.currentWindow().lifo().free(font_entries);
 
     if (font_entries.len > 0) {
         font_entries[0] = .{ .idx = 0, .name = "Theme Body" };
-        for (dvui.currentWindow().fonts.database.items, 1..) |*dbs, i| {
+        for (dvui.currentWindow().fonts.database.faces.items, 1..) |*dbs, i| {
             font_entries[i] = .{ .idx = i, .name = dbs.name(dvui.currentWindow().arena()) };
         }
 
@@ -189,14 +227,20 @@ pub fn textEntryWidgets() void {
             dvui.label(@src(), "Multiline", .{}, .{});
 
             _ = dvui.checkbox(@src(), &text_entry_multiline_break, "Break Lines", .{});
+            if (text_entry_multiline_break) {
+                _ = dvui.dropdownEnum(@src(), @TypeOf(text_entry_multiline_line_break), .{ .choice = &text_entry_multiline_line_break }, .{}, .{});
+                _ = dvui.dropdownEnum(@src(), @TypeOf(text_entry_multiline_word_break), .{ .choice = &text_entry_multiline_word_break }, .{}, .{});
+                _ = dvui.dropdownEnum(@src(), @TypeOf(text_entry_multiline_overflow_wrap), .{ .choice = &text_entry_multiline_overflow_wrap }, .{}, .{});
+            }
         }
 
         left_alignment.spacer(@src(), 0);
 
         var font = dvui.Font.theme(.body);
         if (Sfont.dropdown > 0) {
-            font = dvui.currentWindow().fonts.database.items[font_entries[Sfont.dropdown].idx - 1].font();
+            font = dvui.Font.ofSource(&dvui.currentWindow().fonts.database.faces.items[font_entries[Sfont.dropdown].idx - 1]);
         }
+        font = font.withSize(20);
 
         var te_opts: dvui.TextEntryWidget.InitOptions = .{
             .multiline = true,
@@ -205,11 +249,14 @@ pub fn textEntryWidgets() void {
                 .allocator = text_entry_multiline_fba.allocator(),
                 .limit = text_entry_multiline_allocator_buf.len,
             } },
-            .text_initial = "This multiline text\nentry can scroll\nin both directions.",
+            .text_initial = "This multiline text\nentry can scroll\nin both directions.\nffi e\u{301} क्ष \u{1F469}\u{200D}\u{1F4BB} ปี่",
         };
         if (text_entry_multiline_break) {
             te_opts.break_lines = true;
             te_opts.scroll_horizontal = false;
+            te_opts.line_break = text_entry_multiline_line_break;
+            te_opts.word_break = text_entry_multiline_word_break;
+            te_opts.overflow_wrap = text_entry_multiline_overflow_wrap;
         }
 
         var te = dvui.textEntry(
@@ -260,11 +307,7 @@ pub fn textEntryWidgets() void {
         var la2 = dvui.Alignment.init(@src(), 0);
         defer la2.deinit();
 
-        if (dvui.backend.kind == .web) {
-            if (dvui.button(@src(), "Add Noto Font", .{}, .{})) {
-                dvui.backend.wasm.wasm_add_noto_font();
-            }
-        } else {
+        if (dvui.backend.kind != .web) {
             var hbox2 = dvui.box(@src(), .{ .dir = .horizontal }, .{});
             dvui.label(@src(), "Name", .{}, .{ .gravity_y = 0.5 });
 
@@ -325,7 +368,7 @@ pub fn textEntryWidgets() void {
                     break :blk;
                 }
 
-                for (dvui.currentWindow().fonts.database.items) |*dbs| {
+                for (dvui.currentWindow().fonts.database.faces.items) |*dbs| {
                     if (std.mem.eql(u8, dbs.familyName(), name)) {
                         const msg = std.fmt.allocPrint(dvui.currentWindow().lifo(), "Already have font named \"{s}\"", .{name}) catch name;
                         defer dvui.currentWindow().lifo().free(msg);

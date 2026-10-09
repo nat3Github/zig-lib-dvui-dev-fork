@@ -3,6 +3,7 @@ declare namespace DVUI {
         | string
         | WebAssembly.WebAssemblyInstantiatedSource
         | Promise<WebAssembly.WebAssemblyInstantiatedSource>
+        | ((imports: WebAssembly.Imports) => Promise<WebAssembly.WebAssemblyInstantiatedSource>)
         ;
 
     type AllocatorFunction = (len: number) => number;

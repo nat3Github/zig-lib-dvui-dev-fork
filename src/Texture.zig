@@ -421,15 +421,13 @@ pub fn update(tex: *Texture, pma: []const Color.PMA) !void {
 ///
 /// Only valid between `Window.begin` and `Window.end`.
 pub fn updateSubRect(tex: *Texture, pma: [*]const u8, x: u32, y: u32, w: u32, h: u32) !void {
-    dvui.currentWindow().backend.textureUpdateSubRect(tex.*, pma, x, y, w, h) catch |err| {
-        if (err == TextureError.NotImplemented) {
-            const full_len = tex.width * tex.height;
-            const full: []const Color.PMA = @as([*]const Color.PMA, @ptrCast(@alignCast(pma)))[0..full_len];
-            try update(tex, full);
-        } else {
-            return err;
-        }
-    };
+    if (comptime dvui.Backend.has_texture_update_sub_rect) {
+        try dvui.currentWindow().backend.textureUpdateSubRect(tex.*, pma, x, y, w, h);
+    } else {
+        const full_len = tex.width * tex.height;
+        const full: []const Color.PMA = @as([*]const Color.PMA, @ptrCast(@alignCast(pma)))[0..full_len];
+        try update(tex, full);
+    }
 }
 
 /// Read pixels from texture created with `textureCreateTarget`.

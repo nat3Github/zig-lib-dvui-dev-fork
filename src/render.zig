@@ -33,7 +33,6 @@ pub const RenderCommand = struct {
     clip: Rect.Physical,
     alpha: f32,
     snap: bool,
-    kerning: bool,
     cmd: Command,
 
     pub const Command = union(enum) {
@@ -133,13 +132,12 @@ pub const TextOptions = struct {
     sel_end: ?usize = null,
     sel_color: ?Color = null,
     debug: bool = false,
-    kerning: ?bool = null,
-    kern_in: ?[]u32 = null,
     ak_opts: ?AccessKit.TextRunOptions = null,
+    pre_shaped: ?*const Font.ShapedText = null,
+    pre_shaped_glyph_limit: ?usize = null,
 };
 
-/// Only renders a single line of text.  Newlines are rendered as spaces.
-///
+/// Only renders a single line of text
 /// Selection will be colored with the current themes accent color,
 /// with the text color being set to the themes fill color.
 ///
@@ -148,6 +146,7 @@ pub fn renderText(opts: TextOptions) Backend.GenericError!void {
     var cw = dvui.currentWindow();
     // Record character heights and positions for AccessKit text_run role.
     var text_info: std.MultiArrayList(AccessKit.CharPositionInfo) = .empty;
+    var glyph_positions: std.ArrayList(AccessKit.GlyphPosition) = .empty;
     const clipped_rect = dvui.clipGet().intersect(opts.rs.r);
 
     // If accessibility is enabled, we still need create the associated text_run
@@ -156,13 +155,13 @@ pub fn renderText(opts: TextOptions) Backend.GenericError!void {
     if (opts.rs.s == 0) return;
     if (clipped_rect.empty() and opts.ak_opts == null) return;
 
-    const utf8_text = try dvui.toUtf8(cw.lifo(), opts.text);
-    defer if (opts.text.ptr != utf8_text.ptr) cw.lifo().free(utf8_text);
+    // pre_shaped text was already validated by the caller
+    const utf8_text = if (opts.pre_shaped != null) opts.text else try dvui.toUtf8(cw.lifo(), opts.text);
+    defer if (opts.pre_shaped == null and opts.text.ptr != utf8_text.ptr) cw.lifo().free(utf8_text);
 
     if (!cw.render_target.rendering) {
         var opts_copy = opts;
         opts_copy.text = try cw.arena().dupe(u8, utf8_text);
-        if (opts.kern_in) |ki| opts_copy.kern_in = try cw.arena().dupe(u32, ki);
         if (opts.gradient) |g| opts_copy.gradient = try g.dupe(cw.arena());
         cw.addRenderCommand(.{ .text = opts_copy }, false);
         return;
@@ -171,45 +170,33 @@ pub fn renderText(opts: TextOptions) Backend.GenericError!void {
     const target_size = opts.font.size * opts.rs.s;
     const sized_font = opts.font.withSize(target_size);
 
-    // might get a slightly smaller font
-    var fce = try cw.fonts.getOrCreate(cw.gpa, sized_font);
-    var fce_ascent = fce.ascent;
-    if (opts.font.line_height_factor < 1.0) {
-        fce_ascent = @round(fce_ascent * opts.font.line_height_factor);
-    }
+    // glyphs may come from different fallback entries; line metrics use the primary one
+    var fallback_entry: *Font.Cache.Entry = undefined;
+    var fallback_ascent: f32 = undefined;
+    var shaped_text: Font.Cache.ShapedText = undefined;
+    var owns_line = false;
+    defer if (owns_line) shaped_text.deinit();
 
-    // this must be synced with Font.textSizeEx()
-    const target_fraction = if (cw.snap_to_pixels) 1.0 else target_size / fce.em_height;
-
-    // make sure the cache has all the glyphs we need
-    if (opts.kern_in == null) {
-        // if kern_in is given, assume we already did this when measuring the text
-        var utf8it = std.unicode.Utf8View.initUnchecked(utf8_text).iterator();
-        while (utf8it.nextCodepoint()) |codepoint| {
-            // see halfspace below
-            const halfspace = (codepoint == '\n' or codepoint == '\r');
-            _ = try fce.glyphInfoGetOrReplacement(cw.gpa, if (halfspace) ' ' else codepoint);
+    if (opts.pre_shaped) |shaped| {
+        fallback_entry = shaped.fallback;
+        fallback_ascent = shaped.ascent;
+        shaped_text = .{ .line = shaped.line, .entries = shaped.entries };
+    } else {
+        const resolved = try cw.fonts.resolveStack(cw.gpa, sized_font);
+        shaped_text = cw.fonts.shapeLineText(cw.arena(), cw.gpa, resolved, utf8_text, null, .auto, opts.font.shapeStyle(0)) catch return error.OutOfMemory;
+        owns_line = true;
+        fallback_entry = try cw.fonts.primaryEntry(cw.gpa, resolved);
+        fallback_ascent = fallback_entry.ascent;
+        if (opts.font.line_height_factor < 1.0) {
+            fallback_ascent = @round(fallback_ascent * opts.font.line_height_factor);
         }
     }
 
-    // Generate new texture atlas if needed to update glyph uv coords
-    const texture_atlas = fce.getTextureAtlas(cw.gpa, cw.backend) catch |err| switch (err) {
-        error.OutOfMemory => |e| return e,
-        else => {
-            const fname = opts.font.name(cw.arena());
-            defer cw.arena().free(fname);
-            dvui.log.err("Could not get texture atlas for font {s}, text area marked in magenta, to display '{s}'", .{ fname, opts.text });
-            opts.rs.r.fill(.{}, .{ .color = .magenta });
-            return;
-        },
-    };
-
-    // Over allocate the internal buffers assuming each byte is a character
-    var builder = try dvui.Triangles.Builder.init(cw.lifo(), 4 * utf8_text.len, 6 * utf8_text.len);
-    defer builder.deinit(cw.lifo());
+    const line = &shaped_text.line;
 
     const color = opts.color.opacity(cw.alpha);
     const col: Color.PMA = .fromColor(color);
+    const white_pma: Color.PMA = .white;
 
     // Sample fresh per-vertex below when set; leave `col` as the flat
     // fallback for background/selection/underline/strike, which stay flat.
@@ -239,140 +226,159 @@ pub fn renderText(opts: TextOptions) Backend.GenericError!void {
     // if we will definitely have a selected region or not
     const sel: bool = sel_start < sel_end;
 
-    const atlas_size: Size = .{ .w = @floatFromInt(texture_atlas.width), .h = @floatFromInt(texture_atlas.height) };
+    const snap = cw.snap_to_pixels;
 
-    var bytes_seen: usize = 0;
-    var last_codepoint: u32 = 0;
+    // a reused pre-shaped line can extend past the text drawn here
+    const glyph_limit = if (opts.pre_shaped != null) opts.pre_shaped_glyph_limit orelse line.buffer.info.items.len else line.buffer.info.items.len;
 
-    const kerning: bool = opts.kerning orelse cw.kerning;
-    var next_kern_idx: u32 = 0;
-    var next_kern_byte: u32 = 0;
-    if (opts.kern_in) |ki| {
-        next_kern_byte = ki[next_kern_idx];
-        next_kern_idx += 1;
+    // Each entry has its own atlas, so batch per same-entry run. Submitted after
+    // the loop: start.x can still shift left, and all runs rotate around it.
+    const SegRender = struct { tri: Triangles, tex: Texture };
+    var seg_renders: std.ArrayList(SegRender) = .empty;
+    defer {
+        for (seg_renders.items) |*sr| sr.tri.deinit(cw.lifo());
+        seg_renders.deinit(cw.lifo());
     }
 
-    var i: usize = 0;
-    while (i < opts.text.len) {
-        const cplen = std.unicode.utf8ByteSequenceLength(opts.text[i]) catch unreachable;
-        const codepoint = std.unicode.utf8Decode(opts.text[i..][0..cplen]) catch unreachable;
+    var seg_start: usize = 0;
+    while (seg_start < glyph_limit) {
+        const fce = shaped_text.entryForGlyph(fallback_entry, seg_start);
+        var seg_end = seg_start + 1;
+        while (seg_end < glyph_limit and shaped_text.entryForGlyph(fallback_entry, seg_end) == fce) seg_end += 1;
 
-        // Render \n, \r as half spaces.  That way if they are part of the
-        // selection, you can see it. This matches Chrome's behavior, although
-        // this is not a universal - Firefox doesn't do this.  Since this is
-        // inside rendering, it doesn't affect text sizing.
-        const halfspace = (codepoint == '\n' or codepoint == '\r');
-        var gi = try fce.glyphInfoGetOrReplacement(cw.gpa, if (halfspace) ' ' else codepoint);
-        if (halfspace) gi.advance = @round(gi.advance * 0.5);
+        // Place every glyph before fetching the atlas, or a first-seen glyph
+        // misses this frame's upload and gets UVs from the pre-growth size.
+        for (line.buffer.info.items[seg_start..seg_end]) |info| _ = fce.glyphInfoGet(cw.gpa, info.codepoint) catch {};
 
-        if (kerning and last_codepoint != 0 and i >= next_kern_byte) {
-            const kk = fce.kern(last_codepoint, codepoint);
-            x += target_fraction * (if (cw.snap_to_pixels) @round(kk) else kk);
+        const texture_atlas: ?Texture = fce.getTextureAtlas(cw.gpa, cw.backend) catch |err| switch (err) {
+            error.OutOfMemory => |e| return e,
+            else => blk: {
+                const fname = opts.font.name(cw.arena());
+                defer cw.arena().free(fname);
+                dvui.log.err("Could not get texture atlas for font {s} ({any}), skipping glyphs of '{s}'", .{ fname, err, opts.text });
+                break :blk null;
+            },
+        };
+        const atlas_size: Size = if (texture_atlas) |tex| .{ .w = @floatFromInt(tex.width), .h = @floatFromInt(tex.height) } else .{ .w = 1, .h = 1 };
 
-            if (opts.kern_in) |ki| {
-                if (next_kern_idx < ki.len) {
-                    next_kern_byte = ki[next_kern_idx];
-                    next_kern_idx += 1;
+        var builder = try dvui.Triangles.Builder.init(cw.lifo(), 4 * (seg_end - seg_start), 6 * (seg_end - seg_start));
+        errdefer builder.deinit(cw.lifo());
+
+        for (line.buffer.info.items[seg_start..seg_end], line.buffer.pos.items[seg_start..seg_end], seg_start..) |info, pos, gidx| {
+            const gi = fce.glyphInfoGet(cw.gpa, info.codepoint) catch continue;
+
+            const off_x = fce.toPixels(pos.x_offset);
+            const off_y = fce.toPixels(pos.y_offset);
+            const adv = fce.toPixels(pos.x_advance);
+            const adv_used = if (snap) @round(adv) else adv;
+
+            // Glyph extends left of the start (negative left bearing, like "j"):
+            // shift the whole line over. textSize() includes this extra space.
+            if (x + off_x + gi.leftBearing < start.x) {
+                start.x -= off_x + gi.leftBearing;
+                x = start.x;
+            }
+
+            const nextx = x + adv_used;
+            const leftx = x + off_x + gi.leftBearing;
+
+            if (sel) {
+                const range = line.clusterByteRange(gidx);
+                const in_sel = range.start < sel_end and range.end > sel_start;
+                var lo = @min(x, leftx);
+                var hi = nextx;
+                if (in_sel and (range.start < sel_start or range.end > sel_end)) {
+                    // The selection ends inside a ligature: shade only the
+                    // components it covers, at the carets the cursor uses.
+                    const metrics = shaped_text.metrics(fallback_entry);
+                    const a = start.x + line.caretPenOffset(metrics, @max(range.start, sel_start), snap);
+                    const b = start.x + line.caretPenOffset(metrics, @min(range.end, sel_end), snap);
+                    lo = @min(a, b);
+                    hi = @max(a, b);
+                }
+                if (!sel_in and in_sel) {
+                    sel_in = true;
+                    sel_start_x = lo;
+                } else if (sel_in and !in_sel) {
+                    sel_in = false;
+                }
+
+                if (sel_in) {
+                    sel_end_x = hi;
                 }
             }
-        }
-
-        i += cplen;
-        last_codepoint = codepoint;
-
-        const adv = if (cw.snap_to_pixels) @round(gi.advance) else gi.advance;
-        if (x + gi.leftBearing * target_fraction < start.x) {
-            // Glyph extends left of the start, like the first letter being
-            // "j", which has a negative left bearing.
-            //
-            // Shift the whole line over so it starts at x_start.  textSize()
-            // includes this extra space.
-
-            //std.debug.print("moving x from {d} to {d}\n", .{ x, x_start - gi.leftBearing * target_fraction });
-            start.x -= gi.leftBearing * target_fraction;
-            x = start.x;
-        }
-
-        const nextx = x + adv * target_fraction;
-        const leftx = x + gi.leftBearing * target_fraction;
-
-        if (sel) {
-            bytes_seen += std.unicode.utf8CodepointSequenceLength(codepoint) catch unreachable;
-            if (!sel_in and bytes_seen > sel_start and bytes_seen <= sel_end) {
-                // entering selection
-                sel_in = true;
-                sel_start_x = @min(x, leftx);
-            } else if (sel_in and bytes_seen > sel_end) {
-                // leaving selection
-                sel_in = false;
+            if (dvui.accesskit_enabled) {
+                if (opts.ak_opts) |_| {
+                    glyph_positions.append(cw.arena(), .{
+                        .cluster_byte = line.byte_offsets[info.cluster],
+                        .w = nextx - x,
+                        .x = std.math.clamp(x - clipped_rect.x, 0, clipped_rect.w),
+                    }) catch {};
+                }
             }
 
-            if (sel_in) {
-                // update selection
-                sel_end_x = nextx;
+            if (gi.w > 0 and texture_atlas != null) {
+                const vtx_offset: dvui.Vertex.Index = @intCast(builder.vertexes.items.len);
+                var v: Vertex = undefined;
+                const base_col: Color.PMA = if (gi.is_color) white_pma else col;
+                const uv0: @Vector(2, f32) = .{ gi.origin[0] / atlas_size.w, gi.origin[1] / atlas_size.h };
+
+                v.pos.x = leftx;
+                v.pos.y = start.y - off_y + (fallback_ascent - gi.topBearing);
+                v.col = if (!gi.is_color and opts.gradient != null) .fromColor(opts.gradient.?.sample(gradient_bounds, v.pos).opacity(cw.alpha)) else base_col;
+                v.uv = uv0;
+                builder.appendVertex(v);
+
+                if (opts.debug) {
+                    dvui.log.debug(" - x {d} y {d}", .{ v.pos.x, v.pos.y });
+                }
+
+                v.pos.x = x + off_x + gi.leftBearing + gi.w;
+                max_x = @max(max_x, v.pos.x);
+                v.uv[0] = uv0[0] + gi.w / atlas_size.w;
+                if (!gi.is_color) if (opts.gradient) |g| {
+                    v.col = .fromColor(g.sample(gradient_bounds, v.pos).opacity(cw.alpha));
+                };
+                builder.appendVertex(v);
+
+                v.pos.y = start.y - off_y + (fallback_ascent - gi.topBearing + gi.h);
+                sel_max_y = @max(sel_max_y, v.pos.y);
+                v.uv[1] = uv0[1] + gi.h / atlas_size.h;
+                if (!gi.is_color) if (opts.gradient) |g| {
+                    v.col = .fromColor(g.sample(gradient_bounds, v.pos).opacity(cw.alpha));
+                };
+                builder.appendVertex(v);
+
+                v.pos.x = leftx;
+                v.uv[0] = uv0[0];
+                if (!gi.is_color) if (opts.gradient) |g| {
+                    v.col = .fromColor(g.sample(gradient_bounds, v.pos).opacity(cw.alpha));
+                };
+                builder.appendVertex(v);
+
+                // triangles must be counter-clockwise (y going down) to avoid backface culling
+                builder.appendTriangles(&.{
+                    vtx_offset + 0, vtx_offset + 2, vtx_offset + 1,
+                    vtx_offset + 0, vtx_offset + 3, vtx_offset + 2,
+                });
             }
-        }
-        if (dvui.accesskit_enabled) {
-            if (opts.ak_opts) |_| {
-                text_info.append(cw.arena(), .{
-                    .l = cplen,
-                    .w = if (gi.w == 0) nextx - x else gi.w,
-                    .x = std.math.clamp(x - clipped_rect.x, 0, clipped_rect.w),
-                }) catch {};
-            }
-        }
 
-        // don't output triangles for a zero-width glyph (space seems to be the only one)
-        if (gi.w > 0) {
-            const vtx_offset: dvui.Vertex.Index = @intCast(builder.vertexes.items.len);
-            var v: Vertex = undefined;
-
-            v.pos.x = leftx;
-            v.pos.y = start.y + (fce_ascent - gi.topBearing) * target_fraction;
-            v.col = if (opts.gradient) |g| .fromColor(g.sample(gradient_bounds, v.pos).opacity(cw.alpha)) else col;
-            v.uv = gi.uv;
-            builder.appendVertex(v);
-
-            if (opts.debug) {
-                dvui.log.debug(" - x {d} y {d}", .{ v.pos.x, v.pos.y });
-            }
-
-            if (opts.debug) {
-                //log.debug("{d} pad {d} minx {d} maxx {d} miny {d} maxy {d} x {d} y {d}", .{ bytes_seen, pad, gi.minx, gi.maxx, gi.miny, gi.maxy, v.pos.x, v.pos.y });
-                //log.debug("{d} pad {d} left {d} top {d} w {d} h {d} advance {d}", .{ bytes_seen, pad, gi.f2_leftBearing, gi.f2_topBearing, gi.f2_w, gi.f2_h, gi.f2_advance });
-            }
-
-            v.pos.x = x + (gi.leftBearing + gi.w) * target_fraction;
-            max_x = v.pos.x;
-            v.uv[0] = gi.uv[0] + gi.w / atlas_size.w;
-            if (opts.gradient) |g| v.col = .fromColor(g.sample(gradient_bounds, v.pos).opacity(cw.alpha));
-            builder.appendVertex(v);
-
-            v.pos.y = start.y + (fce_ascent - gi.topBearing + gi.h) * target_fraction;
-            sel_max_y = @max(sel_max_y, v.pos.y);
-            v.uv[1] = gi.uv[1] + gi.h / atlas_size.h;
-            if (opts.gradient) |g| v.col = .fromColor(g.sample(gradient_bounds, v.pos).opacity(cw.alpha));
-            builder.appendVertex(v);
-
-            v.pos.x = leftx;
-            v.uv[0] = gi.uv[0];
-            if (opts.gradient) |g| v.col = .fromColor(g.sample(gradient_bounds, v.pos).opacity(cw.alpha));
-            builder.appendVertex(v);
-
-            // triangles must be counter-clockwise (y going down) to avoid backface culling
-            builder.appendTriangles(&.{
-                vtx_offset + 0, vtx_offset + 2, vtx_offset + 1,
-                vtx_offset + 0, vtx_offset + 3, vtx_offset + 2,
-            });
+            x = nextx;
         }
 
-        x = nextx;
+        if (builder.vertexes.items.len > 0) {
+            try seg_renders.append(cw.lifo(), .{ .tri = builder.build(), .tex = texture_atlas.? });
+        } else {
+            builder.deinit(cw.lifo());
+        }
+
+        seg_start = seg_end;
     }
 
     if (opts.background_color) |bgcol| {
         opts.rs.r.toPoint(.{
             .x = max_x,
-            .y = @max(sel_max_y, opts.rs.r.y + fce.height * target_fraction * opts.font.line_height_factor),
+            .y = @max(sel_max_y, opts.rs.r.y + fallback_entry.height * opts.font.line_height_factor),
         }).fill(.{}, .{ .color = .{ .color = bgcol }, .fade = 0 });
     }
 
@@ -380,20 +386,20 @@ pub fn renderText(opts: TextOptions) Backend.GenericError!void {
         Rect.Physical.fromPoint(.{ .x = sel_start_x, .y = start.y })
             .toPoint(.{
                 .x = sel_end_x,
-                .y = @max(sel_max_y, start.y + fce.height * target_fraction * opts.font.line_height_factor),
+                .y = @max(sel_max_y, start.y + fallback_entry.height * opts.font.line_height_factor),
             })
             .fill(.{}, .{ .color = .{ .color = opts.sel_color orelse dvui.themeGet().focus }, .fade = 0 });
     }
 
     if (opts.font.underline) |u| {
         if (u.thick > 0) {
-            var topleft: dvui.Point.Physical = .{ .x = start.x, .y = start.y + fce_ascent + (fce.em_height * 0.2) };
+            var topleft: dvui.Point.Physical = .{ .x = start.x, .y = start.y + fallback_ascent + (fallback_entry.em_height * 0.2) };
             if (cw.snap_to_pixels) {
                 // x should already be snapped
                 topleft.y = @round(topleft.y);
             }
 
-            const botright: dvui.Point.Physical = .{ .x = max_x, .y = topleft.y + @max(1.0 * opts.rs.s, fce.em_height * u.thick) };
+            const botright: dvui.Point.Physical = .{ .x = max_x, .y = topleft.y + @max(1.0 * opts.rs.s, fallback_entry.em_height * u.thick) };
 
             Rect.Physical.fromPoint(topleft).toPoint(botright).fill(.{}, .{ .color = .{ .color = color }, .fade = 0 });
         }
@@ -401,8 +407,8 @@ pub fn renderText(opts: TextOptions) Backend.GenericError!void {
 
     if (opts.font.strike) |s| {
         if (s.thick > 0) {
-            const thick = @max(1.0 * opts.rs.s, fce.em_height * s.thick);
-            var topleft: dvui.Point.Physical = .{ .x = start.x, .y = start.y + fce_ascent - (fce.em_height * 0.5) - thick * 0.5 };
+            const thick = @max(1.0 * opts.rs.s, fallback_entry.em_height * s.thick);
+            var topleft: dvui.Point.Physical = .{ .x = start.x, .y = start.y + fallback_ascent - (fallback_entry.em_height * 0.5) - thick * 0.5 };
             if (cw.snap_to_pixels) {
                 // x should already be snapped
                 topleft.y = @round(topleft.y);
@@ -414,14 +420,13 @@ pub fn renderText(opts: TextOptions) Backend.GenericError!void {
         }
     }
 
-    var tri = builder.build();
-    defer tri.deinit(cw.lifo());
-
-    tri.rotate(.{ .x = start.x, .y = start.y }, opts.rotation);
-
-    try renderTriangles(tri, texture_atlas);
+    for (seg_renders.items) |*sr| {
+        sr.tri.rotate(.{ .x = start.x, .y = start.y }, opts.rotation);
+        try renderTriangles(sr.tri, sr.tex);
+    }
 
     if (dvui.accesskit_enabled) if (opts.ak_opts) |ak_opts| {
+        AccessKit.buildCharacterInfo(cw.arena(), opts.text, glyph_positions.items, &text_info);
         cw.accesskit.textRunPopulate(opts.text, ak_opts, &text_info, clipped_rect);
     };
 }

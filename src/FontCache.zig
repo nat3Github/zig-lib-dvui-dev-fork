@@ -1,668 +1,1034 @@
 const std = @import("std");
 const dvui = @import("dvui.zig");
+const opentype = @import("opentype");
 const Font = @import("Font.zig");
-const c = dvui.c;
 
 const Size = dvui.Size;
 const Texture = dvui.Texture;
 const Backend = dvui.Backend;
 
-const Source = Font.Source;
-const FreeType = Font.FreeType;
-const Error = Font.Error;
+const UserCoord = opentype.UserCoord;
+const Buffer = opentype.Buffer;
+const BidiFallbackResult = opentype.BidiFallbackResult;
+const DiscoveryProperties = opentype.DiscoveryProperties;
+const OtFont = opentype.Font;
+const Renderer = opentype.Renderer;
+const Cmap = opentype.Cmap;
+const shaping = opentype.shaping;
+const shapeBidiParagraphWithFallback = opentype.shapeBidiParagraphWithFallback;
+const PlanCache = opentype.PlanCache;
+const firstHardBreak = opentype.firstHardBreak;
 
-const impl: enum { FreeType, STB } = if (dvui.useFreeType) .FreeType else .STB;
+const Source = Font.Source;
+const FontSet = opentype.discovery.FontSet;
+const FamilyEntry = Font.FamilyEntry;
+const WebFallbackOptions = Font.WebFallbackOptions;
+const NAME_MAX_LEN = Font.NAME_MAX_LEN;
+const max_variations = Font.max_variations;
+const Error = Font.Error;
 
 const Cache = @This();
 
-database: std.ArrayList(Source) = .empty,
-cache: dvui.TrackingAutoHashMap(u64, Entry, .get_and_put, void) = .empty,
+const LineCache = opentype.line_cache.Cache(Font.CacheKey);
+
+pub const ShapedLine = opentype.ShapedLine;
+
+const FamilyAliases = opentype.FamilyAliases(Font, FamilyEntry);
+
+pub const max_alias_depth = FamilyAliases.max_depth;
+pub const max_alias_expansions = FamilyAliases.max_expansions;
+pub const max_stack_families = FamilyAliases.max_families;
+
+database: FontSet = .{},
+cache: dvui.TrackingAutoHashMap(Font.CacheKey, *Entry, .get_and_put, void) = .empty,
+resolved_stacks: dvui.TrackingAutoHashMap(Font.CacheKey, *ResolvedStack, .get_and_put, void) = .empty,
+coverage_cache: opentype.CoverageCache = .{},
+line_cache: LineCache = .{},
+family_aliases: FamilyAliases = .{},
 
 pub fn deinit(self: *Cache, gpa: std.mem.Allocator, backend: Backend) void {
     defer self.* = undefined;
     var it = self.cache.iterator();
     while (it.next()) |item| {
-        item.value_ptr.deinit(gpa, backend);
+        item.value_ptr.*.deinit(gpa, backend);
+        gpa.destroy(item.value_ptr.*);
     }
     self.cache.deinit(gpa);
 
-    for (self.database.items) |*source| {
-        if (source.allocator) |a| {
-            a.free(source.bytes);
-        }
+    var sit = self.resolved_stacks.iterator();
+    while (sit.next()) |item| {
+        item.value_ptr.*.deinit(gpa);
+        gpa.destroy(item.value_ptr.*);
     }
-    self.database.deinit(gpa);
+    self.resolved_stacks.deinit(gpa);
+
+    self.coverage_cache.deinit(gpa);
+
+    self.line_cache.deinit(gpa);
+
+    self.database.deinit(gpa, dvui.io);
+
+    self.family_aliases.deinit(gpa);
 }
+
+pub fn addFamily(self: *Cache, gpa: std.mem.Allocator, alias: []const u8, names: []const []const u8) std.mem.Allocator.Error!void {
+    const list = try gpa.alloc(FamilyEntry, names.len);
+    defer gpa.free(list);
+    for (names, list) |n, *dst| dst.* = .{ .family = Font.array(n) };
+    return self.addFamilyEntries(gpa, alias, list);
+}
+
+pub fn addFamilyEntries(self: *Cache, gpa: std.mem.Allocator, alias: []const u8, entries: []const FamilyEntry) std.mem.Allocator.Error!void {
+    _ = try self.family_aliases.put(gpa, alias[0..@min(alias.len, NAME_MAX_LEN)], entries);
+    var sit = self.resolved_stacks.iterator();
+    while (sit.next()) |item| {
+        item.value_ptr.*.deinit(gpa);
+        gpa.destroy(item.value_ptr.*);
+    }
+    self.resolved_stacks.map.clearRetainingCapacity();
+    self.line_cache.clear(gpa);
+}
+
+pub const max_atlas_height = 4096;
+// 1024x4096 RGBA fits sdl3gpu's 16MB texture transfer buffer.
+pub const max_atlas_width = 1024;
 
 pub fn reset(self: *Cache, gpa: std.mem.Allocator, backend: Backend) void {
     var it = self.cache.iterator();
     while (it.next_resetting()) |kv| {
         var fce = kv.value;
         fce.deinit(gpa, backend);
+        gpa.destroy(fce);
     }
+    var sit = self.resolved_stacks.iterator();
+    while (sit.next_resetting()) |kv| {
+        var stack = kv.value;
+        stack.deinit(gpa);
+        gpa.destroy(stack);
+    }
+    self.line_cache.evictUnused(gpa);
+    if (self.coverage_cache.map.count() > max_coverage_entries) self.evictUnreferencedCoverage(gpa);
+    if (self.database.releaseUnused(dvui.io, self)) self.line_cache.clearPlans(gpa);
+}
+
+// Coverage is size-independent and costly to rebuild, so keep it past its stack's eviction until there are many.
+const max_coverage_entries = 64;
+
+fn evictUnreferencedCoverage(self: *Cache, gpa: std.mem.Allocator) void {
+    var it = self.coverage_cache.map.iterator();
+    next: while (it.next()) |kv| {
+        var sit = self.resolved_stacks.iterator();
+        while (sit.next_peek()) |stack| {
+            if (stack.value.fallback.coverage.ptr == kv.value_ptr.coverage.ptr) continue :next;
+        }
+        kv.value_ptr.deinit(gpa);
+        self.coverage_cache.map.removeByPtr(kv.key_ptr);
+    }
+}
+
+pub fn bytesReferenced(self: *Cache, bytes: []const u8) bool {
+    const start = @intFromPtr(bytes.ptr);
+    const end = start + bytes.len;
+    var eit = self.cache.iterator();
+    while (eit.next_peek()) |kv| {
+        const p = @intFromPtr(kv.value.parsed_font.data.ptr);
+        if (p >= start and p < end) return true;
+    }
+    var sit = self.resolved_stacks.iterator();
+    while (sit.next_peek()) |kv| {
+        for (kv.value.raw_fonts) |raw_font| {
+            const p = @intFromPtr(raw_font.data.ptr);
+            if (p >= start and p < end) return true;
+        }
+    }
+    return false;
 }
 
 pub fn findSource(self: *Cache, font: Font) struct { ?Source, ?Source } {
-    var second_best: ?usize = null;
-    for (self.database.items, 0..) |*source, i| {
-        if (std.mem.eql(u8, font.familyName(), source.familyName())) {
-            if (font.weight == source.weight and font.style == source.style) {
-                return .{ source.*, null }; // exact match
-            }
-
-            if (font.weight == source.weight) {
-                // second best is same family name and same weight
-                second_best = i;
-            } else if (second_best == null) {
-                // at least the family name is the same
-                second_best = i;
-            }
-        }
-    }
-
-    if (second_best) |sb| {
-        return .{ null, self.database.items[sb] };
-    }
-
-    return .{ null, null };
+    const match = self.database.find(dvui.io, font.familyName(), .{ .weight = font.weight, .style = font.style, .stretch = font.stretch }) orelse return .{ null, null };
+    return if (match.exact) .{ match.face.*, null } else .{ null, match.face.* };
 }
 
-pub fn getOrCreate(self: *Cache, gpa: std.mem.Allocator, font: Font) std.mem.Allocator.Error!*Entry {
-    const entry = try self.cache.getOrPut(gpa, font.hash());
-    if (entry.found_existing) return entry.value_ptr;
+fn resolveSource(self: *Cache, state_gpa: std.mem.Allocator, raw_font: Font) std.mem.Allocator.Error!Source {
+    const font = self.family_aliases.firstFamily(raw_font);
+    const fname = font.name(state_gpa);
+    defer state_gpa.free(fname);
+    const resolved = try self.database.resolve(state_gpa, dvui.io, font.familyName(), .{ .weight = font.weight, .style = font.style, .stretch = font.stretch }) orelse {
+        dvui.log.warn("Font {s} not loaded in dvui, using fallback", .{fname});
+        return Font.Embedded.forFamily(font.familyName());
+    };
+    switch (resolved.how) {
+        .exact => {},
+        .closest => {
+            const sname = resolved.face.name(state_gpa);
+            defer state_gpa.free(sname);
+            dvui.log.warn("Font {s} not loaded in dvui, using second best {s}", .{ fname, sname });
+        },
+        .system => dvui.log.debug("Font {s} resolved via OS font discovery", .{fname}),
+    }
+    return resolved.face;
+}
 
-    const fname = font.name(gpa);
-    defer gpa.free(fname);
+pub fn getOrCreate(self: *Cache, state_gpa: std.mem.Allocator, font: Font) std.mem.Allocator.Error!*Entry {
+    const entry = try self.cache.getOrPut(state_gpa, font.cacheKey());
+    if (entry.found_existing) return entry.value_ptr.*;
+    errdefer self.cache.map.removeByPtr(entry.key_ptr);
 
-    const exact, const second = self.findSource(font);
+    const source = try self.resolveSource(state_gpa, font);
 
-    const source = exact orelse second orelse Source.fallback;
+    const boxed = try state_gpa.create(Entry);
+    errdefer state_gpa.destroy(boxed);
+    boxed.* = Entry.init(state_gpa, &source, font) catch |err| blk: {
+        dvui.log.err("Font {f} init got {any}, using fallback", .{ font, err });
+        break :blk Entry.init(state_gpa, &Font.Embedded.sans, font) catch |fallback_err|
+            // the built-in font is embedded, so a load failure is a build defect, not a runtime condition
+            std.debug.panic("built-in fallback font failed to load: {any}", .{fallback_err});
+    };
+    entry.value_ptr.* = boxed;
+    return boxed;
+}
 
-    // Bold was requested but it's not available: thicken the face we do have
-    const embolden = exact == null and font.weight == .bold and source.weight != .bold;
+pub const ResolvedStack = struct {
+    font_key: Font.CacheKey = .{ .bytes = @splat(0) },
+    entry_keys: []Font.CacheKey = &.{},
+    family_fonts: []Font = &.{},
+    raw_fonts: []OtFont = &.{},
+    fallback: Cmap.FallbackStack = .{},
+    logged_missing: std.AutoHashMapUnmanaged(u21, void) = .empty,
+    m_size: ?Size = null,
 
-    if (exact == null) {
-        const sname = source.name(gpa);
-        defer gpa.free(sname);
-        if (embolden) {
-            dvui.log.debug("Font {s} not loaded in dvui, synthesizing bold from {s}", .{ fname, sname });
-        } else {
-            dvui.log.warn("Font {s} not loaded in dvui, using {s}", .{ fname, sname });
-        }
+    pub fn deinit(self: *ResolvedStack, gpa: std.mem.Allocator) void {
+        for (self.raw_fonts) |*rf| rf.deinit(gpa);
+        gpa.free(self.raw_fonts);
+        gpa.free(self.entry_keys);
+        gpa.free(self.family_fonts);
+        self.logged_missing.deinit(gpa);
     }
 
-    //log.debug("FontCacheGet creating font hash {x} ptr {*} size {d} name \"{s}\"", .{ fontHash, bytes.ptr, font.size, font.name });
+    pub fn entryIndexFor(self: *const ResolvedStack, codepoint: u21) ?u8 {
+        return self.fallback.entryIndexFor(codepoint);
+    }
+};
 
-    entry.value_ptr.* = Entry.init(gpa, source, font, embolden) catch |err| {
-        dvui.log.err("Font {s} init got {any}, using fallback", .{ fname, err });
-        // Remove the invalid font cache entry, something went wrong reading the ttf_bytes
-        self.cache.map.removeByPtr(entry.key_ptr);
-        // Substitute the known good fallback font
-        return self.getOrCreate(gpa, Source.fallback.font());
+fn coverageCacheKey(names: []const Font) u64 {
+    var hasher = std.hash.Wyhash.init(0);
+    for (names) |family_font| {
+        var k = family_font.cacheKey();
+        @memset(k.bytes[NAME_MAX_LEN..][0..4], 0); // size
+        hasher.update(&k.bytes);
+    }
+    return hasher.final();
+}
+
+pub fn resolveStack(self: *Cache, state_gpa: std.mem.Allocator, font: Font) std.mem.Allocator.Error!*ResolvedStack {
+    const font_key = font.cacheKey();
+    if (self.resolved_stacks.get(font_key)) |existing| return existing;
+
+    var flattened = self.family_aliases.flatten(font);
+    if (flattened.hit_limit) dvui.log.warn("Font family alias {s} nests deeper than {d} or expands more than {d} times (cycle?), ignoring the rest", .{ font.familyName(), max_alias_depth, max_alias_expansions });
+    if (flattened.len == 0) {
+        flattened.fonts[0] = font;
+        flattened.len = 1;
+    }
+    const names = flattened.slice();
+
+    const entry_keys = try state_gpa.alloc(Font.CacheKey, names.len);
+    errdefer state_gpa.free(entry_keys);
+    const family_fonts = try state_gpa.alloc(Font, names.len);
+    errdefer state_gpa.free(family_fonts);
+    const raw_fonts = try state_gpa.alloc(OtFont, names.len);
+    errdefer state_gpa.free(raw_fonts);
+
+    var count: usize = 0;
+    errdefer for (raw_fonts[0..count]) |*rf| rf.deinit(state_gpa);
+
+    for (names) |family_font| {
+        family_fonts[count] = family_font;
+        entry_keys[count] = family_font.cacheKey();
+
+        const source = try self.resolveSource(state_gpa, family_font);
+        raw_fonts[count] = FontSet.parseFace(state_gpa, source.bytes, source.collection_index) catch |err| switch (err) {
+            error.OutOfMemory => |e| return e,
+            else => FontSet.parseFace(state_gpa, Font.Embedded.sans.bytes, 0) catch |e2| switch (e2) {
+                error.OutOfMemory => |e| return e,
+                else => unreachable, // embedded Vera.ttf is a known-good sfnt
+            },
+        };
+        count += 1;
+    }
+
+    const fallback = try self.coverage_cache.getOrBuild(state_gpa, coverageCacheKey(names), raw_fonts[0..count]);
+    const boxed = try state_gpa.create(ResolvedStack);
+    errdefer state_gpa.destroy(boxed);
+    boxed.* = .{ .font_key = font_key, .entry_keys = entry_keys, .family_fonts = family_fonts, .raw_fonts = raw_fonts, .fallback = fallback };
+    try self.resolved_stacks.put(state_gpa, font_key, boxed);
+    return boxed;
+}
+
+pub fn primaryEntry(self: *Cache, state_gpa: std.mem.Allocator, resolved: *const ResolvedStack) std.mem.Allocator.Error!*Entry {
+    if (self.stackEntry(resolved, 0)) |existing| return existing;
+    return self.getOrCreate(state_gpa, resolved.family_fonts[0]);
+}
+
+pub fn stackEntry(self: *Cache, resolved: *const ResolvedStack, index: u8) ?*Entry {
+    if (index >= resolved.entry_keys.len) return null;
+    return if (self.cache.getPtr(resolved.entry_keys[index])) |p| p.* else null;
+}
+
+pub fn discoverDynamicFallback(self: *Cache, state_gpa: std.mem.Allocator, codepoint: u21) ?Font {
+    const family = self.database.fallbackFamily(state_gpa, dvui.io, codepoint) orelse return null;
+    return Font.init(FontSet.nameSlice(&family));
+}
+
+fn webFallbackFont(self: *Cache, state_gpa: std.mem.Allocator, codepoint: u21) ?Font {
+    const family = self.database.webFallbackFamily(state_gpa, codepoint) orelse return null;
+    return Font.init(FontSet.nameSlice(&family));
+}
+
+pub fn processWebFallback(self: *Cache, gpa: std.mem.Allocator, scratch: std.mem.Allocator) void {
+    self.database.processWebFallback(gpa, scratch, struct {
+        pub fn fetch(_: @This(), font: u16, url: []const u8) void {
+            if (@hasDecl(dvui.backend, "fetchFallbackFont")) dvui.backend.fetchFallbackFont(font, url);
+        }
+    }{});
+}
+
+pub fn webFallbackLoaded(self: *Cache, gpa: std.mem.Allocator, font: u16, bytes: []u8) void {
+    if (self.database.webFallbackLoaded(gpa, font, bytes)) self.line_cache.clear(gpa);
+}
+
+pub fn setWebFallback(self: *Cache, gpa: std.mem.Allocator, options: WebFallbackOptions) void {
+    self.database.setWebFallback(gpa, options.enabled, options.base_url);
+    self.line_cache.clear(gpa);
+}
+
+pub fn webFallbackFailed(self: *Cache, gpa: std.mem.Allocator, font: u16) void {
+    self.database.webFallbackFailed(gpa, font);
+}
+
+const LineProvider = struct {
+    cache: *Cache,
+    resolved: *ResolvedStack,
+    discovered: *std.ArrayList(Discovered),
+    output: std.mem.Allocator,
+
+    const Discovered = struct { key: Font.CacheKey, font: Font };
+
+    pub fn coversCodepoint(self: LineProvider, codepoint: u21) bool {
+        return self.resolved.entryIndexFor(codepoint) != null;
+    }
+
+    pub fn fontForCodepoint(self: LineProvider, state_gpa: std.mem.Allocator, codepoint: u21) ?Font.CacheKey {
+        const found = self.cache.discoverDynamicFallback(state_gpa, codepoint) orelse
+            self.cache.webFallbackFont(state_gpa, codepoint) orelse return null;
+        const sized = found.withSize(self.resolved.family_fonts[0].size);
+        const key = sized.cacheKey();
+        self.discovered.append(self.output, .{ .key = key, .font = sized }) catch return null;
+        return key;
+    }
+
+    pub fn ensureFont(self: LineProvider, state_gpa: std.mem.Allocator, key: Font.CacheKey) !OtFont {
+        const font = self.fontForKey(key) orelse return error.FontUnavailable;
+        const entry = try self.cache.getOrCreate(state_gpa, font);
+        return entry.parsed_font;
+    }
+
+    pub fn hasFont(self: LineProvider, key: Font.CacheKey) bool {
+        return self.cache.cache.getPtr(key) != null;
+    }
+
+    pub fn toPixels(self: LineProvider, key: Font.CacheKey, font_units: i32) f32 {
+        const entry = self.cache.cache.getPtr(key) orelse return 0;
+        return entry.*.toPixels(font_units);
+    }
+
+    pub fn emboldenUnits(self: LineProvider, key: Font.CacheKey) i32 {
+        const entry = self.cache.cache.getPtr(key) orelse return 0;
+        if (!entry.*.embolden) return 0;
+        return opentype.rasterization.emboldenUnits(entry.*.renderer.head.units_per_em);
+    }
+
+    pub fn noteMissingCoverage(self: LineProvider, state_gpa: std.mem.Allocator, codepoint: u21) void {
+        logMissingCoverage(self.resolved, state_gpa, codepoint);
+    }
+
+    fn fontForKey(self: LineProvider, key: Font.CacheKey) ?Font {
+        for (self.resolved.entry_keys, self.resolved.family_fonts) |k, font| {
+            if (Font.CacheKey.Context.eql(.{}, k, key)) return font;
+        }
+        for (self.discovered.items) |d| {
+            if (Font.CacheKey.Context.eql(.{}, d.key, key)) return d.font;
+        }
+        return null;
+    }
+};
+
+pub fn shapeLineText(self: *Cache, output: std.mem.Allocator, state_gpa: std.mem.Allocator, resolved: *ResolvedStack, text: []const u8, item: ?Font.ShapeItem, base_direction: opentype.unicode.Bidi.ParagraphDirection, style: Font.ShapeStyle) std.mem.Allocator.Error!ShapedText {
+    var discovered: std.ArrayList(LineProvider.Discovered) = .empty;
+    defer discovered.deinit(output);
+    const provider: LineProvider = .{ .cache = self, .resolved = resolved, .discovered = &discovered, .output = output };
+
+    var result = self.line_cache.shapeLine(
+        output,
+        state_gpa,
+        provider,
+        resolved.font_key,
+        resolved.raw_fonts,
+        resolved.entry_keys,
+        text,
+        if (item) |it| .{ .start = it.start, .end = it.end } else null,
+        base_direction,
+        .{ .features = style.features, .tab_size = style.tab_size, .tab_origin = style.tab_origin },
+    ) catch |err| switch (err) {
+        error.OutOfMemory => |e| return e,
     };
-    //log.debug("- size {d} ascent {d} height {d}", .{ font.size, entry.ascent, entry.height });
-    return entry.value_ptr;
+    defer output.free(result.font_keys);
+    errdefer result.line.deinit();
+
+    const entries = try output.alloc(*Entry, result.font_keys.len);
+    errdefer output.free(entries);
+    for (entries, result.font_keys) |*slot, key| {
+        slot.* = (self.cache.getPtr(key) orelse return error.OutOfMemory).*;
+    }
+
+    return .{ .line = result.line, .entries = entries };
+}
+
+pub const ShapedText = struct {
+    line: ShapedLine,
+    entries: []*Entry,
+
+    pub fn deinit(self: *ShapedText) void {
+        const output = self.line.allocator;
+        self.line.deinit();
+        output.free(self.entries);
+    }
+
+    pub fn entryForGlyph(self: ShapedText, fallback: *Entry, glyph_idx: usize) *Entry {
+        const font_index = self.line.fontIndexForGlyph(glyph_idx);
+        if (font_index >= self.entries.len) return fallback;
+        return self.entries[font_index];
+    }
+
+    pub const Metrics = struct {
+        entries: []const *Entry,
+        fallback: *Entry,
+
+        fn entry(self: Metrics, font_index: u16) *Entry {
+            if (font_index >= self.entries.len) return self.fallback;
+            return self.entries[font_index];
+        }
+
+        pub fn glyphInfoGet(self: Metrics, gpa: std.mem.Allocator, font_index: u16, glyph_id: u32) !Entry.GlyphInfo {
+            return self.entry(font_index).glyphInfoGet(gpa, glyph_id);
+        }
+
+        pub fn toPixels(self: Metrics, font_index: u16, font_units: i32) f32 {
+            return self.entry(font_index).toPixels(font_units);
+        }
+
+        pub fn ascent(self: Metrics, font_index: u16) f32 {
+            return self.entry(font_index).ascent;
+        }
+
+        pub fn baseHeight(self: Metrics) f32 {
+            return self.fallback.height;
+        }
+
+        pub fn gdefTable(self: Metrics, font_index: u16) ?[]const u8 {
+            return self.entry(font_index).parsed_font.tableData("GDEF".*);
+        }
+    };
+
+    pub fn metrics(self: ShapedText, fallback: *Entry) Metrics {
+        return .{ .entries = self.entries, .fallback = fallback };
+    }
+};
+
+fn logMissingCoverage(resolved: *ResolvedStack, gpa: std.mem.Allocator, codepoint: u21) void {
+    const block: u21 = codepoint >> 8;
+    if (resolved.logged_missing.get(block) != null) return;
+    resolved.logged_missing.put(gpa, block, {}) catch {};
+    dvui.log.debug("Font: no entry covers codepoint block U+{X:0>4}xx (e.g. U+{X:0>4}), falling back to entry 0 (.notdef)", .{ block, codepoint });
+}
+
+fn initialMeasureWindow(resolved: *const ResolvedStack, mwidth: f32, newline_idx: usize) usize {
+    const m_advance = if (resolved.m_size) |m| m.w else 0;
+    if (!(m_advance > 0) or !std.math.isFinite(mwidth)) return @min(newline_idx, 64);
+    const estimate = @min(@as(f32, @floatFromInt(newline_idx)), @max(0, mwidth / m_advance * 2 + 8));
+    return @min(newline_idx, @max(16, @as(usize, @intFromFloat(estimate))));
+}
+
+pub const MeasureResult = struct {
+    size: Size,
+    shaped: ShapedText,
+};
+
+pub fn textSizeRawShaped(
+    self: *Cache,
+    output: std.mem.Allocator,
+    state_gpa: std.mem.Allocator,
+    resolved: *ResolvedStack,
+    text: []const u8,
+    opts: Font.TextSizeOptions,
+    style: Font.ShapeStyle,
+) std.mem.Allocator.Error!MeasureResult {
+    const mwidth = opts.max_width orelse dvui.max_float_safe;
+    const snap = if (dvui.current_window) |cw| cw.snap_to_pixels else true;
+    const default_height: f32 = if (self.primaryEntry(state_gpa, resolved)) |fe| fe.height else |_| 0;
+
+    const hard_break = firstHardBreak(text);
+    const newline_idx = if (hard_break) |hb| hb.start else text.len;
+    var window: usize = if (opts.max_width != null and opts.item == null) initialMeasureWindow(resolved, mwidth, newline_idx) else newline_idx;
+
+    while (true) {
+        var shaped = try self.shapeLineText(output, state_gpa, resolved, text[0..window], opts.item, opts.base_direction, style);
+        errdefer shaped.deinit();
+        const line = &shaped.line;
+
+        const fallback_entry = self.stackEntry(resolved, 0);
+
+        const ext: opentype.ShapedLine.Extents = if (fallback_entry) |fe|
+            try line.measureGlyphs(
+                state_gpa,
+                shaped.metrics(fe),
+                .{ .start = 0, .end = line.buffer.info.items.len },
+                .{ .max = mwidth, .end_metric = opts.end_metric },
+                snap,
+            )
+        else
+            .{ .size = .{ .w = 0, .h = default_height }, .glyphs_used = 0 };
+        const glyphs_used = ext.glyphs_used;
+        const tw = ext.size.w;
+        const th = ext.size.h;
+
+        const found_break = glyphs_used < line.buffer.info.items.len;
+        if (found_break or window >= newline_idx) {
+            if (found_break and line.buffer.isRtl()) {
+                if (fallback_entry) |fe| {
+                    const fit = try line.logicalPrefixForWidth(state_gpa, shaped.metrics(fe), mwidth, opts.end_metric, snap);
+                    if (opts.end_idx) |endout| endout.* = fit.byte;
+                    return .{ .size = .{ .w = fit.w, .h = th }, .shaped = shaped };
+                }
+            }
+            if (opts.end_idx) |endout| {
+                endout.* = line.byteOffsetForGlyph(glyphs_used);
+                if (!found_break) {
+                    if (hard_break) |hb| endout.* += hb.len;
+                }
+            }
+            return .{ .size = .{ .w = tw, .h = th }, .shaped = shaped };
+        }
+
+        shaped.deinit();
+        window = @min(newline_idx, window * 4);
+    }
 }
 
 pub const Entry = struct {
-    face: if (impl == .FreeType) c.FT_Face else c.stbtt_fontinfo,
     name: []const u8, // gpa
-    scaleFactor: f32,
+    parsed_font: OtFont,
+    renderer: Renderer,
+    /// Synthetic bold: bold asked for, the source has no bold face or axis.
+    embolden: bool = false,
+    sbix_strike: ?[]const u8,
     height: f32, // ascender - descender
-    ascent: f32, // ascender (integer)
-    em_height: f32, // height of M
-    glyph_info: std.AutoHashMapUnmanaged(u32, GlyphInfo) = .empty,
-    glyph_info_ascii: [ascii_size - ascii_start]GlyphInfo,
+    ascent: f32, // ascender
+    em_height: f32, // measured M height
+    /// Glyphs keyed by ID (post-shaping), not Unicode codepoint.
+    /// Bounded by `Cache.max_atlas_width` x `Cache.max_atlas_height`.
+    glyphs: std.HashMapUnmanaged(u32, GlyphInfo, GlyphIdContext, std.hash_map.default_max_load_percentage) = .empty,
     texture_atlas_cache: ?Texture = null,
-    embolden: bool = false, // true if this entry is synthetically bolded
+    /// Allocated height (may exceed pack_y due to geometric growth).
+    atlas_alloc_height: u32 = 0,
+    /// Shelf-packer state; decoupled from GPU upload.
+    atlas_width: u32 = 0,
+    pack_x: u32 = pad,
+    pack_y: u32 = pad,
+    pack_row_height: u32 = 0,
 
-    const ascii_size = 127;
-    const ascii_start = 32;
-
-    const GlyphInfo = struct {
-        advance: f32, // horizontal distance to move the pen
-        leftBearing: f32, // horizontal distance from pen to glyph pixels left edge (integer)
-        topBearing: f32, // vertical distance from pen to glyph pixels top edge (integer)
-        w: f32, // width of bounding box (integer)
-        h: f32, // height of bounding box (integer)
-        uv: @Vector(2, f32),
+    // Wyhash over 4 bytes dominated glyphInfoGet; Fibonacci hashing spreads
+    // dense glyph ids across both the bucket bits and the top fingerprint bits.
+    const GlyphIdContext = struct {
+        pub fn hash(_: GlyphIdContext, glyph_id: u32) u64 {
+            return @as(u64, glyph_id) *% 0x9E3779B97F4A7C15;
+        }
+        pub fn eql(_: GlyphIdContext, a: u32, b: u32) bool {
+            return a == b;
+        }
     };
 
-    /// Load the underlying font at an integer size <= font.size (guaranteed to have a minimum pixel size of 1)
-    pub fn init(gpa: std.mem.Allocator, source: Source, font: Font, embolden: bool) Error!Entry {
-        const min_pixel_size = 1;
+    /// Padding (px) kept on every side of a packed glyph.
+    const pad: u32 = 1;
+    const initial_atlas_width: u32 = 512;
 
-        var fname = source.name(gpa);
-        if (embolden) {
-            const old = fname;
-            defer gpa.free(old);
-            fname = std.fmt.allocPrint(gpa, "{s} Bold Synth", .{old}) catch "OOM";
+    pub const GlyphInfo = struct {
+        leftBearing: f32, // pen x to glyph left
+        topBearing: f32, // pen y to glyph top
+        w: f32, // bounding box width
+        h: f32, // bounding box height
+        /// Raw pixel origin (top-left) in atlas; append-only, never moves.
+        origin: @Vector(2, f32),
+        /// True for color glyphs (COLR/sbix/CBDT); rendered as-is.
+        is_color: bool,
+        /// Rasterized bytes, gpa-owned: straight RGBA (w*h*4) when
+        /// `is_color`, coverage (w*h) otherwise. Freed once uploaded
+        /// when the backend has partial uploads (`drops_uploaded_pixels`);
+        /// a rebuild re-rasterizes.
+        pixels: []u8,
+        /// Uploaded to current texture_atlas_cache yet.
+        uploaded: bool,
+    };
+
+    pub fn toPixels(self: *const Entry, font_units: i32) f32 {
+        return self.renderer.unitsToPixels(font_units);
+    }
+
+    const max_user_coords = max_variations + DiscoveryProperties.max_pinned_axes + 3;
+
+    fn effectiveUserCoords(font: Font, face_pinned: []const UserCoord, buf: *[max_user_coords]UserCoord) []const UserCoord {
+        const pinned = font.variations[0..font.variation_count];
+        @memcpy(buf[0..pinned.len], pinned);
+        var n = pinned.len;
+        const style_coord: UserCoord = switch (font.style) {
+            .normal => .{ .tag = "ital".*, .value = 0 },
+            .italic => .{ .tag = "ital".*, .value = 1 },
+            .oblique => .{ .tag = "slnt".*, .value = -14 },
+        };
+        const synthetic = [_]UserCoord{
+            .{ .tag = "wght".*, .value = font.weight.value },
+            .{ .tag = "wdth".*, .value = font.stretch.value * 100 },
+            style_coord,
+        };
+        for ([_][]const UserCoord{ face_pinned, &synthetic }) |layer| {
+            for (layer) |coord| {
+                const already_set = for (buf[0..n]) |v| {
+                    if (std.mem.eql(u8, &v.tag, &coord.tag)) break true;
+                } else false;
+                if (already_set) continue;
+                buf[n] = coord;
+                n += 1;
+            }
         }
+        return buf[0..n];
+    }
+
+    /// Blink's rule: synthesize at 600+ from a face under 600. A `wght` axis
+    /// reaching 600 renders the real weight; color glyphs have no outline.
+    fn wantsSyntheticBold(font: Font, source: *const Source, parsed_font: OtFont) bool {
+        const threshold = Font.Weight.semibold.value;
+        if (font.weight.value < threshold or source.weight.value >= threshold) return false;
+        for ([_][4]u8{ "COLR".*, "sbix".*, "CBDT".* }) |tag| {
+            if (parsed_font.tableData(tag) != null) return false;
+        }
+        const fvar_data = parsed_font.tableData("fvar".*) orelse return true;
+        const lifo = dvui.currentWindow().lifo();
+        const axes = opentype.parsing.Table.fvar.axes(lifo, fvar_data) catch return true;
+        defer lifo.free(axes);
+        for (axes) |axis| {
+            if (std.mem.eql(u8, &axis.tag, "wght") and axis.max_value >= threshold) return false;
+        }
+        return true;
+    }
+
+    fn measuredCapHeight(renderer: *Renderer, glyph_id: u16) ?f32 {
+        const bounds = renderer.glyphBounds(glyph_id, .{}, dvui.currentWindow().lifo()) catch return null;
+        if (bounds.rows == 0) return null;
+        return @floatFromInt(bounds.rows);
+    }
+
+    fn loadSbixStrike(gpa: std.mem.Allocator, source: *const Source, ppem: f32) ?[]const u8 {
+        if (opentype.discovery.system.Backend == null) return null;
+        const path = source.path orelse return null;
+        const file = std.Io.Dir.cwd().openFile(dvui.io, path, .{}) catch return null;
+        defer file.close(dvui.io);
+        const rounded: u16 = @intFromFloat(std.math.clamp(@round(ppem), 1, std.math.maxInt(u16)));
+        return opentype.parsing.Font.readSbixStrike(gpa, dvui.io, file, source.collection_index, rounded) catch null;
+    }
+
+    pub fn init(gpa: std.mem.Allocator, source: *const Source, font: Font) Error!Entry {
+        const min_pixel_size: f32 = 1;
+
+        const parsed_font = FontSet.parseFace(gpa, source.bytes, source.collection_index) catch |err| {
+            const fname = font.name(gpa);
+            defer gpa.free(fname);
+            dvui.log.warn("Font.Cache.Entry.init() opentype parse error {any} font {s}\n", .{ err, fname });
+            return Error.FontError;
+        };
+        errdefer parsed_font.deinit(gpa);
+
+        const embolden = wantsSyntheticBold(font, source, parsed_font);
+        const fname = if (embolden) blk: {
+            const plain = font.name(gpa);
+            defer gpa.free(plain);
+            break :blk std.fmt.allocPrint(gpa, "{s} Bold Synth", .{plain}) catch "";
+        } else font.name(gpa);
         errdefer gpa.free(fname);
 
-        var self: Entry = if (impl == .FreeType) blk: {
-            var face: c.FT_Face = undefined;
-            var args: c.FT_Open_Args = undefined;
-            args.flags = @as(u32, @bitCast(FreeType.OpenFlags{ .memory = true }));
-            args.memory_base = source.bytes.ptr;
-            args.memory_size = @as(u31, @intCast(source.bytes.len));
-            FreeType.intToError(c.FT_Open_Face(dvui.ft2lib, &args, 0, &face)) catch |err| {
-                dvui.log.warn("Font.Cache.Entry.init() freetype error {any} trying to FT_Open_Face font {s}\n", .{ err, fname });
-                return Error.FontError;
-            };
-
-            // "pixel size" for freetype doesn't actually mean you'll get that height, it's more like using pts
-            // so we search for a font that has a height <= font.size
-            var pixel_size = @as(u32, @trunc(@max(min_pixel_size, @floor(font.size))));
-            pixel_size += 20;
-
-            while (true) : (pixel_size -= 1) {
-                FreeType.intToError(c.FT_Set_Pixel_Sizes(face, pixel_size, pixel_size)) catch |err| {
-                    dvui.log.warn("Font.Cache.Entry.init() freetype error {any} trying to FT_Set_Pixel_Sizes font {s}\n", .{ err, fname });
-                    return Error.FontError;
-                };
-
-                const ascender = @as(f32, @floatFromInt(face.*.ascender)) / 64.0;
-                const ss = @as(f32, @floatFromInt(face.*.size.*.metrics.y_scale)) / 0x10000;
-                const fascent = ascender * ss;
-                const descender = @as(f32, @floatFromInt(face.*.descender)) / 64.0;
-                const descent = descender * ss;
-
-                var entry: Entry = .{
-                    .face = face,
-                    .name = fname,
-                    .scaleFactor = 1.0, // not used with freetype
-                    .height = fascent - descent,
-                    .ascent = @trunc(fascent), // cheat ascent a bit, must be an integer
-                    .em_height = undefined, // below
-                    .glyph_info_ascii = undefined,
-                };
-
-                const M = try entry.glyphInfoGenerate('M');
-                if (M.h <= 0) {
-                    dvui.log.warn("Font.Cache.Entry.init() freetype error getting M font {s} size {d}\n", .{ fname, font.size });
-                    return error.FontError;
-                }
-
-                if (M.h <= font.size or pixel_size == min_pixel_size) {
-                    //std.debug.print("{s} pixel_size {d} ascent {d} descent {d} height {d}\n", .{fname, pixel_size, ascent, descent, ascent - descent});
-                    entry.em_height = M.h;
-                    // set after sizing so synthetic bold renders at the correct size
-                    entry.embolden = embolden;
-                    break :blk entry;
-                }
-            }
-        } else blk: {
-            const offset = c.stbtt_GetFontOffsetForIndex(source.bytes.ptr, 0);
-            if (offset < 0) {
-                dvui.log.warn("Font.Cache.Entry.init() stbtt error when calling stbtt_GetFontOffsetForIndex font {s}\n", .{fname});
-                return Error.FontError;
-            }
-            var face: c.stbtt_fontinfo = undefined;
-            if (c.stbtt_InitFont(&face, source.bytes.ptr, offset) != 1) {
-                dvui.log.warn("Font.Cache.Entry.init() stbtt error when calling stbtt_InitFont font {s}\n", .{fname});
-                return Error.FontError;
-            }
-
-            var face_ascent: c_int = undefined;
-            var face_descent: c_int = undefined;
-            c.stbtt_GetFontVMetrics(&face, &face_ascent, &face_descent, null);
-
-            var entry: Entry = .{
-                .face = face,
-                .name = fname,
-                .scaleFactor = 1.0, // adjusted below
-                .height = 1.0, // adjusted below
-                .ascent = 1.0, // adjusted below
-                .em_height = undefined, // below
-                .glyph_info_ascii = undefined,
-            };
-
-            const M = try entry.glyphInfoGenerate('M');
-            if (M.h <= 0) {
-                dvui.log.warn("Font.Cache.Entry.init() stbtt error getting M font {s} size {d}\n", .{ fname, font.size });
-                return error.FontError;
-            }
-            entry.scaleFactor = @max(min_pixel_size, @floor(font.size)) / M.h;
-            const ascender = entry.scaleFactor * @as(f32, @floatFromInt(face_ascent));
-            const descender = entry.scaleFactor * @as(f32, @floatFromInt(face_descent));
-            entry.ascent = @trunc(ascender); // cheat the ascent a bit, must be integer
-            entry.height = ascender - descender;
-            entry.em_height = entry.scaleFactor * M.h;
-            entry.embolden = embolden;
-
-            //std.debug.print("{s} ascent {d} descent {d} computed ascent {d} height {d}\n", .{fname, ascender, descender, entry.ascent, entry.height});
-            break :blk entry;
+        var ppem = @max(min_pixel_size, font.size);
+        var coords_buf: [max_user_coords]UserCoord = undefined;
+        const user_coords = effectiveUserCoords(font, source.pinnedAxes(), &coords_buf);
+        // The cap-height probe below sizes the face, so it measures the
+        // outline before emboldening grows it.
+        var render_options: opentype.render.RenderOptions = .{ .hint_glyf = true, .user_coords = user_coords };
+        var renderer = Renderer.init(gpa, dvui.currentWindow().lifo(), parsed_font, ppem, render_options) catch |err| {
+            dvui.log.warn("Font.Cache.Entry.init() opentype renderer error {any} font {s}\n", .{ err, fname });
+            return Error.FontError;
         };
+        errdefer renderer.deinit(gpa);
 
-        // Pre-generate the ascii glyphs
-        //std.debug.print("char,codepoint,hx,w,hy,h,adv\n", .{});
-        for (0..self.glyph_info_ascii.len) |i| {
-            self.glyph_info_ascii[i] = try self.glyphInfoGenerate(@intCast(i + ascii_start));
+        const sbix_strike = if (parsed_font.tableData(.{ 's', 'b', 'i', 'x' }) != null)
+            null
+        else
+            loadSbixStrike(gpa, source, ppem);
+        errdefer if (sbix_strike) |strike| gpa.free(strike);
+        if (sbix_strike) |strike| renderer.sbix_data = strike;
+
+        const units_per_em_f: f32 = @floatFromInt(renderer.head.units_per_em);
+
+        const extents = parsed_font.horizontalExtents(renderer.head.units_per_em);
+        const raw_ascender: f32 = @floatFromInt(extents.ascender);
+        const raw_descender: f32 = @floatFromInt(extents.descender);
+
+        const cmap_data = parsed_font.tableData(.{ 'c', 'm', 'a', 'p' });
+        const m_glyph_id: u16 = if (cmap_data) |cd| (Cmap.lookup(cd, 'M') orelse 0) else 0;
+
+        var em_height = ppem;
+        if (m_glyph_id != 0) probe: {
+            const probe_h = measuredCapHeight(&renderer, m_glyph_id) orelse break :probe;
+            if (probe_h <= 0) break :probe;
+            const ratio = probe_h / ppem;
+            const corrected = @max(min_pixel_size, font.size / ratio);
+            renderer.setPpem(gpa, dvui.currentWindow().lifo(), corrected, render_options) catch |err| {
+                dvui.log.warn("Font.Cache.Entry.init() opentype renderer error {any} font {s}\n", .{ err, fname });
+                return Error.FontError;
+            };
+            ppem = corrected;
+            em_height = measuredCapHeight(&renderer, m_glyph_id) orelse ppem;
+        }
+        if (embolden) {
+            render_options.embolden = true;
+            renderer.setPpem(gpa, dvui.currentWindow().lifo(), ppem, render_options) catch |err| {
+                dvui.log.warn("Font.Cache.Entry.init() opentype renderer error {any} font {s}\n", .{ err, fname });
+                return Error.FontError;
+            };
         }
 
-        //const gi = self.glyph_info_ascii['M' - ascii_start];
-        //std.debug.print("{s} size {d} height {d} M left {d} top {d} wxh {d}x{d}\n", .{ fname, font.size, self.height, gi.leftBearing, gi.topBearing, gi.w, gi.h});
+        const scale_f = ppem / units_per_em_f;
+        const entry: Entry = .{
+            .name = fname,
+            .parsed_font = parsed_font,
+            .renderer = renderer,
+            .embolden = embolden,
+            .sbix_strike = sbix_strike,
+            .ascent = @trunc(raw_ascender * scale_f),
+            .height = (raw_ascender - raw_descender) * scale_f,
+            .em_height = em_height,
+        };
 
-        return self;
+        return entry;
     }
 
     pub fn deinit(self: *Entry, gpa: std.mem.Allocator, backend: Backend) void {
         defer self.* = undefined;
         gpa.free(self.name);
-        self.glyph_info.deinit(gpa);
-        if (impl == .FreeType) {
-            _ = c.FT_Done_Face(self.face);
-        }
+        var it = self.glyphs.valueIterator();
+        while (it.next()) |gi| gpa.free(gi.pixels);
+        self.glyphs.deinit(gpa);
+        self.renderer.deinit(gpa);
+        self.parsed_font.deinit(gpa);
+        if (self.sbix_strike) |strike| gpa.free(strike);
         if (self.texture_atlas_cache) |tex| backend.textureDestroy(tex);
     }
 
-    pub fn invalidateTextureAtlas(self: *Entry) void {
+    const drops_uploaded_pixels = Backend.has_texture_update_sub_rect;
+
+    fn dropUploadedPixels(gpa: std.mem.Allocator, gi: *GlyphInfo) void {
+        if (!drops_uploaded_pixels) return;
+        gpa.free(gi.pixels);
+        gi.pixels = &.{};
+    }
+
+    fn restorePixels(self: *Entry, gpa: std.mem.Allocator, glyph_id: u32, gi: *GlyphInfo) std.mem.Allocator.Error!bool {
+        if (gi.pixels.len > 0 or gi.w == 0 or gi.h == 0) return true;
+        const rendered = self.renderer.renderGlyph(@intCast(glyph_id), .{}, dvui.currentWindow().lifo(), gpa) catch |err| switch (err) {
+            error.OutOfMemory => |e| return e,
+            else => return false,
+        };
+        if (@as(f32, @floatFromInt(rendered.bitmap.width)) != gi.w or @as(f32, @floatFromInt(rendered.bitmap.rows)) != gi.h) {
+            rendered.deinit(gpa);
+            return false;
+        }
+        std.debug.assert(rendered.bitmap.pixels_row_major.len == @as(usize, rendered.bitmap.width) * rendered.bitmap.rows * @as(usize, if (rendered.is_color) 4 else 1));
+        gi.pixels = rendered.bitmap.pixels_row_major;
+        return true;
+    }
+
+    fn clearAtlas(self: *Entry, gpa: std.mem.Allocator) void {
+        var it = self.glyphs.valueIterator();
+        while (it.next()) |gi| gpa.free(gi.pixels);
+        self.glyphs.clearAndFree(gpa);
+        self.invalidateTextureAtlas();
+        self.atlas_width = 0;
+        self.pack_x = pad;
+        self.pack_y = pad;
+        self.pack_row_height = 0;
+    }
+
+    fn invalidateTextureAtlas(self: *Entry) void {
         if (self.texture_atlas_cache) |tex| {
             dvui.textureDestroyLater(tex);
         }
         self.texture_atlas_cache = null;
+        self.atlas_alloc_height = 0;
+        var it = self.glyphs.valueIterator();
+        while (it.next()) |gi| gi.uploaded = false;
     }
 
-    /// This needs to be called before rendering of glyphs as the uv coordinates
-    /// of the glyphs will not be correct if the atlas needs to be generated.
-    pub fn getTextureAtlas(self: *Entry, gpa: std.mem.Allocator, backend: Backend) Backend.TextureError!Texture {
-        if (self.texture_atlas_cache) |tex| return tex;
-
-        // number of extra pixels to add on each side of each glyph
-        const pad = 1;
-
-        const total = self.glyph_info_ascii.len + self.glyph_info.count();
-        const row_glyphs: u32 = @ceil(@as(f32, @sqrt(@as(f32, @floatFromInt(total)))));
-
-        var s = Size{};
-        {
-            var i: u32 = 0;
-            var row: Size = .{};
-            var it = self.glyph_info.iterator();
-
-            while (i < total) {
-                const gi, const codepoint = if (i < self.glyph_info_ascii.len) .{ &self.glyph_info_ascii[i], i + ascii_start } else blk: {
-                    const e = it.next().?;
-                    break :blk .{ e.value_ptr, e.key_ptr.* };
-                };
-                _ = codepoint;
-
-                row.w += gi.w + 2 * pad;
-                row.h = @max(row.h, gi.h + 2 * pad);
-
-                i += 1;
-                if (i % row_glyphs == 0) {
-                    s.w = @max(s.w, row.w);
-                    s.h += row.h;
-                    row = .{};
-                }
-            } else {
-                s.w = @max(s.w, row.w);
-                s.h += row.h;
-            }
-
-            s = s.ceil();
+    fn placeGlyph(self: *Entry, w: u32, h: u32) @Vector(2, f32) {
+        if (self.atlas_width == 0) {
+            self.atlas_width = @max(initial_atlas_width, w + 2 * pad);
+        } else if (w + 2 * pad > self.atlas_width) {
+            self.atlas_width = @min(max_atlas_width, @max(w + 2 * pad, self.atlas_width * 2));
+            self.repackAll();
         }
+        if (self.pack_x + w + pad > self.atlas_width) {
+            self.pack_x = pad;
+            self.pack_y += self.pack_row_height + pad;
+            self.pack_row_height = 0;
+        }
+        const origin: @Vector(2, f32) = .{ @floatFromInt(self.pack_x), @floatFromInt(self.pack_y) };
+        self.pack_x += w + pad;
+        self.pack_row_height = @max(self.pack_row_height, h);
+        return origin;
+    }
 
-        // also add an extra padding around whole texture
-        s.w += 2 * pad;
-        s.h += 2 * pad;
+    fn repackAll(self: *Entry) void {
+        self.pack_x = pad;
+        self.pack_y = pad;
+        self.pack_row_height = 0;
+        var it = self.glyphs.valueIterator();
+        while (it.next()) |gi| {
+            gi.origin = self.placeGlyphNoWidthCheck(@intFromFloat(gi.w), @intFromFloat(gi.h));
+        }
+        self.invalidateTextureAtlas();
+    }
 
-        var pixels = try gpa.alloc(dvui.Color.PMA, @as(usize, @trunc(s.w * s.h)));
+    fn placeGlyphNoWidthCheck(self: *Entry, w: u32, h: u32) @Vector(2, f32) {
+        if (self.pack_x + w + pad > self.atlas_width) {
+            self.pack_x = pad;
+            self.pack_y += self.pack_row_height + pad;
+            self.pack_row_height = 0;
+        }
+        const origin: @Vector(2, f32) = .{ @floatFromInt(self.pack_x), @floatFromInt(self.pack_y) };
+        self.pack_x += w + pad;
+        self.pack_row_height = @max(self.pack_row_height, h);
+        return origin;
+    }
+
+    fn blitGlyph(gi: *const GlyphInfo, dst: []dvui.Color.PMA, dst_stride: u32, ox: u32, oy: u32) void {
+        const out_w: u32 = @intFromFloat(gi.w);
+        const out_h: u32 = @intFromFloat(gi.h);
+        if (out_w == 0 or out_h == 0) return;
+        var row: u32 = 0;
+        while (row < out_h) : (row += 1) {
+            var col: u32 = 0;
+            while (col < out_w) : (col += 1) {
+                const src_index = row * out_w + col;
+                const dest = (oy + row) * dst_stride + (ox + col);
+                dst[dest] = if (gi.is_color) blk: {
+                    const src = gi.pixels[src_index * 4 ..][0..4];
+                    break :blk .fromColor(.{ .r = src[0], .g = src[1], .b = src[2], .a = src[3] });
+                } else blk: {
+                    const coverage = gi.pixels[src_index];
+                    break :blk .{ .r = coverage, .g = coverage, .b = coverage, .a = coverage };
+                };
+            }
+        }
+    }
+
+    fn rebuildAtlasTexture(self: *Entry, gpa: std.mem.Allocator, new_height: u32) Backend.TextureError!void {
+        const pixel_count = @as(usize, self.atlas_width) * new_height;
+        const pixels = try gpa.alloc(dvui.Color.PMA, pixel_count);
         defer gpa.free(pixels);
-        // set all pixels to zero alpha
         @memset(pixels, .transparent);
 
-        //const num_glyphs = fce.glyph_info.count();
-        //std.debug.print("font size {d} regen glyph atlas num {d} max size {}\n", .{ sized_font.size, num_glyphs, s });
-
-        var x: i32 = pad;
-        var y: i32 = pad;
-        var it = self.glyph_info.iterator();
-        var row_height: u32 = 0;
-        var i: u32 = 0;
-        while (i < total) {
-            var gi, const codepoint = if (i < self.glyph_info_ascii.len) .{ &self.glyph_info_ascii[i], i + ascii_start } else blk: {
-                const e = it.next().?;
-                break :blk .{ e.value_ptr, e.key_ptr.* };
-            };
-
-            gi.uv[0] = @as(f32, @floatFromInt(x + pad)) / s.w;
-            gi.uv[1] = @as(f32, @floatFromInt(y + pad)) / s.h;
-
-            if (impl == .FreeType) blk: {
-                FreeType.intToError(c.FT_Load_Char(self.face, codepoint, @as(i32, @bitCast(FreeType.LoadFlags{ .render = false })))) catch |err| {
-                    dvui.log.warn("renderText: freetype error {any} trying to FT_Load_Char codepoint {d}", .{ err, codepoint });
-                    break :blk; // will skip the failing glyph
-                };
-                if (self.embolden) c.FT_GlyphSlot_Embolden(self.face.*.glyph);
-
-                // https://freetype.org/freetype2/docs/tutorial/step1.html#section-6
-                if (self.face.*.glyph.*.format != c.FT_GLYPH_FORMAT_BITMAP) {
-                    FreeType.intToError(c.FT_Render_Glyph(self.face.*.glyph, c.FT_RENDER_MODE_NORMAL)) catch |err| {
-                        dvui.log.warn("renderText freetype error {any} trying to FT_Render_Glyph codepoint {d}", .{ err, codepoint });
-                        break :blk; // will skip the failing glyph
-                    };
-                }
-
-                const bitmap = self.face.*.glyph.*.bitmap;
-                //std.debug.print("bitmap,{d},{d},{d}\n", .{codepoint, bitmap.width, bitmap.rows});
-                row_height = @max(row_height, bitmap.rows);
-                var row: i32 = 0;
-                while (row < bitmap.rows) : (row += 1) {
-                    var col: i32 = 0;
-                    while (col < bitmap.width) : (col += 1) {
-                        const src = bitmap.buffer[@as(usize, @intCast(row * bitmap.pitch + col))];
-
-                        // because of the extra edge, offset by 1 row and 1 col
-                        const di = @as(usize, @intCast((y + row + pad) * @as(i32, @trunc(s.w)) + (x + col + pad)));
-
-                        // premultiplied white
-                        pixels[di] = .{ .r = src, .g = src, .b = src, .a = src };
-                    }
-                }
-            } else {
-                //var ow: c_int = undefined;
-                //var oh: c_int = undefined;
-                //const bm = c.stbtt_GetCodepointBitmap(&self.face, self.scaleFactor, self.scaleFactor, @as(c_int, @intCast(codepoint)), &ow, &oh, null, null);
-                //std.debug.print("bitmap,{d},{d},{d}\n", .{codepoint, ow, oh});
-
-                //c.stbtt_FreeBitmap(bm, null);
-
-                const out_w: u32 = @trunc(gi.w);
-                const out_h: u32 = @trunc(gi.h);
-                row_height = @max(row_height, out_h);
-
-                // single channel
-                const bitmap = try gpa.alloc(u8, @as(usize, out_w * out_h));
-                defer gpa.free(bitmap);
-
-                //log.debug("makecodepointBitmap size x {d} y {d} w {d} h {d} out w {d} h {d}", .{ x, y, s.w, s.h, out_w, out_h });
-
-                c.stbtt_MakeCodepointBitmapSubpixel(&self.face, bitmap.ptr, @as(c_int, @intCast(out_w)), @as(c_int, @intCast(out_h)), @as(c_int, @intCast(out_w)), self.scaleFactor, self.scaleFactor, 0.0, 0.0, @as(c_int, @intCast(codepoint)));
-
-                if (self.embolden) {
-                    // glyphInfoGenerate already widened gi.w by k, so the smear has room
-                    const k = self.emboldenPx();
-                    for (0..out_h) |row| {
-                        const line = bitmap[row * out_w ..][0..out_w];
-                        var col = out_w;
-                        while (col > 0) {
-                            col -= 1;
-                            var v = line[col];
-                            for (1..k + 1) |shift| {
-                                if (col >= shift) v = @max(v, line[col - shift]);
-                            }
-                            line[col] = v;
-                        }
-                    }
-                }
-
-                const stride: usize = @trunc(s.w);
-                const di = @as(usize, @intCast(y)) * stride + @as(usize, @intCast(x));
-                for (0..out_h) |row| {
-                    for (0..out_w) |col| {
-                        const src = bitmap[row * out_w + col];
-                        const dest = di + (row + pad) * stride + (col + pad);
-
-                        // premultiplied white
-                        pixels[dest] = .{ .r = src, .g = src, .b = src, .a = src };
-                    }
-                }
+        var it = self.glyphs.iterator();
+        while (it.next()) |kv| {
+            const gi = kv.value_ptr;
+            if (try self.restorePixels(gpa, kv.key_ptr.*, gi)) {
+                blitGlyph(gi, pixels, self.atlas_width, @intFromFloat(gi.origin[0]), @intFromFloat(gi.origin[1]));
             }
-
-            x += @as(i32, @trunc(gi.w)) + 2 * pad;
-
-            i += 1;
-            if (i % row_glyphs == 0) {
-                x = pad;
-                y += @intCast(row_height + 2 * pad);
-                row_height = 0;
-            }
+            gi.uploaded = true;
+            dropUploadedPixels(gpa, gi);
         }
 
-        self.texture_atlas_cache = try backend.textureCreate(@ptrCast(pixels.ptr), .{ .width = @trunc(s.w), .height = @trunc(s.h) });
-        return self.texture_atlas_cache.?;
+        const new_tex = try dvui.textureCreate(pixels, .{ .width = self.atlas_width, .height = new_height });
+        if (self.texture_atlas_cache) |old| dvui.textureDestroyLater(old);
+        self.texture_atlas_cache = new_tex;
+        self.atlas_alloc_height = new_height;
     }
 
-    /// If a codepoint is missing in the font it gets the glyph for
-    /// `std.unicode.replacement_character`
-    pub fn glyphInfoGetOrReplacement(self: *Entry, gpa: std.mem.Allocator, codepoint: u32) std.mem.Allocator.Error!GlyphInfo {
-        return self.glyphInfoGet(gpa, codepoint) catch |err| switch (err) {
-            Error.FontError => self.glyphInfoGet(gpa, std.unicode.replacement_character) catch unreachable,
-            else => |e| e,
-        };
-    }
-
-    pub fn glyphInfoGet(self: *Entry, gpa: std.mem.Allocator, codepoint: u32) (std.mem.Allocator.Error || Error)!GlyphInfo {
-        if (ascii_start <= codepoint and codepoint < ascii_size)
-            return self.glyph_info_ascii[codepoint - ascii_start];
-
-        if (self.glyph_info.get(codepoint)) |gi| return gi;
-
-        const gi = try self.glyphInfoGenerate(codepoint);
-
-        // new glyph, need to regen texture atlas on next render
-        //std.debug.print("new glyph {}\n", .{codepoint});
-        self.invalidateTextureAtlas();
-
-        try self.glyph_info.put(gpa, codepoint, gi);
-        return gi;
-    }
-
-    fn emboldenPx(self: *Entry) usize {
-        const em_px = self.scaleFactor / c.stbtt_ScaleForMappingEmToPixels(&self.face, 1.0);
-        return @max(1, @as(usize, @intFromFloat(@round(em_px / 24.0))));
-    }
-
-    pub fn glyphInfoGenerate(self: *Entry, codepoint: u32) Error!GlyphInfo {
-        const gi: GlyphInfo = if (impl == .FreeType) blk: {
-            FreeType.intToError(c.FT_Load_Char(self.face, codepoint, @as(i32, @bitCast(FreeType.LoadFlags{ .render = false })))) catch |err| {
-                dvui.log.warn("glyphInfoGet freetype error {any} font {s} codepoint {d}\n", .{ err, self.name, codepoint });
-                return Error.FontError;
-            };
-            if (self.embolden) c.FT_GlyphSlot_Embolden(self.face.*.glyph);
-
-            const m = self.face.*.glyph.*.metrics;
-            const minx = @as(f32, @floatFromInt(m.horiBearingX)) / 64.0;
-            const miny = @as(f32, @floatFromInt(m.horiBearingY)) / 64.0;
-
-            //const hx = @as(f32, @floatFromInt(m.horiBearingX)) / 64.0;
-            //const w = @as(f32, @floatFromInt(m.width)) / 64.0;
-            //const hy = @as(f32, @floatFromInt(m.horiBearingY)) / 64.0;
-            //const h = @as(f32, @floatFromInt(m.height)) / 64.0;
-            const adv = @as(f32, @floatFromInt(m.horiAdvance)) / 64.0;
-            //std.debug.print("{c},{d},{d},{d},{d},{d},{d}\n", .{@as(u8, @intCast(codepoint)), codepoint, hx, w, hy, h, adv});
-
-            // All these values should be integers, but just in case.
-            // bitmap assumes pen position is at a pixel boundary.
-
-            break :blk .{
-                .advance = adv,
-                .leftBearing = @floor(minx),
-                .topBearing = @floor(miny),
-                .w = @ceil(minx + @as(f32, @floatFromInt(m.width)) / 64.0) - @floor(minx),
-                .h = @ceil(miny + @as(f32, @floatFromInt(m.height)) / 64.0) - @floor(miny),
-                .uv = .{ 0, 0 },
-            };
-        } else blk: {
-            var advanceWidth: c_int = undefined;
-            c.stbtt_GetCodepointHMetrics(&self.face, @as(c_int, @intCast(codepoint)), &advanceWidth, null);
-            var ix0: c_int = undefined;
-            var iy0: c_int = undefined;
-            var ix1: c_int = undefined;
-            var iy1: c_int = undefined;
-            const ret = c.stbtt_GetCodepointBox(&self.face, @as(c_int, @intCast(codepoint)), &ix0, &iy0, &ix1, &iy1);
-            const x0: f32 = if (ret == 0) 0 else self.scaleFactor * @as(f32, @floatFromInt(ix0));
-            const y0: f32 = if (ret == 0) 0 else self.scaleFactor * @as(f32, @floatFromInt(iy0));
-            const x1: f32 = if (ret == 0) 0 else self.scaleFactor * @as(f32, @floatFromInt(ix1));
-            const y1: f32 = if (ret == 0) 0 else self.scaleFactor * @as(f32, @floatFromInt(iy1));
-            const adv: f32 = self.scaleFactor * @as(f32, @floatFromInt(advanceWidth));
-            const k: f32 = if (self.embolden) @floatFromInt(self.emboldenPx()) else 0;
-
-            //std.debug.print("{c},{d},{d},{d},{d},{d},{d}\n", .{@as(u8, @intCast(codepoint)), codepoint, x0, x1, y0, y1, adv});
-            //std.debug.print("{d} codepoint {d} stbtt x0 {d} {d} x1 {d} {d} y0 {d} {d} y1 {d} {d}\n", .{ self.ascent, codepoint, ix0, x0, ix1, x1, iy0, y0, iy1, y1 });
-
-            // bitmap assumes pen position is at a pixel boundary, so we
-            // extend the box in each direction to a full pixel (so floor
-            // x0/y0, and ceil x1/y1)
-
-            break :blk .{
-                .advance = adv + k,
-                .leftBearing = @floor(x0),
-                .topBearing = @ceil(y1),
-                .w = @ceil(x1 + k) - @floor(x0),
-                .h = @ceil(y1) - @floor(y0),
-                .uv = .{ 0, 0 },
-            };
-        };
-        //std.debug.print("codepoint {d} advance {d} leftBearing {d} topBearing {d} w {d} h {d}\n", .{ codepoint, gi.advance, gi.leftBearing, gi.topBearing, gi.w, gi.h });
-        return gi;
-    }
-
-    pub fn kern(fce: *Entry, codepoint1: u32, codepoint2: u32) f32 {
-        if (impl == .FreeType) {
-            const index1 = c.FT_Get_Char_Index(fce.face, codepoint1);
-            const index2 = c.FT_Get_Char_Index(fce.face, codepoint2);
-            var k: c.FT_Vector = undefined;
-            FreeType.intToError(c.FT_Get_Kerning(fce.face, index1, index2, c.FT_KERNING_DEFAULT, &k)) catch |err| {
-                dvui.log.warn("renderText freetype error {any} trying to FT_Get_Kerning font {s} codepoints {d} {d}\n", .{ err, fce.name, codepoint1, codepoint2 });
-                k.x = 0;
-                k.y = 0;
-            };
-
-            return @as(f32, @floatFromInt(k.x)) / 64.0;
-        } else {
-            const kern_adv: c_int = c.stbtt_GetCodepointKernAdvance(&fce.face, @as(c_int, @intCast(codepoint1)), @as(c_int, @intCast(codepoint2)));
-            return fce.scaleFactor * @as(f32, @floatFromInt(kern_adv));
-        }
-    }
-
-    /// Doesn't scale the font or max_width, always stops at newlines
-    ///
-    /// Assumes the text is valid utf8. Will exit early with non-full
-    /// size on invalid utf8
-    pub fn textSizeRaw(
-        self: *Entry,
-        gpa: std.mem.Allocator,
-        text: []const u8,
-        opts: Font.TextSizeOptions,
-    ) std.mem.Allocator.Error!Size {
-        const mwidth = opts.max_width orelse dvui.max_float_safe;
-
-        const snap = dvui.snapToPixels();
-        var x: f32 = 0;
-        var minx: f32 = 0;
-        var maxx: f32 = 0;
-        var miny: f32 = 0;
-        var maxy: f32 = self.height;
-        var tw: f32 = 0;
-        var th: f32 = self.height;
-
-        var ei: usize = 0;
-        var nearest_break: bool = false;
-
-        const kerning: bool = opts.kerning orelse true;
-        var last_codepoint: u32 = 0;
-        var next_kern_idx: u32 = 0;
-        var next_kern_byte: u32 = 0;
-        if (opts.kern_in) |ki| {
-            next_kern_byte = ki[next_kern_idx];
-            next_kern_idx += 1;
+    pub fn getTextureAtlas(self: *Entry, gpa: std.mem.Allocator, backend: Backend) Backend.TextureError!Texture {
+        if (self.atlas_width == 0) {
+            if (self.texture_atlas_cache) |tex| return tex;
+            const blank = [1]dvui.Color.PMA{.transparent};
+            self.texture_atlas_cache = try dvui.textureCreate(&blank, .{ .width = 1, .height = 1 });
+            return self.texture_atlas_cache.?;
         }
 
-        var i: usize = 0;
-        while (i < text.len) {
-            const cplen = std.unicode.utf8ByteSequenceLength(text[i]) catch unreachable;
-            const codepoint = std.unicode.utf8Decode(text[i..][0..cplen]) catch unreachable;
+        const needed_height = self.pack_y + self.pack_row_height + pad;
+        if (self.texture_atlas_cache == null or needed_height > self.atlas_alloc_height) {
+            const new_height = @min(max_atlas_height, @max(needed_height, self.atlas_alloc_height * 2));
+            try self.rebuildAtlasTexture(gpa, new_height);
+            return self.texture_atlas_cache.?;
+        }
 
-            if (codepoint == '\n') {
-                // newlines always terminate, and don't use any space
-                ei += 1;
+        const tex = self.texture_atlas_cache.?;
+
+        var any_pending = false;
+        var scan_it = self.glyphs.valueIterator();
+        while (scan_it.next()) |gi| {
+            if (!gi.uploaded) {
+                any_pending = true;
                 break;
             }
+        }
+        if (!any_pending) return tex;
 
-            const gi = try self.glyphInfoGetOrReplacement(gpa, codepoint);
-
-            if (kerning and last_codepoint != 0 and i >= next_kern_byte) {
-                const kk = self.kern(last_codepoint, codepoint);
-                x += if (snap) @round(kk) else kk;
-
-                if (opts.kern_in) |ki| {
-                    if (next_kern_idx < ki.len) {
-                        next_kern_byte = ki[next_kern_idx];
-                        next_kern_idx += 1;
-                    }
-                }
-
-                if (kk != 0) {
-                    if (opts.kern_out) |ko| {
-                        // fill in first 0
-                        for (ko) |*k| {
-                            if (k.* == 0) {
-                                k.* = @intCast(i);
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-
-            i += cplen;
-            last_codepoint = codepoint;
-
-            const adv = if (snap) @round(gi.advance) else gi.advance;
-
-            minx = @min(minx, x + gi.leftBearing);
-            maxx = @max(maxx, x + gi.leftBearing + gi.w);
-            maxx = @max(maxx, x + adv);
-
-            miny = @min(miny, self.ascent - gi.topBearing);
-            maxy = @max(maxy, self.ascent - gi.topBearing + gi.h);
-
-            if ((maxx - minx) > mwidth) {
-                switch (opts.end_metric) {
-                    .before => break, // went too far
-                    .nearest => {
-                        if ((maxx - minx) - mwidth >= mwidth - tw) {
-                            break; // current one is closest
-                        } else {
-                            // get the next glyph and then break
-                            nearest_break = true;
-                        }
-                    },
-                }
-            }
-
-            // record that we processed this codepoint
-            ei += cplen;
-
-            // update space taken by glyph
-            tw = maxx - minx;
-            th = maxy - miny;
-            x += adv;
-
-            if (nearest_break) break;
+        if (comptime !drops_uploaded_pixels) {
+            try self.rebuildAtlasTexture(gpa, self.atlas_alloc_height);
+            return self.texture_atlas_cache.?;
         }
 
-        // TODO: xstart and ystart
+        const row_pixels = try gpa.alloc(dvui.Color.PMA, @as(usize, self.atlas_width) * needed_height);
+        defer gpa.free(row_pixels);
 
-        if (opts.end_idx) |endout| {
-            endout.* = ei;
+        var it = self.glyphs.iterator();
+        while (it.next()) |kv| {
+            const gi = kv.value_ptr;
+            if (gi.uploaded) continue;
+            const out_w: u32 = @intFromFloat(gi.w);
+            const out_h: u32 = @intFromFloat(gi.h);
+            if (out_w == 0 or out_h == 0) {
+                gi.uploaded = true;
+                continue;
+            }
+            if (!try self.restorePixels(gpa, kv.key_ptr.*, gi)) {
+                gi.uploaded = true;
+                continue;
+            }
+            const ox: u32 = @intFromFloat(gi.origin[0]);
+            const oy: u32 = @intFromFloat(gi.origin[1]);
+            blitGlyph(gi, row_pixels, self.atlas_width, ox, oy);
+            try backend.textureUpdateSubRect(tex, @ptrCast(row_pixels.ptr), ox, oy, out_w, out_h);
+            gi.uploaded = true;
+            dropUploadedPixels(gpa, gi);
         }
+        return tex;
+    }
 
-        if (opts.kern_out) |ko| {
-            // fill in first 0
-            for (ko) |*k| {
-                if (k.* == 0) {
-                    k.* = @intCast(i);
-                    break;
+    pub fn glyphInfoGet(self: *Entry, gpa: std.mem.Allocator, glyph_id: u32) std.mem.Allocator.Error!GlyphInfo {
+        if (self.glyphs.get(glyph_id)) |gi| return gi;
+
+        var gi: GlyphInfo = blk: {
+            const rendered = self.renderer.renderGlyph(@intCast(glyph_id), .{}, dvui.currentWindow().lifo(), gpa) catch |err| switch (err) {
+                error.OutOfMemory => |e| return e,
+                else => {
+                    dvui.log.warn("Font.Cache.Entry.glyphInfoGet() opentype render error {any} font {s} glyph {d}\n", .{ err, self.name, glyph_id });
+                    break :blk .{ .leftBearing = 0, .topBearing = 0, .w = 0, .h = 0, .origin = .{ 0, 0 }, .is_color = false, .pixels = &.{}, .uploaded = false };
+                },
+            };
+            break :blk .{
+                .leftBearing = @floatFromInt(rendered.bitmap.left),
+                .topBearing = @floatFromInt(rendered.bitmap.top),
+                .w = @floatFromInt(rendered.bitmap.width),
+                .h = @floatFromInt(rendered.bitmap.rows),
+                .origin = .{ 0, 0 },
+                .is_color = rendered.is_color,
+                .pixels = rendered.bitmap.pixels_row_major,
+                .uploaded = false,
+            };
+        };
+        errdefer gpa.free(gi.pixels);
+
+        if (gi.w > 0 and gi.h > 0) {
+            const w: u32 = @intFromFloat(gi.w);
+            const h: u32 = @intFromFloat(gi.h);
+            if (w + 2 * pad > max_atlas_width or h + 2 * pad > max_atlas_height) {
+                dvui.log.warn("Font.Cache.Entry.glyphInfoGet() glyph {d} of font {s} is {d}x{d}, larger than the atlas, skipped\n", .{ glyph_id, self.name, w, h });
+                gi.w = 0;
+                gi.h = 0;
+                gpa.free(gi.pixels);
+                gi.pixels = &.{};
+            } else {
+                gi.origin = self.placeGlyph(w, h);
+                if (self.pack_y + self.pack_row_height + pad > max_atlas_height) {
+                    // ponytail: evict everything; a frame needing more than one full atlas thrashes, LRU shelves if that shows up
+                    self.clearAtlas(gpa);
+                    gi.origin = self.placeGlyph(w, h);
                 }
             }
         }
 
-        //std.debug.print("textSizeRaw size {d} for \"{s}\" {d}x{d} {d}\n", .{ self.size, text, tw, th, ei });
-        return Size{ .w = tw, .h = th };
+        try self.glyphs.put(gpa, glyph_id, gi);
+        return gi;
     }
 };
+test "Entry.glyphInfoGet: a full atlas is cleared instead of growing past max_atlas_height" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    const cw = dvui.currentWindow();
+    const entry = try cw.fonts.getOrCreate(cw.gpa, Font.init("Vera"));
+    _ = try entry.glyphInfoGet(cw.gpa, 36);
+    entry.pack_y = Cache.max_atlas_height;
+    const gi = try entry.glyphInfoGet(cw.gpa, 37);
+    try std.testing.expectEqual(@as(usize, 1), entry.glyphs.count());
+    try std.testing.expectEqual(@as(f32, @floatFromInt(Cache.Entry.pad)), gi.origin[1]);
+    try std.testing.expect(entry.atlas_width <= Cache.max_atlas_width);
+}
+
+test "Cache.reset: past max_coverage_entries, drops coverage no resolved stack uses" {
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    const cw = dvui.currentWindow();
+    for (0..Cache.max_coverage_entries + 1) |i| {
+        var fallback = try Cmap.FallbackStack.build(cw.gpa, &.{});
+        errdefer fallback.deinit(cw.gpa);
+        try cw.fonts.coverage_cache.map.put(cw.gpa, i, fallback);
+    }
+    const resolved = try cw.fonts.resolveStack(cw.gpa, Font.init("Vera"));
+    _ = resolved;
+    cw.fonts.reset(cw.gpa, cw.backend);
+    try std.testing.expectEqual(@as(u32, 1), cw.fonts.coverage_cache.map.count());
+}
+
+test "Entry.getTextureAtlas: keeps glyph pixels when partial uploads are unsupported" {
+    if (Cache.Entry.drops_uploaded_pixels) return error.SkipZigTest;
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    const cw = dvui.currentWindow();
+    const entry = try cw.fonts.getOrCreate(cw.gpa, Font.init("Vera"));
+    _ = try entry.glyphInfoGet(cw.gpa, 36);
+    _ = try entry.getTextureAtlas(cw.gpa, cw.backend);
+    _ = try entry.glyphInfoGet(cw.gpa, 37);
+    _ = try entry.getTextureAtlas(cw.gpa, cw.backend);
+    try std.testing.expect(entry.glyphs.get(36).?.pixels.len > 0);
+    try std.testing.expect(entry.glyphs.get(37).?.pixels.len > 0);
+}
+
+test "Entry.getTextureAtlas: drops uploaded glyph pixels when partial uploads are supported; restorePixels re-renders" {
+    if (!Cache.Entry.drops_uploaded_pixels) return error.SkipZigTest;
+    var t = try dvui.testing.init(.{});
+    defer t.deinit();
+    const cw = dvui.currentWindow();
+    const entry = try cw.fonts.getOrCreate(cw.gpa, Font.init("Vera"));
+    _ = try entry.glyphInfoGet(cw.gpa, 36);
+    _ = try entry.getTextureAtlas(cw.gpa, cw.backend);
+    _ = try entry.glyphInfoGet(cw.gpa, 37);
+    _ = try entry.getTextureAtlas(cw.gpa, cw.backend);
+    try std.testing.expectEqual(@as(usize, 0), entry.glyphs.get(37).?.pixels.len);
+    const gi = entry.glyphs.getPtr(36).?;
+    try std.testing.expect(try entry.restorePixels(cw.gpa, 36, gi));
+    try std.testing.expect(gi.pixels.len > 0);
+}
