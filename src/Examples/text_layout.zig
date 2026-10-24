@@ -250,9 +250,9 @@ fn textAlign() void {
     {
         var hbox = dvui.box(@src(), .{ .dir = .horizontal }, .{});
         defer hbox.deinit();
-        inline for (@typeInfo(TextLayoutWidget.TextAlign).@"enum".fields, 0..) |field, i| {
-            const value: TextLayoutWidget.TextAlign = @enumFromInt(field.value);
-            if (dvui.radio(@src(), align_choice == value, field.name, .{ .id_extra = i })) align_choice = value;
+        inline for (@typeInfo(TextLayoutWidget.TextAlign).@"enum".field_names, 0..) |name, i| {
+            const value = @field(TextLayoutWidget.TextAlign, name);
+            if (dvui.radio(@src(), align_choice == value, name, .{ .id_extra = i })) align_choice = value;
         }
     }
 

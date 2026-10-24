@@ -1741,7 +1741,7 @@ test "overflow_wrap reaches the inner TextLayout" {
 
         var buf = blk: {
             var b: [64]u8 = @splat(0);
-            const s = "a" ** 48;
+            const s = &@as([48]u8, @splat('a'));
             @memcpy(b[0..s.len], s);
             break :blk b;
         };

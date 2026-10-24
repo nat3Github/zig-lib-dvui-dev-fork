@@ -3610,7 +3610,7 @@ test "copy: a split selection copies its ranges joined in text order" {
             .cursor = 2,
             .start = 2,
             .end = 11,
-            .visual = .{ .anchor = .{ .byte = 9, .affinity = .after }, .cursor = 2, .start = 2, .end = 11, .ranges = .{ .{ 2, 3 }, .{ 9, 11 } } ++ .{.{ 0, 0 }} ** (Selection.max_split_ranges - 2), .ranges_len = 2 },
+            .visual = .{ .anchor = .{ .byte = 9, .affinity = .after }, .cursor = 2, .start = 2, .end = 11, .ranges = .{ .{ 2, 3 }, .{ 9, 11 } } ++ @as([Selection.max_split_ranges - 2][2]usize, @splat(.{ 0, 0 })), .ranges_len = 2 },
         };
         var copy_next = false;
 
@@ -3833,11 +3833,13 @@ test "cache_layout: a long LTR line records horizontal BytePos, a reordered one 
 
     const fns = struct {
         var id: dvui.Id = undefined;
+        const ltr_line: [2000]u8 = @splat('a');
+        const rtl_line: [2000]u8 = @bitCast(@as([1000][2]u8, @splat("\u{05e9}".*)));
         fn frame() !dvui.App.Result {
             var tl = dvui.textLayout(@src(), .{ .break_lines = false, .cache_layout = true }, .{ .expand = .horizontal });
             defer tl.deinit();
             id = tl.data().id;
-            tl.addText("a" ** 2000 ++ "\n" ++ "\u{05e9}" ** 1000, .{});
+            tl.addText(&ltr_line ++ "\n" ++ &rtl_line, .{});
             tl.addTextDone(.{});
             return .ok;
         }
