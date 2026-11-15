@@ -428,7 +428,7 @@ pub fn sizeM(self: Font, wide: f32, tall: f32) Size {
     const resolved = cw.fonts.resolveStack(cw.gpa, sized_font) catch return .{ .w = 10, .h = 10 };
 
     if (resolved.m_size == null) {
-        var result = cw.fonts.textSizeRawShaped(cw.arena(), cw.gpa, resolved, "M", .{}, .{}) catch return .{ .w = 10, .h = 10 };
+        var result = cw.fonts.textSizeRawShaped(cw.arena(), cw.lifo(), cw.gpa, resolved, "M", .{}, .{}) catch return .{ .w = 10, .h = 10 };
         result.shaped.deinit();
         resolved.m_size = result.size;
     }
@@ -625,7 +625,7 @@ pub fn textSizeExShaped(self: Font, state_gpa: std.mem.Allocator, output: std.me
         options.max_width = mwidth * ss;
     }
 
-    var result = try cw.fonts.textSizeRawShaped(output, state_gpa, resolved, text, options, self.shapeStyle(opts.tab_origin * ss));
+    var result = try cw.fonts.textSizeRawShaped(output, cw.lifo(), state_gpa, resolved, text, options, self.shapeStyle(opts.tab_origin * ss));
 
     const fallback_entry = cw.fonts.primaryEntry(state_gpa, resolved) catch {
         result.shaped.deinit();

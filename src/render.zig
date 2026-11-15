@@ -183,7 +183,7 @@ pub fn renderText(opts: TextOptions) Backend.GenericError!void {
         shaped_text = .{ .line = shaped.line, .entries = shaped.entries };
     } else {
         const resolved = try cw.fonts.resolveStack(cw.gpa, sized_font);
-        shaped_text = cw.fonts.shapeLineText(cw.arena(), cw.gpa, resolved, utf8_text, null, .auto, opts.font.shapeStyle(0)) catch return error.OutOfMemory;
+        shaped_text = cw.fonts.shapeLineText(cw.arena(), cw.lifo(), cw.gpa, resolved, utf8_text, null, .auto, opts.font.shapeStyle(0)) catch return error.OutOfMemory;
         owns_line = true;
         fallback_entry = try cw.fonts.primaryEntry(cw.gpa, resolved);
         fallback_ascent = fallback_entry.ascent;

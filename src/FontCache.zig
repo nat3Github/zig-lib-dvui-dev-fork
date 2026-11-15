@@ -363,13 +363,14 @@ const LineProvider = struct {
     }
 };
 
-pub fn shapeLineText(self: *Cache, output: std.mem.Allocator, state_gpa: std.mem.Allocator, resolved: *ResolvedStack, text: []const u8, item: ?Font.ShapeItem, base_direction: opentype.unicode.Bidi.ParagraphDirection, style: Font.ShapeStyle) std.mem.Allocator.Error!ShapedText {
+pub fn shapeLineText(self: *Cache, output: std.mem.Allocator, scratch: std.mem.Allocator, state_gpa: std.mem.Allocator, resolved: *ResolvedStack, text: []const u8, item: ?Font.ShapeItem, base_direction: opentype.unicode.Bidi.ParagraphDirection, style: Font.ShapeStyle) std.mem.Allocator.Error!ShapedText {
     var discovered: std.ArrayList(LineProvider.Discovered) = .empty;
     defer discovered.deinit(output);
     const provider: LineProvider = .{ .cache = self, .resolved = resolved, .discovered = &discovered, .output = output };
 
     var result = self.line_cache.shapeLine(
         output,
+        scratch,
         state_gpa,
         provider,
         resolved.font_key,
@@ -467,6 +468,7 @@ pub const MeasureResult = struct {
 pub fn textSizeRawShaped(
     self: *Cache,
     output: std.mem.Allocator,
+    scratch: std.mem.Allocator,
     state_gpa: std.mem.Allocator,
     resolved: *ResolvedStack,
     text: []const u8,
@@ -482,7 +484,7 @@ pub fn textSizeRawShaped(
     var window: usize = if (opts.max_width != null and opts.item == null) initialMeasureWindow(resolved, mwidth, newline_idx) else newline_idx;
 
     while (true) {
-        var shaped = try self.shapeLineText(output, state_gpa, resolved, text[0..window], opts.item, opts.base_direction, style);
+        var shaped = try self.shapeLineText(output, scratch, state_gpa, resolved, text[0..window], opts.item, opts.base_direction, style);
         errdefer shaped.deinit();
         const line = &shaped.line;
 
