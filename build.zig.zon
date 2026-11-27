@@ -29,7 +29,7 @@
             .hash = "sdl-1.0.6+3.4.18-i4QD0eENqgBF05QqwFxQm937mtl5sNDidtSmvG38hHKz",
             .lazy = true,
         },
-        .opentype = .{ .url = "git+https://github.com/nat3Github/zig-lib-opentype.git#8a61091515382b60f0a1411f1ee1e99e00eac199", .hash = "opentype-0.0.0-ta4c0GZsQwDKykb0EiP_Juw-qwpJglA4fqUFBCZyMsLm" },
+        .opentype = .{ .url = "git+https://github.com/nat3Github/zig-lib-opentype.git#f28283fe8a871274156edf16037fce253c2022db", .hash = "opentype-0.0.0-ta4c0HsDRACHrRvut6vxPDwv24Se4FndpG8e-0ETr9dF" },
         .raylib = .{
             .url = "git+https://github.com/raysan5/raylib#2dee47282ae75d241759cc35f22e4768dcd092be",
             .hash = "raylib-6.0.0-whq8uM2eNwXVGGNZwCSIfww2flgpamJLoaJ9Tau5lbJa",
